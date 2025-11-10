@@ -1,0 +1,3 @@
+source venv/bin/activate
+export PYTHONPATH=/home/coder/Deep_FPTM/python:/home/coder/Deep_FPTM/python:
+export PYTHONPATH=/home/coder/Deep_FPTM/python:/home/coder/Deep_FPTM/python:
