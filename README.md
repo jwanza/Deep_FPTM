@@ -22,6 +22,17 @@ Here are the training results of the tiny **20-clause** model on the MNIST datas
 ## How to Run Examples
 
 - Ensure that you have the latest version of the [Julia](https://julialang.org/downloads/) language installed.
+- From the project root, instantiate the Julia environment to download all recorded dependencies:
+
+```shell
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+  If you encounter an error about `Random` (or another standard library) not being installed, resolve the environment and retry:
+
+```shell
+julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
+```
 - Some examples require dataset preparation scripts written in [Python](https://www.python.org/downloads/). To install the necessary dependencies, run the following command:
 
 ```shell
@@ -116,10 +127,59 @@ Run the MNIST training example:
 julia --project=. -O3 -t 32 examples/MNIST/mnist.jl
 ```
 
+Set `DATADEPS_ALWAYS_ACCEPT=true` (for example via `export DATADEPS_ALWAYS_ACCEPT=true`) if you prefer to auto-accept dataset download prompts when running in non-interactive environments.
+
 To run the MNIST inference benchmark, please use the following command:
 
 ```shell
 julia --project=. -O3 -t 32 examples/MNIST/mnist_benchmark_inference.jl
+```
+
+### Python Equivalence Runner
+
+The PyTorch package in `python/fptm_ste/` now bundles a configurable MNIST/CIFAR battery that exercises the latest TM variants (straight-through, deep, Swin hybrid, and TM transformer) with gradient accumulation, STE annealing, EMA smoothing, and warm-up + cosine learning-rate schedules.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r python/fptm_ste/requirements.txt
+python python/fptm_ste/tests/run_mnist_equiv.py
+```
+
+Optional environment flags:
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `TM_MNIST_PRESET` | `baseline` (fast CNN/TM stack) or `advanced` (Swin, EMA, accumulation) | `baseline` |
+| `TM_MNIST_EPOCHS` | Number of epochs per model | `25` (`baseline`), `50` (`advanced`) |
+| `TM_MNIST_ACCUM`  | Gradient-accumulation steps | `1` (`baseline`), `4` (`advanced`) |
+| `TM_MNIST_EMA`    | EMA decay factor | `0.0` (`baseline`), `0.999` (`advanced`) |
+| `TM_MNIST_VARIANTS` | Comma-separated subset (`tm`, `deep_tm`, `hybrid`, `transformer`) | all |
+| `TM_MNIST_REPORT_EPOCH` | Print per-epoch train accuracy | `0` (`baseline`), `1` (`advanced`) |
+| `TM_MNIST_WARMUP` | Warm-up epochs before cosine decay | `0` (`baseline`), `5` (`advanced`) |
+
+Examples:
+
+```bash
+# Only the deep TM variant with per-epoch logging
+TM_MNIST_VARIANTS=deep_tm TM_MNIST_REPORT_EPOCH=1 python python/fptm_ste/tests/run_mnist_equiv.py
+
+# Swin + TM hybrid with longer warm-up and small batch accumulation
+TM_MNIST_PRESET=advanced TM_MNIST_VARIANTS=hybrid TM_MNIST_WARMUP=8 TM_MNIST_ACCUM=6 python python/fptm_ste/tests/run_mnist_equiv.py
+```
+
+Each run writes `/tmp/mnist_equiv_results.json` and, where applicable, JSON exports compatible with the Julia `JsonBridge`.  These artefacts allow you to verify cross-language equivalence or to load the compiled literals directly from Julia.
+
+New Julia wrappers simply forward to the Python runner so you can stay inside the Julia workflow:
+
+- `examples/MNIST/mnist_deep_tm.jl`
+- `examples/MNIST/mnist_hybrid_swin.jl`
+- `examples/MNIST/mnist_tm_transformer.jl`
+
+They honour the same environment variables.  For example:
+
+```bash
+TM_MNIST_VARIANTS=hybrid julia --project=. examples/MNIST/mnist_hybrid_swin.jl
 ```
 
 ## Citation

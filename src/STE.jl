@@ -211,6 +211,7 @@ function train_ste!(tm::TMClassifierSTE, X::Vector{TMInput}, Y::Vector;
             else
                 @printf("#%d  STE loss: %.6f\n", e, loss_val)
             end
+            flush(stdout)
         end
     end
     total_time = time() - t_start

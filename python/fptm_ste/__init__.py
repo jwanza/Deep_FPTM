@@ -1,4 +1,4 @@
-from .tm import FuzzyPatternTM_STE
+from .tm import FuzzyPatternTM_STE, FuzzyPatternTMFPTM
 from .deep_tm import DeepTMNetwork
 from .swin_tm import SwinFeatureExtractor, MultiScaleTMEnsemble
 from .attention_oracle import TM_Attention_Oracle

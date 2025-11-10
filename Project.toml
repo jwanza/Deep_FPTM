@@ -8,7 +8,10 @@ JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 MLDatasets = "eb30cadb-4394-5ae3-aed4-317e484a6458"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-Random = "9a3f8284-686f-5a3c-9b56-6d3c1b5f7b7a"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 
 [compat]
 Flux = "0.14"

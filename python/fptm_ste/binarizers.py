@@ -13,10 +13,17 @@ class SwinDualBinarizer(nn.Module):
     - STE hard binarization option
     - Cosine-annealed temperature scheduling supported via setter
     """
-    def __init__(self, in_channels: int, num_thresholds: int = 16, init_temperature: float = 1.0):
+    def __init__(
+        self,
+        in_channels: int,
+        num_thresholds: int = 16,
+        init_temperature: float = 1.0,
+        backbone_type: str = "swin",
+    ):
         super().__init__()
         self.num_thresholds = num_thresholds
         self.temperature = init_temperature
+        self.backbone_type = backbone_type
 
         self.reduce = nn.Conv2d(in_channels, num_thresholds, kernel_size=1, bias=True)
         nn.init.xavier_uniform_(self.reduce.weight, gain=0.5)
@@ -39,6 +46,18 @@ class SwinDualBinarizer(nn.Module):
 
     def set_temperature(self, t: float):
         self.temperature = float(t)
+
+    def anneal_temperature(self, value: float):
+        self.temperature = max(0.01, float(value))
+
+    def reset_running_stats(self):
+        self.running_mean.zero_()
+        self.running_std.fill_(1.0)
+        self.initialized.fill_(False)
+
+    @property
+    def output_channels(self) -> int:
+        return self.num_thresholds * 2
 
     def forward(self, x: torch.Tensor, use_discrete: bool = False) -> torch.Tensor:
         # x: [B, C, H, W], unbounded (zero-centered)
@@ -82,10 +101,17 @@ class CNNSingleBinarizer(nn.Module):
     - Reduces channels to T with 1x1 conv and bias
     - Applies sigmoid((x - threshold)/T) with STE option
     """
-    def __init__(self, in_channels: int, num_thresholds: int = 16, init_temperature: float = 1.0):
+    def __init__(
+        self,
+        in_channels: int,
+        num_thresholds: int = 16,
+        init_temperature: float = 1.0,
+        backbone_type: str = "cnn",
+    ):
         super().__init__()
         self.num_thresholds = num_thresholds
         self.temperature = init_temperature
+        self.backbone_type = backbone_type
 
         self.reduce = nn.Conv2d(in_channels, num_thresholds, kernel_size=1, bias=True)
         nn.init.xavier_uniform_(self.reduce.weight, gain=0.5)
@@ -106,6 +132,18 @@ class CNNSingleBinarizer(nn.Module):
 
     def set_temperature(self, t: float):
         self.temperature = float(t)
+
+    def anneal_temperature(self, value: float):
+        self.temperature = max(0.01, float(value))
+
+    def reset_running_stats(self):
+        self.running_mean.zero_()
+        self.running_std.fill_(1.0)
+        self.initialized.fill_(False)
+
+    @property
+    def output_channels(self) -> int:
+        return self.num_thresholds
 
     def forward(self, x: torch.Tensor, use_discrete: bool = False) -> torch.Tensor:
         # x: [B, C, H, W], expected nonnegative

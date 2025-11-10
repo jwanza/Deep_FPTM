@@ -8,9 +8,10 @@ using Base.Threads
 train_x, train_y = MNIST.traindata()
 test_x, test_y = MNIST.testdata()
 
-# Prepare binary classification: 0 vs non-0
-y_train = [yi == 0 for yi in train_y]
-y_test = [yi == 0 for yi in test_y]
+# Full 10-class classification
+y_train = collect(train_y)
+y_test = collect(test_y)
+labels = sort(unique(y_train))
 
 # Booleanize pixels with a single threshold
 function to_tm_inputs(imgs)
@@ -33,7 +34,11 @@ EPOCHS = 10
 LR = 5f-3
 
 # Train STE TM with epoch-level metrics
-tm = TMClassifierSTE{Bool}(CLAUSES, L=L, LF=LF, tau=0.5f0)
+println("Running STE TM on MNIST (multi-class)")
+println("Clauses: $(CLAUSES), L: $(L), LF: $(LF), epochs: $(EPOCHS), lr: $(LR)")
+println("Classes: $(length(labels)) | Training samples: $(length(x_train)) | Test samples: $(length(x_test))")
+
+tm = TMClassifierSTE{Int}(CLAUSES, L=L, LF=LF, tau=0.5f0)
 initialize_ste!(tm, x_train, y_train)
 metrics = Dict{Symbol, Any}()
 train_ste!(tm, x_train, y_train;
@@ -55,7 +60,7 @@ train_acc = get(metrics, :train_accuracy, nothing)
 val_acc = get(metrics, :val_accuracy, nothing)
 @printf("Final STE train accuracy: %.2f%%\n", train_acc === nothing ? NaN : train_acc * 100)
 @printf("Final STE validation accuracy: %.2f%%\n", val_acc === nothing ? acc * 100 : val_acc * 100)
-@printf("MNIST (0 vs rest) discretized compiled TM accuracy: %.2f%%\n", acc * 100)
+@printf("MNIST discretized compiled TM accuracy: %.2f%%\n", acc * 100)
 
 # Save model
 save(tmc, "/tmp/mnist_tm_ste_compiled.tm")

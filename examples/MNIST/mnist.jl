@@ -9,21 +9,28 @@ end
 
 using Printf: @printf
 using MLDatasets: MNIST, FashionMNIST
-using .FuzzyPatternTM: TMInput, TMClassifier, train!, predict, accuracy, save, load, unzip, booleanize, combine, optimize!, benchmark
+using .FuzzyPatternTM: TMInput, TMClassifier, train!, predict, accuracy, save, load, booleanize, combine, optimize!, benchmark
 
+if !haskey(ENV, "DATADEPS_ALWAYS_ACCEPT")
+    ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"
+end
 
-x_train, y_train = unzip([MNIST(:train)...])
-x_test, y_test = unzip([MNIST(:test)...])
-# x_train, y_train = unzip([FashionMNIST(:train)...])
-# x_test, y_test = unzip([FashionMNIST(:test)...])
+train_imgs, train_labels = MNIST.traindata(Float32)
+test_imgs, test_labels = MNIST.testdata(Float32)
+# To switch to Fashion-MNIST instead, replace the two lines above with:
+# train_imgs, train_labels = FashionMNIST.traindata(Float32)
+# test_imgs, test_labels = FashionMNIST.testdata(Float32)
+
+x_train = [view(train_imgs, :, :, i) for i in axes(train_imgs, 3)]
+x_test = [view(test_imgs, :, :, i) for i in axes(test_imgs, 3)]
 
 # 4-bit booleanization
 x_train = [booleanize(x, 0, 0.25, 0.5, 0.75) for x in x_train]
 x_test = [booleanize(x, 0, 0.25, 0.5, 0.75) for x in x_test]
 
 # Convert y_train and y_test to the Int8 type to save memory
-y_train = Int8.(y_train)
-y_test = Int8.(y_test)
+y_train = Int8.(train_labels)
+y_test = Int8.(test_labels)
 
 CLAUSES = 20
 T = 20

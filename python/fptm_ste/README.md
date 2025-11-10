@@ -46,4 +46,43 @@ from fptm_ste import DeepTMNetwork
 model = DeepTMNetwork(input_dim=128, hidden_dims=[64, 64], n_classes=10, n_clauses=100)
 ```
 
+## MNIST Equivalence Runner
+
+We ship a convenience script (`python/fptm_ste/tests/run_mnist_equiv.py`) that runs the latest TM variants on MNIST (and can be adapted to CIFAR) with:
+
+- straight-through TM (conv projector + clause annealing)
+- deeper TM stacks with noise and layer-wise τ scheduling
+- Swin-T hybrid ensemble (spatial + scale attention, anti-collapse gating)
+- TM transformer with token downsampling
+- gradient accumulation, EMA smoothing, and warm-up + cosine LR schedules
+
+```bash
+python python/fptm_ste/tests/run_mnist_equiv.py
+```
+
+Environment variables (set before invoking the script):
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `TM_MNIST_EPOCHS` | Epochs per model | `50` |
+| `TM_MNIST_ACCUM` | Gradient-accumulation steps | `4` |
+| `TM_MNIST_EMA` | EMA decay | `0.999` |
+| `TM_MNIST_WARMUP` | Warm-up epochs before cosine anneal | `5` |
+| `TM_MNIST_VARIANTS` | Comma-separated subset (`tm`, `deep_tm`, `hybrid`, `transformer`) | `tm,deep_tm,hybrid,transformer` |
+| `TM_MNIST_REPORT_EPOCH` | Log per-epoch train accuracy (`0`/`1`) | `0` |
+
+Examples:
+
+```bash
+# Just the deep TM variant with detailed logging
+TM_MNIST_VARIANTS=deep_tm TM_MNIST_REPORT_EPOCH=1 python python/fptm_ste/tests/run_mnist_equiv.py
+
+# Swin hybrid only, longer warm-up, more accumulation steps
+TM_MNIST_VARIANTS=hybrid TM_MNIST_WARMUP=8 TM_MNIST_ACCUM=6 python python/fptm_ste/tests/run_mnist_equiv.py
+```
+
+Each run produces `/tmp/mnist_equiv_results.json` plus model-specific JSON exports (for the TM flavours that can be discretised). These exports load directly into the Julia `JsonBridge` pipeline.
+
+Julia wrappers (`examples/MNIST/mnist_deep_tm.jl`, `mnist_hybrid_swin.jl`, `mnist_tm_transformer.jl`) forward to this script so you can invoke the variants from Julia with the same environment variables.
+
 

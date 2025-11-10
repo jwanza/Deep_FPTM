@@ -6,11 +6,12 @@ from .tm import FuzzyPatternTM_STE
 
 class DeepTMNetwork(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: list[int], n_classes: int,
-                 n_clauses: int = 100, dropout: float = 0.1, tau: float = 0.5):
+                 n_clauses: int = 100, dropout: float = 0.1, tau: float = 0.5, noise_std: float = 0.0):
         super().__init__()
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.residuals = nn.ModuleList()
+        self.noise_std = noise_std
 
         prev = input_dim
         for h in hidden_dims:
@@ -24,6 +25,8 @@ class DeepTMNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
         # x in [0,1]
+        if self.training and self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
         for layer, norm, res in zip(self.layers, self.norms, self.residuals):
             identity = res(x)
             logits, _ = layer(x, use_ste=use_ste)   # [B, h]

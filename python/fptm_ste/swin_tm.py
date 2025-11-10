@@ -1,23 +1,507 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import timm
+except ImportError:  # pragma: no cover - timm is an optional dependency
+    timm = None
+
 from .tm import FuzzyPatternTM_STE
 from .binarizers import SwinDualBinarizer, CNNSingleBinarizer
 
 
-class SwinFeatureExtractor(nn.Module):
-    def __init__(self, model_name: str = "swin_tiny_patch4_window7_224", pretrained: bool = True, freeze: bool = True):
-        super().__init__()
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3))
-        if freeze:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
+class _SwinBackbone(nn.Module):
+    """Flexible Swin Transformer backbone with optional channel projection."""
 
-    def forward(self, x: torch.Tensor):
-        # Returns list of [B, C, H, W] features at multiple scales
+    SUPPORTED_VARIANTS: Dict[str, Tuple[int, List[int], List[int], int]] = {
+        # variant: (embed_dim, depths, num_heads, window_size)
+        "tiny": (96, [2, 2, 6, 2], [3, 6, 12, 24], 7),
+        "small": (96, [2, 2, 18, 2], [3, 6, 12, 24], 7),
+        "base": (128, [2, 2, 18, 2], [4, 8, 16, 32], 7),
+        "large": (192, [2, 2, 18, 2], [6, 12, 24, 48], 7),
+    }
+
+    def __init__(
+        self,
+        variant: str = "tiny",
+        pretrained: bool = True,
+        num_scales: int = 4,
+        input_size: int = 224,
+        output_channels: Optional[Sequence[int]] = None,
+        freeze_stages: int = 0,
+        use_checkpoint: bool = False,
+        drop_path_rate: float = 0.2,
+        use_timm: bool = True,
+        version: str = "v1",
+        timm_model_name: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        if variant not in self.SUPPORTED_VARIANTS:
+            raise ValueError(f"Unsupported Swin variant '{variant}'. Supported: {list(self.SUPPORTED_VARIANTS)}")
+        if num_scales < 1 or num_scales > 4:
+            raise ValueError("num_scales must be between 1 and 4.")
+
+        self.variant = variant
+        self.version = version
+        self.timm_model_name = timm_model_name
+        self.num_scales = num_scales
+        self.input_size = input_size
+        self.use_timm = False
+
+        if use_timm:
+            self.use_timm = self._create_from_timm(
+                variant=variant,
+                pretrained=pretrained,
+                input_size=input_size,
+                version=version,
+                timm_model_name=timm_model_name,
+                drop_path=drop_path_rate,
+            )
+
+        if not self.use_timm:
+            raise RuntimeError(
+                "timm.backend unavailable. Install timm >=0.9.0 to use Swin backbones or disable use_timm."
+            )
+
+        if hasattr(self.swin, "feature_info") and self.swin.feature_info is not None:
+            self.native_channels = [
+                self.swin.feature_info.info[i]["num_chs"] for i in range(num_scales)
+            ]
+            self._feature_info = self.swin.feature_info
+        else:  # pragma: no cover - timm always exposes feature_info, but keep fallback
+            embed_dim, _, _, _ = self.SUPPORTED_VARIANTS[variant]
+            self.native_channels = [embed_dim * (2 ** i) for i in range(num_scales)]
+            self._feature_info = None
+
+        if output_channels is not None:
+            if len(output_channels) != num_scales:
+                raise ValueError("output_channels length must match num_scales.")
+            self.projections = nn.ModuleList(
+                [
+                    nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+                    for in_ch, out_ch in zip(self.native_channels, output_channels)
+                ]
+            )
+            self._output_channels = list(output_channels)
+        else:
+            self.projections = None
+            self._output_channels = list(self.native_channels)
+
+        if freeze_stages > 0:
+            self._freeze_stages(freeze_stages)
+
+        if use_checkpoint:
+            self._enable_gradient_checkpointing()
+
+    def _create_from_timm(
+        self,
+        variant: str,
+        pretrained: bool,
+        input_size: int,
+        version: str,
+        timm_model_name: Optional[str],
+        drop_path: float,
+    ) -> bool:
+        if timm is None:
+            return False
+        try:
+            model_name = self._resolve_timm_model(variant, input_size, version, timm_model_name)
+            self.swin = timm.create_model(
+                model_name,
+                pretrained=pretrained,
+                features_only=True,
+                out_indices=tuple(range(self.num_scales)),
+                img_size=input_size,
+                pretrained_cfg_overlay={"drop_path_rate": drop_path},
+            )
+            self.use_timm = True
+            return True
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[SwinBackbone] Failed to create timm model ({exc}).")
+            return False
+
+    def _resolve_timm_model(
+        self,
+        variant: str,
+        input_size: int,
+        version: str,
+        override: Optional[str],
+    ) -> str:
+        if override:
+            return override
+        if version not in {"v1", "v2", "s3"}:
+            raise ValueError(f"Unknown Swin version '{version}'. Use 'v1', 'v2', or 's3'.")
+
+        if version == "v1":
+            if input_size >= 384:
+                name_map = {
+                    "tiny": "swin_tiny_patch4_window12_384",
+                    "small": "swin_small_patch4_window12_384",
+                    "base": "swin_base_patch4_window12_384",
+                    "large": "swin_large_patch4_window12_384",
+                }
+            else:
+                name_map = {
+                    "tiny": "swin_tiny_patch4_window7_224",
+                    "small": "swin_small_patch4_window7_224",
+                    "base": "swin_base_patch4_window7_224",
+                    "large": "swin_large_patch4_window7_224",
+                }
+        elif version == "v2":
+            if input_size <= 256:
+                name_map = {
+                    "tiny": "swinv2_tiny_window8_256",
+                    "small": "swinv2_small_window8_256",
+                    "base": "swinv2_base_window8_256",
+                    "large": "swinv2_large_window12_192",
+                }
+            else:
+                name_map = {
+                    "tiny": "swinv2_tiny_window16_256",
+                    "small": "swinv2_small_window16_256",
+                    "base": "swinv2_base_window12to16_192to256",
+                    "large": "swinv2_large_window12to16_192to256",
+                }
+        else:  # s3
+            name_map = {
+                "tiny": "swin_s3_tiny_224",
+                "small": "swin_s3_small_224",
+                "base": "swin_s3_base_224",
+                "large": "swin_s3_base_224",
+            }
+        return name_map[variant]
+
+    def _freeze_stages(self, num_stages: int) -> None:
+        if not self.use_timm:
+            return
+
+        if hasattr(self.swin, "patch_embed"):
+            for param in self.swin.patch_embed.parameters():
+                param.requires_grad = False
+
+        for i in range(min(num_stages, 4)):
+            stage_name = f"layers_{i}"
+            if hasattr(self.swin, stage_name):
+                stage = getattr(self.swin, stage_name)
+                for param in stage.parameters():
+                    param.requires_grad = False
+
+    def _enable_gradient_checkpointing(self) -> None:
+        if self.use_timm and hasattr(self.swin, "set_grad_checkpointing"):
+            self.swin.set_grad_checkpointing(True)
+
+    @property
+    def feature_info(self):
+        if self.use_timm:
+            return getattr(self.swin, "feature_info", None)
+        return getattr(self, "_feature_info", None)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        if x.shape[1] == 1:  # grayscale → RGB
+            x = x.repeat(1, 3, 1, 1)
+
+        features = self.swin(x)
+
+        outputs = []
+        for idx, feat in enumerate(features[: self.num_scales]):
+            if feat.dim() == 4 and feat.shape[1] != feat.shape[-1]:
+                feat = feat.permute(0, 3, 1, 2).contiguous()
+            if self.projections is not None:
+                feat = self.projections[idx](feat)
+            outputs.append(feat)
+        return outputs
+
+    def get_output_channels(self) -> List[int]:
+        return list(self._output_channels)
+
+
+class _SwinBackboneWithFPN(nn.Module):
+    """Wraps Swin backbone with a lightweight FPN."""
+
+    def __init__(
+        self,
+        variant: str = "tiny",
+        pretrained: bool = True,
+        num_scales: int = 4,
+        input_size: int = 224,
+        output_channels: Optional[Sequence[int]] = None,
+        fpn_channels: int = 256,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.backbone = _SwinBackbone(
+            variant=variant,
+            pretrained=pretrained,
+            num_scales=num_scales,
+            input_size=input_size,
+            output_channels=None,
+            **kwargs,
+        )
+
+        native_channels = self.backbone.native_channels
+        self.lateral_convs = nn.ModuleList(
+            [nn.Conv2d(in_ch, fpn_channels, kernel_size=1) for in_ch in native_channels]
+        )
+        self.output_convs = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1),
+                    nn.GroupNorm(32, fpn_channels),
+                    nn.GELU(),
+                )
+                for _ in range(num_scales)
+            ]
+        )
+
+        if output_channels is not None:
+            if len(output_channels) != num_scales:
+                raise ValueError("output_channels length must match num_scales.")
+            self.projections = nn.ModuleList(
+                [
+                    nn.Conv2d(fpn_channels, out_ch, kernel_size=1)
+                    for out_ch in output_channels
+                ]
+            )
+            self._output_channels = list(output_channels)
+        else:
+            self.projections = None
+            self._output_channels = [fpn_channels] * num_scales
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         feats = self.backbone(x)
-        return feats
+        laterals = [conv(feat) for conv, feat in zip(self.lateral_convs, feats)]
+
+        for i in range(len(laterals) - 1, 0, -1):
+            upsampled = F.interpolate(
+                laterals[i],
+                size=laterals[i - 1].shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            laterals[i - 1] = laterals[i - 1] + upsampled
+
+        outputs = [
+            out_conv(lateral)
+            for out_conv, lateral in zip(self.output_convs, laterals)
+        ]
+
+        if self.projections is not None:
+            outputs = [
+                proj(feat) for proj, feat in zip(self.projections, outputs)
+            ]
+        return outputs
+
+    def get_output_channels(self) -> List[int]:
+        return list(self._output_channels)
+
+
+class SwinFeatureExtractor(nn.Module):
+    """High-level Swin feature extractor with optional FPN."""
+
+    def __init__(
+        self,
+        variant: str = "tiny",
+        pretrained: bool = True,
+        num_scales: int = 4,
+        input_size: int = 224,
+        output_channels: Optional[Sequence[int]] = None,
+        freeze_stages: int = 0,
+        use_checkpoint: bool = False,
+        drop_path_rate: float = 0.2,
+        use_fpn: bool = False,
+        fpn_channels: int = 256,
+        use_timm: bool = True,
+        version: str = "v1",
+        timm_model_name: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        backbone_kwargs = dict(
+            variant=variant,
+            pretrained=pretrained,
+            num_scales=num_scales,
+            input_size=input_size,
+            output_channels=output_channels,
+            freeze_stages=freeze_stages,
+            use_checkpoint=use_checkpoint,
+            drop_path_rate=drop_path_rate,
+            use_timm=use_timm,
+            version=version,
+            timm_model_name=timm_model_name,
+        )
+
+        if use_fpn:
+            self.backbone = _SwinBackboneWithFPN(
+                fpn_channels=fpn_channels,
+                **backbone_kwargs,
+            )
+        else:
+            self.backbone = _SwinBackbone(**backbone_kwargs)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        return self.backbone(x)
+
+    def get_output_channels(self) -> List[int]:
+        return self.backbone.get_output_channels()
+
+
+
+class CrossScaleSpatialAttention(nn.Module):
+    """Multi-head attention operating over backbone feature maps."""
+
+    def __init__(self, dims: Sequence[int], num_heads: int = 4, proj_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.num_scales = len(dims)
+        self.proj_dim = proj_dim
+        self.projections = nn.ModuleList([nn.Conv2d(dim, proj_dim, kernel_size=1) for dim in dims])
+        self.attn = nn.MultiheadAttention(embed_dim=proj_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(proj_dim)
+        self.output = nn.ModuleList([nn.Conv2d(proj_dim, dim, kernel_size=1) for dim in dims])
+
+    def forward(self, features: Sequence[torch.Tensor]) -> List[torch.Tensor]:
+        if not features:
+            return []
+        bsz = features[0].shape[0]
+        min_h = min(f.shape[2] for f in features)
+        min_w = min(f.shape[3] for f in features)
+
+        aligned = []
+        shapes = []
+        for feat, proj in zip(features, self.projections):
+            shapes.append(feat.shape)
+            if feat.shape[2:] != (min_h, min_w):
+                feat = F.adaptive_avg_pool2d(feat, (min_h, min_w))
+            feat = proj(feat)  # (B, proj_dim, H, W)
+            aligned.append(feat.flatten(2).transpose(1, 2))  # (B, HW, proj_dim)
+
+        combined = torch.cat(aligned, dim=1)
+        attended, _ = self.attn(combined, combined, combined)
+        attended = self.norm(attended + combined)
+
+        splits = torch.split(attended, [a.shape[1] for a in aligned], dim=1)
+        outputs: List[torch.Tensor] = []
+        for split, out_proj, (b, c, h, w) in zip(splits, self.output, shapes):
+            split = split.transpose(1, 2).reshape(bsz, self.proj_dim, min_h, min_w)
+            split = out_proj(split)
+            if (h, w) != (min_h, min_w):
+                split = F.interpolate(split, size=(h, w), mode="bilinear", align_corners=False)
+            outputs.append(split)
+        return outputs
+
+
+class LearnableScaleAttention(nn.Module):
+    """Learns per-scale weights using feature statistics and logits."""
+
+    def __init__(
+        self,
+        num_scales: int,
+        feature_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_scales = num_scales
+        self.temperature = nn.Parameter(torch.tensor(1.0))
+        stats_dim = num_scales * 4  # entropy, max-logit, mean, std
+        input_dim = stats_dim + num_scales * feature_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_scales),
+        )
+        self.bias = nn.Parameter(torch.zeros(num_scales))
+        self.register_buffer("ema_accuracy", torch.ones(num_scales) * 0.5)
+        self.register_buffer("ema_confidence", torch.ones(num_scales) * 0.5)
+        self.register_buffer("ema_calibration", torch.ones(num_scales))
+        self.momentum = 0.05
+        self._pending_update: Optional[Dict[str, torch.Tensor]] = None
+
+    def _compute_stats(self, features: List[torch.Tensor], logits: List[torch.Tensor]) -> torch.Tensor:
+        stats = []
+        proj_feats = []
+        for feat, logit in zip(features, logits):
+            probs = F.softmax(logit, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+            max_logit = logit.max(dim=-1)[0]
+            feat_mean = feat.mean(dim=-1)
+            feat_std = feat.std(dim=-1)
+            stats.append(torch.stack([entropy, max_logit, feat_mean, feat_std], dim=-1))
+            proj_feats.append(feat)
+        stats_tensor = torch.cat(stats, dim=-1)
+        features_tensor = torch.cat(proj_feats, dim=-1)
+        return torch.cat([stats_tensor, features_tensor], dim=-1)
+
+    def forward(self, features: List[torch.Tensor], logits: List[torch.Tensor]) -> torch.Tensor:
+        stats = self._compute_stats(features, logits)
+        attn_logits = self.mlp(stats) + self.bias.unsqueeze(0)
+        attn_logits = torch.clamp(attn_logits, -10.0, 10.0)
+        temp = torch.clamp(self.temperature.abs(), 0.1, 5.0)
+        weights = F.softmax(attn_logits / temp, dim=-1)
+
+        if self.training:
+            stacked = torch.stack(logits, dim=1)
+            with torch.no_grad():
+                ensemble = stacked.mean(dim=1)
+                pseudo_labels = ensemble.argmax(dim=-1)
+                confidences = F.softmax(stacked, dim=-1).max(dim=-1)[0]
+                correct = (stacked.argmax(dim=-1) == pseudo_labels.unsqueeze(1)).float()
+                self._pending_update = {
+                    "correct": correct.detach(),
+                    "confidence": confidences.detach(),
+                }
+
+        return weights
+
+    def update_ema_after_step(self):
+        if not self.training or self._pending_update is None:
+            return
+        correct = self._pending_update["correct"].mean(dim=0)
+        confidence = self._pending_update["confidence"].mean(dim=0)
+        calibration = correct / (confidence + 1e-6)
+        self.ema_accuracy.mul_(1 - self.momentum).add_(correct, alpha=self.momentum)
+        self.ema_confidence.mul_(1 - self.momentum).add_(confidence, alpha=self.momentum)
+        self.ema_calibration.mul_(1 - self.momentum).add_(calibration, alpha=self.momentum)
+        self._pending_update = None
+
+    def extra_repr(self) -> str:
+        return f"num_scales={self.num_scales}, temperature={self.temperature.item():.3f}"
+
+
+class AntiCollapseGate(nn.Module):
+    """Prevents ensemble weights from collapsing to a single expert."""
+
+    def __init__(self, num_heads: int, min_fraction: float = 0.05, entropy_weight: float = 0.01):
+        super().__init__()
+        self.num_heads = num_heads
+        self.min_fraction = min_fraction
+        self.entropy_weight = entropy_weight
+        self.bias = nn.Parameter(torch.zeros(num_heads))
+
+    def forward(self, weights: torch.Tensor, training: bool = False) -> Tuple[torch.Tensor, Dict[str, float], Optional[torch.Tensor]]:
+        logits = torch.log(torch.clamp(weights, 1e-6, 1.0)) + self.bias
+        adjusted = F.softmax(logits, dim=-1)
+        if self.min_fraction > 0:
+            adjusted = (1 - self.min_fraction * self.num_heads) * adjusted + self.min_fraction
+        stats = {
+            "mean": adjusted.mean().item(),
+            "std": adjusted.std().item(),
+            "min": adjusted.min().item(),
+            "max": adjusted.max().item(),
+        }
+        entropy = None
+        if training and self.entropy_weight > 0:
+            entropy = -(adjusted * torch.log(adjusted + 1e-8)).sum(dim=-1).mean() * self.entropy_weight
+        return adjusted, stats, entropy
 
 
 class MultiScaleTMEnsemble(nn.Module):
@@ -32,7 +516,15 @@ class MultiScaleTMEnsemble(nn.Module):
                  n_classes: int,
                  head_configs: list[dict],
                  backbone_type: str = "swin",
-                 init_temperature: float = 1.0):
+                 init_temperature: float = 1.0,
+                 stage_resolutions: Optional[Sequence[int]] = None,
+                 use_spatial_attention: bool = False,
+                 spatial_attention_heads: int = 4,
+                 spatial_attention_dim: int = 256,
+                 use_learnable_scale_attention: bool = False,
+                 scale_attention_hidden: int = 128,
+                 use_anti_collapse_gate: bool = False,
+                 gate_entropy_weight: float = 0.01):
         """
         head_configs: list of dicts, each like:
           { "stages": [0,1], "n_clauses": 200, "binarizer": "auto", "thresholds": 16, "pool": "gap" }
@@ -43,9 +535,57 @@ class MultiScaleTMEnsemble(nn.Module):
         self.backbone_type = backbone_type
         self.heads = nn.ModuleList()
         self.gate = nn.Parameter(torch.ones(len(head_configs)) / max(1, len(head_configs)))
+        self.stage_resolutions = list(stage_resolutions) if stage_resolutions is not None else None
+
+        resolution_to_stage = {}
+        if self.stage_resolutions is not None:
+            for idx, res in enumerate(self.stage_resolutions):
+                resolution_to_stage[res] = idx
+
+        self.spatial_attention = None
+        if use_spatial_attention:
+            self.spatial_attention = CrossScaleSpatialAttention(
+                dims=feature_dims,
+                num_heads=spatial_attention_heads,
+                proj_dim=spatial_attention_dim,
+            )
+
+        self.scale_attention = None
+        self.scale_feature_dim = max(32, scale_attention_hidden // 2)
+        if use_learnable_scale_attention:
+            self.scale_attention = LearnableScaleAttention(
+                num_scales=len(head_configs),
+                feature_dim=self.scale_feature_dim,
+                hidden_dim=scale_attention_hidden,
+            )
+
+        self.anti_collapse_gate = None
+        if use_anti_collapse_gate:
+            self.anti_collapse_gate = AntiCollapseGate(
+                num_heads=len(head_configs),
+                entropy_weight=gate_entropy_weight,
+            )
+        self._entropy_loss: Optional[torch.Tensor] = None
+        self.last_attention_weights: Optional[torch.Tensor] = None
+        self.last_gate_stats: Dict[str, float] = {}
 
         for cfg in head_configs:
-            stages = cfg.get("stages", [0])
+            stages: Optional[Sequence[int]] = cfg.get("stages")
+            if stages is None:
+                if "stage" in cfg:
+                    stages = [cfg["stage"]]
+                elif "resolutions" in cfg and resolution_to_stage:
+                    stages = [resolution_to_stage[r] for r in cfg["resolutions"]]
+                elif "resolution" in cfg and resolution_to_stage:
+                    stages = [resolution_to_stage[cfg["resolution"]]]
+                else:
+                    stages = [len(self.feature_dims) - 1]
+            stages = list(stages)
+
+            for s in stages:
+                if s < 0 or s >= len(self.feature_dims):
+                    raise ValueError(f"Stage index {s} out of bounds for feature dims length {len(self.feature_dims)}")
+
             n_clauses = cfg.get("n_clauses", 200)
             num_thresholds = cfg.get("thresholds", 16)
             pool = cfg.get("pool", "gap")
@@ -58,17 +598,15 @@ class MultiScaleTMEnsemble(nn.Module):
                 in_ch = feature_dims[s]
                 if binarizer == "auto":
                     if backbone_type in ["swin", "vit"]:
-                        adapters.append(SwinDualBinarizer(in_ch, num_thresholds, init_temperature))
-                        fused_dim += num_thresholds * 2
+                        adapter = SwinDualBinarizer(in_ch, num_thresholds, init_temperature, backbone_type=backbone_type)
                     else:
-                        adapters.append(CNNSingleBinarizer(in_ch, num_thresholds, init_temperature))
-                        fused_dim += num_thresholds
+                        adapter = CNNSingleBinarizer(in_ch, num_thresholds, init_temperature, backbone_type=backbone_type)
                 elif binarizer == "dual":
-                    adapters.append(SwinDualBinarizer(in_ch, num_thresholds, init_temperature))
-                    fused_dim += num_thresholds * 2
+                    adapter = SwinDualBinarizer(in_ch, num_thresholds, init_temperature, backbone_type=backbone_type)
                 else:
-                    adapters.append(CNNSingleBinarizer(in_ch, num_thresholds, init_temperature))
-                    fused_dim += num_thresholds
+                    adapter = CNNSingleBinarizer(in_ch, num_thresholds, init_temperature, backbone_type=backbone_type)
+                adapters.append(adapter)
+                fused_dim += adapter.output_channels
 
             projector = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1) if pool == "gap" else nn.AdaptiveMaxPool2d(1),
@@ -84,8 +622,15 @@ class MultiScaleTMEnsemble(nn.Module):
             head.stages = adapters
             head.projector = projector
             head.tm = tm
+            if use_learnable_scale_attention:
+                head.feature_proj = nn.Sequential(
+                    nn.Dropout(0.1),
+                    nn.Linear(max(32, fused_dim // 2), self.scale_feature_dim),
+                )
+            else:
+                head.feature_proj = nn.Identity()
             # store cfg as plain attribute
-            head.cfg = cfg
+            head.cfg = dict(cfg, stages=stages)
             self.heads.append(head)
 
     def set_temperature(self, t: float):
@@ -94,12 +639,31 @@ class MultiScaleTMEnsemble(nn.Module):
                 if hasattr(adapter, "set_temperature"):
                     adapter.set_temperature(t)
 
+    def anneal_binarizers(self, factor: float = 0.95):
+        for head in self.heads:
+            for adapter in head.stages:
+                if hasattr(adapter, "anneal_temperature"):
+                    adapter.anneal_temperature(factor)
+
+    def reset_binarizers(self):
+        for head in self.heads:
+            for adapter in head.stages:
+                if hasattr(adapter, "reset_running_stats"):
+                    adapter.reset_running_stats()
+
     def forward(self, multi_scale_features: list[torch.Tensor], use_ste: bool = True):
         logits_list, clause_list = [], []
+        head_features: List[torch.Tensor] = []
+
+        feature_source = multi_scale_features
+        if self.spatial_attention is not None:
+            feature_source = self.spatial_attention(multi_scale_features)
+
         for head in self.heads:
             adapters = head.stages
-            feats = []
-            for adapter, feat_map in zip(adapters, [multi_scale_features[s] for s in head.cfg["stages"]]):
+            selected_feats = [feature_source[s] for s in head.cfg["stages"]]
+            feats: List[torch.Tensor] = []
+            for adapter, feat_map in zip(adapters, selected_feats):
                 b = adapter(feat_map, use_discrete=not self.training)
                 b = F.adaptive_avg_pool2d(b, 1)  # unify spatial dims to 1x1
                 feats.append(b)
@@ -108,10 +672,36 @@ class MultiScaleTMEnsemble(nn.Module):
             logits, clauses = head.tm(x, use_ste=use_ste)
             logits_list.append(logits)
             clause_list.append(clauses)
+            head_features.append(head.feature_proj(x))
 
-        weights = F.softmax(self.gate, dim=0)
         stacked = torch.stack(logits_list, dim=1)  # [B, H, C]
-        final_logits = torch.sum(stacked * weights.view(1, -1, 1), dim=1)
+
+        if self.scale_attention is not None:
+            weights = self.scale_attention(head_features, logits_list)
+        else:
+            base_weights = F.softmax(self.gate, dim=0)
+            weights = base_weights.unsqueeze(0).expand(stacked.shape[0], -1)
+
+        gate_stats: Dict[str, float] = {}
+        entropy_loss: Optional[torch.Tensor] = None
+        if self.anti_collapse_gate is not None:
+            weights, gate_stats, entropy_loss = self.anti_collapse_gate(weights, training=self.training)
+
+        final_logits = torch.sum(stacked * weights.unsqueeze(-1), dim=1)
+
+        self._entropy_loss = entropy_loss
+        self.last_attention_weights = weights.detach()
+        self.last_gate_stats = gate_stats
         return final_logits, logits_list, clause_list
+
+    def attention_entropy_loss(self) -> Optional[torch.Tensor]:
+        return self._entropy_loss
+
+    def update_attention_ema(self):
+        if self.scale_attention is not None:
+            self.scale_attention.update_ema_after_step()
+
+    def get_gate_diagnostics(self) -> Dict[str, float]:
+        return dict(self.last_gate_stats)
 
 
