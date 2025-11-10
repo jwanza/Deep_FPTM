@@ -1,0 +1,179 @@
+{
+  "run_name": "resnet_tm_tm",
+  "metadata": {
+    "model_name": "resnet_tm",
+    "epochs": 1,
+    "lr": 0.0005,
+    "min_lr": 0.0005,
+    "weight_decay": 1e-05,
+    "grad_clip": 0.5,
+    "grad_accum": 1,
+    "tau_start": 0.6,
+    "tau_end": 0.3,
+    "warmup_epochs": 0,
+    "stage_configs": [
+      {
+        "variant": "18",
+        "layers": [
+          2,
+          2,
+          2,
+          2
+        ],
+        "channels": [
+          64,
+          128,
+          256,
+          512
+        ],
+        "tm_hidden": 256,
+        "tm_clauses": 128
+      }
+    ],
+    "seed": 123,
+    "device": "cpu",
+    "attention_heads": 2,
+    "use_clause_attention": true,
+    "use_scale_attention": true,
+    "scale_entropy_weight": 0.01,
+    "ema_decay": 0.0,
+    "input_noise_std": 0.0,
+    "tm_variant": "resnet_tm",
+    "export_path": null,
+    "patch_size": 4,
+    "batch_multiplier": 1,
+    "virtual_batch_multiplier": 1,
+    "swin_tm_preset": "tiny",
+    "resnet_tm_variant": "18"
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "train_loss": 2.2857873196297502,
+      "train_accuracy": 0.14223333333333332,
+      "eval_accuracy": 0.1028,
+      "duration_s": 96.04469633102417,
+      "diagnostics": {
+        "tau": {
+          "stages.0.0.tm": 0.6,
+          "stages.0.1.tm": 0.6,
+          "stages.1.0.tm": 0.6,
+          "stages.1.1.tm": 0.6,
+          "stages.2.0.tm": 0.6,
+          "stages.2.1.tm": 0.6,
+          "stages.3.0.tm": 0.6,
+          "stages.3.1.tm": 0.6,
+          "stage_heads.0": 0.6,
+          "stage_heads.1": 0.6,
+          "stage_heads.2": 0.6,
+          "stage_heads.3": 0.6,
+          "final_tm": 0.6
+        },
+        "clause_sparsity": {
+          "stages.0.0.tm": {
+            "positive": 0.50103759765625,
+            "negative": 0.5040283203125,
+            "positive_inv": 0.5029296875,
+            "negative_inv": 0.504638671875,
+            "overall": 0.5031585693359375
+          },
+          "stages.0.1.tm": {
+            "positive": 0.49896240234375,
+            "negative": 0.504150390625,
+            "positive_inv": 0.497802734375,
+            "negative_inv": 0.50921630859375,
+            "overall": 0.502532958984375
+          },
+          "stages.1.0.tm": {
+            "positive": 0.50799560546875,
+            "negative": 0.50140380859375,
+            "positive_inv": 0.50616455078125,
+            "negative_inv": 0.50604248046875,
+            "overall": 0.505401611328125
+          },
+          "stages.1.1.tm": {
+            "positive": 0.50140380859375,
+            "negative": 0.5032958984375,
+            "positive_inv": 0.4990234375,
+            "negative_inv": 0.49774169921875,
+            "overall": 0.5003662109375
+          },
+          "stages.2.0.tm": {
+            "positive": 0.5059814453125,
+            "negative": 0.500244140625,
+            "positive_inv": 0.49072265625,
+            "negative_inv": 0.5,
+            "overall": 0.499237060546875
+          },
+          "stages.2.1.tm": {
+            "positive": 0.4962158203125,
+            "negative": 0.50457763671875,
+            "positive_inv": 0.5081787109375,
+            "negative_inv": 0.49957275390625,
+            "overall": 0.50213623046875
+          },
+          "stages.3.0.tm": {
+            "positive": 0.507080078125,
+            "negative": 0.4986572265625,
+            "positive_inv": 0.5,
+            "negative_inv": 0.49786376953125,
+            "overall": 0.5009002685546875
+          },
+          "stages.3.1.tm": {
+            "positive": 0.4986572265625,
+            "negative": 0.49981689453125,
+            "positive_inv": 0.49761962890625,
+            "negative_inv": 0.50384521484375,
+            "overall": 0.4999847412109375
+          },
+          "stage_heads.0": {
+            "positive": 0.5067138671875,
+            "negative": 0.50115966796875,
+            "positive_inv": 0.49755859375,
+            "negative_inv": 0.50775146484375,
+            "overall": 0.5032958984375
+          },
+          "stage_heads.1": {
+            "positive": 0.50244140625,
+            "negative": 0.492919921875,
+            "positive_inv": 0.50006103515625,
+            "negative_inv": 0.507080078125,
+            "overall": 0.5006256103515625
+          },
+          "stage_heads.2": {
+            "positive": 0.50146484375,
+            "negative": 0.50701904296875,
+            "positive_inv": 0.50616455078125,
+            "negative_inv": 0.4964599609375,
+            "overall": 0.502777099609375
+          },
+          "stage_heads.3": {
+            "positive": 0.4951171875,
+            "negative": 0.5028076171875,
+            "positive_inv": 0.501953125,
+            "negative_inv": 0.50201416015625,
+            "overall": 0.5004730224609375
+          },
+          "final_tm": {
+            "positive": 0.50262451171875,
+            "negative": 0.507568359375,
+            "positive_inv": 0.50244140625,
+            "negative_inv": 0.4957275390625,
+            "overall": 0.5020904541015625
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0005,
+        "best_test_acc": 0.1028,
+        "world_size": 1,
+        "stage_acc_0": 0.101,
+        "stage_acc_1": 0.101,
+        "stage_acc_2": 0.1009,
+        "stage_acc_3": 0.0982,
+        "stage_acc_4": 0.1028
+      }
+    }
+  ]
+}

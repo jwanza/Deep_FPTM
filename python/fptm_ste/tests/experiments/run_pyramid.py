@@ -119,7 +119,7 @@ def extract_final_and_stage_logits(model_core, outputs) -> Tuple[torch.Tensor, L
     stage_logits: List[torch.Tensor] = []
     if isinstance(model_core, PyramidTM):
         if isinstance(outputs, tuple) and len(outputs) > 1 and isinstance(outputs[1], list):
-            stage_logits = list(outputs[1]) + [final_logits]
+            stage_logits = list(outputs[1])
     elif isinstance(model_core, SwinLikePyramidTM):
         if isinstance(outputs, tuple) and len(outputs) > 1 and isinstance(outputs[1], list):
             stage_logits = list(outputs[1])
@@ -133,6 +133,9 @@ def extract_final_and_stage_logits(model_core, outputs) -> Tuple[torch.Tensor, L
 
     if not stage_logits:
         stage_logits = [final_logits]
+    elif stage_logits[-1].shape != final_logits.shape:
+        stage_logits.append(final_logits)
+
     return final_logits, stage_logits
 
 
@@ -499,6 +502,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 "patch_size": args.patch_size,
                 "batch_multiplier": world_size,
                 "virtual_batch_multiplier": virtual_multiplier,
+                "stage_aux_weight": args.stage_aux_weight,
                 "swin_tm_preset": args.swin_tm_preset,
                 "resnet_tm_variant": args.resnet_tm_variant,
             },
@@ -546,11 +550,18 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 accum_counter += 1
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                     outputs = model(micro_x, use_ste=False)
-                    logits, _ = extract_final_and_stage_logits(model_core, outputs)
+                    logits, stage_logits = extract_final_and_stage_logits(model_core, outputs)
                     loss = F.cross_entropy(logits, micro_y)
-                    aux_loss = model.attention_entropy_loss() if hasattr(model, "attention_entropy_loss") else None
-                    if aux_loss is not None:
-                        loss = loss + aux_loss
+                    stage_aux_loss = None
+                    if args.stage_aux_weight > 0:
+                        aux_heads = stage_logits[:-1] if len(stage_logits) > 1 else []
+                        if aux_heads:
+                            aux_terms = [F.cross_entropy(s_logits, micro_y) for s_logits in aux_heads]
+                            stage_aux_loss = sum(aux_terms) / len(aux_terms)
+                            loss = loss + args.stage_aux_weight * stage_aux_loss
+                    attn_aux_loss = model.attention_entropy_loss() if hasattr(model, "attention_entropy_loss") else None
+                    if attn_aux_loss is not None:
+                        loss = loss + attn_aux_loss
                     scaled_loss = loss / args.grad_accum
                 scaler.scale(scaled_loss).backward()
 
@@ -731,6 +742,7 @@ def main() -> None:
     parser.add_argument("--resnet-tm-variant", type=str, default="18", choices=["18", "34", "50", "101"])
     parser.add_argument("--resnet-tm-hidden", type=int, default=256)
     parser.add_argument("--resnet-tm-clauses", type=int, default=128)
+    parser.add_argument("--stage-aux-weight", type=float, default=0.25, help="Weight for auxiliary CE on stage heads (0 disables)")
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--batch-multiplier", type=int, default=1, help="Number of parallel replicas (world size)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend to use")
