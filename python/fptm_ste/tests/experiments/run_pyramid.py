@@ -271,6 +271,7 @@ def main() -> None:
             "input_noise_std": args.input_noise_std,
             "tm_variant": args.tm_variant,
             "export_path": str(args.export_path) if args.export_path else None,
+            "patch_size": args.patch_size,
         },
     )
 
