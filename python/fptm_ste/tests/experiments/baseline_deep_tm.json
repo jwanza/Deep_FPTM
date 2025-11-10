@@ -1,0 +1,93 @@
+{
+  "model_name": "DeepTMNetwork",
+  "params": {
+    "input_dim": 784,
+    "hidden_dims": [
+      256,
+      128
+    ],
+    "n_classes": 10,
+    "n_clauses": 256,
+    "dropout": 0.1,
+    "tau": 0.5,
+    "noise_std": 0.0
+  },
+  "device": "cuda",
+  "epochs": 10,
+  "lr": 0.001,
+  "weight_decay": 1e-05,
+  "grad_clip": 0.5,
+  "seed": 42,
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "loss": 1.2430554939104295,
+      "train_acc": 0.6997,
+      "test_acc": 0.8769,
+      "duration_s": 11.032912015914917
+    },
+    {
+      "epoch": 2,
+      "loss": 0.35375679447961006,
+      "train_acc": 0.8991833333333333,
+      "test_acc": 0.9151,
+      "duration_s": 11.107776165008545
+    },
+    {
+      "epoch": 3,
+      "loss": 0.27001039272368843,
+      "train_acc": 0.9198,
+      "test_acc": 0.9236,
+      "duration_s": 11.194810152053833
+    },
+    {
+      "epoch": 4,
+      "loss": 0.23389041541354744,
+      "train_acc": 0.92975,
+      "test_acc": 0.9331,
+      "duration_s": 11.34440302848816
+    },
+    {
+      "epoch": 5,
+      "loss": 0.2131929352228194,
+      "train_acc": 0.9358166666666666,
+      "test_acc": 0.9354,
+      "duration_s": 11.22139310836792
+    },
+    {
+      "epoch": 6,
+      "loss": 0.1960567214023838,
+      "train_acc": 0.9409333333333333,
+      "test_acc": 0.9362,
+      "duration_s": 11.231768369674683
+    },
+    {
+      "epoch": 7,
+      "loss": 0.18260925646021423,
+      "train_acc": 0.9435,
+      "test_acc": 0.9377,
+      "duration_s": 10.768922805786133
+    },
+    {
+      "epoch": 8,
+      "loss": 0.1692367980220933,
+      "train_acc": 0.9481166666666667,
+      "test_acc": 0.9419,
+      "duration_s": 11.139086723327637
+    },
+    {
+      "epoch": 9,
+      "loss": 0.16068478476708886,
+      "train_acc": 0.9499,
+      "test_acc": 0.9464,
+      "duration_s": 11.115028381347656
+    },
+    {
+      "epoch": 10,
+      "loss": 0.15109910777033264,
+      "train_acc": 0.9535833333333333,
+      "test_acc": 0.9481,
+      "duration_s": 11.121163368225098
+    }
+  ]
+}

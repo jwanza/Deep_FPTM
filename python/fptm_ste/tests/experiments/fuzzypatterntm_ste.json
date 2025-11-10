@@ -1,0 +1,87 @@
+{
+  "run_name": "fuzzypatterntm_ste",
+  "metadata": {
+    "model_name": "FuzzyPatternTM_STE",
+    "params": {
+      "n_features": 784,
+      "n_clauses": 256,
+      "n_classes": 10,
+      "tau": 0.4
+    },
+    "epochs": 3,
+    "lr": 0.001,
+    "weight_decay": 1e-05,
+    "grad_clip": 0.5,
+    "threshold": 0.5,
+    "seed": 42,
+    "device": "cuda"
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "train_loss": 2.276954488205249,
+      "train_accuracy": 0.16045,
+      "eval_accuracy": 0.1556,
+      "duration_s": 5.167295217514038,
+      "diagnostics": {
+        "tau": {
+          "root": 0.4
+        },
+        "clause_sparsity": {
+          "root": {
+            "positive": 0.38272279500961304,
+            "negative": 0.3757075071334839,
+            "positive_inv": 0.48935744166374207,
+            "negative_inv": 0.49613359570503235,
+            "overall": 0.43598034977912903
+          }
+        },
+        "attention": {}
+      }
+    },
+    {
+      "epoch": 2,
+      "train_loss": 2.1776114531925748,
+      "train_accuracy": 0.37748333333333334,
+      "eval_accuracy": 0.3994,
+      "duration_s": 4.405867576599121,
+      "diagnostics": {
+        "tau": {
+          "root": 0.4
+        },
+        "clause_sparsity": {
+          "root": {
+            "positive": 0.22086255252361298,
+            "negative": 0.21306002140045166,
+            "positive_inv": 0.4801996946334839,
+            "negative_inv": 0.4890385866165161,
+            "overall": 0.35079020261764526
+          }
+        },
+        "attention": {}
+      }
+    },
+    {
+      "epoch": 3,
+      "train_loss": 1.927145953117403,
+      "train_accuracy": 0.5379833333333334,
+      "eval_accuracy": 0.6347,
+      "duration_s": 4.111065626144409,
+      "diagnostics": {
+        "tau": {
+          "root": 0.4
+        },
+        "clause_sparsity": {
+          "root": {
+            "positive": 0.18445073068141937,
+            "negative": 0.1774653196334839,
+            "positive_inv": 0.4718789756298065,
+            "negative_inv": 0.4827905595302582,
+            "overall": 0.3291463851928711
+          }
+        },
+        "attention": {}
+      }
+    }
+  ]
+}

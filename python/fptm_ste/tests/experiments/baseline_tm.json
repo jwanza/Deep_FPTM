@@ -1,0 +1,87 @@
+{
+  "model_name": "FuzzyPatternTM_STE",
+  "params": {
+    "n_features": 784,
+    "n_clauses": 256,
+    "n_classes": 10,
+    "tau": 0.4
+  },
+  "device": "cuda",
+  "epochs": 10,
+  "lr": 0.001,
+  "weight_decay": 1e-05,
+  "grad_clip": 0.5,
+  "seed": 42,
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "loss": 2.276954488205249,
+      "train_acc": 0.16045,
+      "test_acc": 0.1556,
+      "duration_s": 4.95707631111145
+    },
+    {
+      "epoch": 2,
+      "loss": 2.1776114531925748,
+      "train_acc": 0.37748333333333334,
+      "test_acc": 0.3994,
+      "duration_s": 4.479733943939209
+    },
+    {
+      "epoch": 3,
+      "loss": 1.927145953117403,
+      "train_acc": 0.5379833333333334,
+      "test_acc": 0.6347,
+      "duration_s": 4.553575038909912
+    },
+    {
+      "epoch": 4,
+      "loss": 1.5560997157717056,
+      "train_acc": 0.6402166666666667,
+      "test_acc": 0.6986,
+      "duration_s": 4.6491920948028564
+    },
+    {
+      "epoch": 5,
+      "loss": 1.233618225115957,
+      "train_acc": 0.7230166666666666,
+      "test_acc": 0.7436,
+      "duration_s": 4.582208633422852
+    },
+    {
+      "epoch": 6,
+      "loss": 1.016813058970071,
+      "train_acc": 0.7665333333333333,
+      "test_acc": 0.7715,
+      "duration_s": 4.603613376617432
+    },
+    {
+      "epoch": 7,
+      "loss": 0.8720786666819281,
+      "train_acc": 0.79765,
+      "test_acc": 0.8063,
+      "duration_s": 4.59088134765625
+    },
+    {
+      "epoch": 8,
+      "loss": 0.7721992605276453,
+      "train_acc": 0.8155,
+      "test_acc": 0.8225,
+      "duration_s": 4.671043634414673
+    },
+    {
+      "epoch": 9,
+      "loss": 0.699261082642114,
+      "train_acc": 0.82945,
+      "test_acc": 0.8444,
+      "duration_s": 4.4472315311431885
+    },
+    {
+      "epoch": 10,
+      "loss": 0.6437922470859373,
+      "train_acc": 0.8399833333333333,
+      "test_acc": 0.8495,
+      "duration_s": 4.565778493881226
+    }
+  ]
+}

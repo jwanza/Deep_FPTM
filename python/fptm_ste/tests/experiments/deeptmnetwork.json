@@ -1,0 +1,141 @@
+{
+  "run_name": "deeptmnetwork",
+  "metadata": {
+    "model_name": "DeepTMNetwork",
+    "params": {
+      "input_dim": 784,
+      "hidden_dims": [
+        256,
+        128
+      ],
+      "n_classes": 10,
+      "n_clauses": 256,
+      "dropout": 0.1,
+      "tau": 0.5,
+      "noise_std": 0.0
+    },
+    "epochs": 3,
+    "lr": 0.001,
+    "weight_decay": 1e-05,
+    "grad_clip": 0.5,
+    "threshold": 0.5,
+    "seed": 42,
+    "device": "cuda"
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "train_loss": 1.2466518891010203,
+      "train_accuracy": 0.6981,
+      "eval_accuracy": 0.8792,
+      "duration_s": 10.948375463485718,
+      "diagnostics": {
+        "tau": {
+          "layers.0": 0.5,
+          "layers.1": 0.5,
+          "classifier": 0.5
+        },
+        "clause_sparsity": {
+          "layers.0": {
+            "positive": 0.30013352632522583,
+            "negative": 0.2960379421710968,
+            "positive_inv": 0.49755859375,
+            "negative_inv": 0.4977778196334839,
+            "overall": 0.3978769779205322
+          },
+          "layers.1": {
+            "positive": 0.091705322265625,
+            "negative": 0.08258056640625,
+            "positive_inv": 0.5042724609375,
+            "negative_inv": 0.502105712890625,
+            "overall": 0.295166015625
+          },
+          "classifier": {
+            "positive": 0.407318115234375,
+            "negative": 0.407745361328125,
+            "positive_inv": 0.506439208984375,
+            "negative_inv": 0.50726318359375,
+            "overall": 0.45719146728515625
+          }
+        },
+        "attention": {}
+      }
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.35438708325566004,
+      "train_accuracy": 0.8995166666666666,
+      "eval_accuracy": 0.9141,
+      "duration_s": 10.436585903167725,
+      "diagnostics": {
+        "tau": {
+          "layers.0": 0.5,
+          "layers.1": 0.5,
+          "classifier": 0.5
+        },
+        "clause_sparsity": {
+          "layers.0": {
+            "positive": 0.25295957922935486,
+            "negative": 0.2559291124343872,
+            "positive_inv": 0.5055803656578064,
+            "negative_inv": 0.5039560794830322,
+            "overall": 0.3796062767505646
+          },
+          "layers.1": {
+            "positive": 0.026519775390625,
+            "negative": 0.01800537109375,
+            "positive_inv": 0.5045166015625,
+            "negative_inv": 0.5029296875,
+            "overall": 0.26299285888671875
+          },
+          "classifier": {
+            "positive": 0.386444091796875,
+            "negative": 0.38702392578125,
+            "positive_inv": 0.51422119140625,
+            "negative_inv": 0.514739990234375,
+            "overall": 0.4506072998046875
+          }
+        },
+        "attention": {}
+      }
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.26185313497842755,
+      "train_accuracy": 0.923,
+      "eval_accuracy": 0.9207,
+      "duration_s": 10.1931631565094,
+      "diagnostics": {
+        "tau": {
+          "layers.0": 0.5,
+          "layers.1": 0.5,
+          "classifier": 0.5
+        },
+        "clause_sparsity": {
+          "layers.0": {
+            "positive": 0.20071348547935486,
+            "negative": 0.21584023535251617,
+            "positive_inv": 0.5076729655265808,
+            "negative_inv": 0.5047731995582581,
+            "overall": 0.3572499752044678
+          },
+          "layers.1": {
+            "positive": 0.014678955078125,
+            "negative": 0.00836181640625,
+            "positive_inv": 0.50714111328125,
+            "negative_inv": 0.50701904296875,
+            "overall": 0.25930023193359375
+          },
+          "classifier": {
+            "positive": 0.37939453125,
+            "negative": 0.381683349609375,
+            "positive_inv": 0.517181396484375,
+            "negative_inv": 0.5174560546875,
+            "overall": 0.4489288330078125
+          }
+        },
+        "attention": {}
+      }
+    }
+  ]
+}

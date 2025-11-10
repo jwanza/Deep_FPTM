@@ -4,6 +4,7 @@ MNIST equivalence runner with profiling and accelerated training.
 - Uses fuzzy (float) inputs for learning stability
 - Skips regenerating boolean datasets if cached
 - Exports compiled literals to JSON for Julia bridge
+- Supports MNIST, Fashion-MNIST, and CIFAR-10 dataset options
 """
 
 import argparse
@@ -33,6 +34,38 @@ EXPORT_SLUGS = {
     "deep_tm": "deeptm",
     "hybrid": "hybrid",
     "transformer": "transformer",
+}
+DEFAULT_DATA_ROOT = os.environ.get("TM_DATA_ROOT", os.environ.get("TM_MNIST_ROOT", "/tmp/mnist"))
+DEFAULT_BOOL_TRAIN_PATH = os.environ.get("TM_BOOL_TRAIN_PATH", "/tmp/MNISTTrainingData.txt")
+DEFAULT_BOOL_TEST_PATH = os.environ.get("TM_BOOL_TEST_PATH", "/tmp/MNISTTestData.txt")
+DEFAULT_OUTPUT_JSON = os.environ.get("TM_OUTPUT_JSON", "/tmp/mnist_equiv_results.json")
+DEFAULT_EXPORT_PREFIX = os.environ.get("TM_EXPORT_PREFIX", "tm_mnist")
+
+DATASET_CONFIGS = {
+    "mnist": {
+        "train_class": datasets.MNIST,
+        "test_class": datasets.MNIST,
+        "transform": transforms.ToTensor(),
+        "input_channels": 1,
+        "image_size": (28, 28),
+        "num_classes": 10,
+    },
+    "fashionmnist": {
+        "train_class": datasets.FashionMNIST,
+        "test_class": datasets.FashionMNIST,
+        "transform": transforms.ToTensor(),
+        "input_channels": 1,
+        "image_size": (28, 28),
+        "num_classes": 10,
+    },
+    "cifar10": {
+        "train_class": datasets.CIFAR10,
+        "test_class": datasets.CIFAR10,
+        "transform": transforms.ToTensor(),
+        "input_channels": 3,
+        "image_size": (32, 32),
+        "num_classes": 10,
+    },
 }
 
 
@@ -114,6 +147,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Subset of model variants to train. Defaults to all variants.",
     )
+    parser.add_argument(
+        "--dataset",
+        choices=sorted(DATASET_CONFIGS.keys()),
+        default=os.environ.get("TM_DATASET", "mnist"),
+        help="Dataset to use for training and evaluation.",
+    )
     parser.add_argument("--epochs", type=int, default=int_env("TM_MNIST_EPOCHS", 25), help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=int_env("TM_MNIST_BATCH", 128), help="Training batch size.")
     parser.add_argument(
@@ -122,17 +161,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=int_env("TM_MNIST_TEST_BATCH", 512),
         help="Evaluation batch size.",
     )
-    parser.add_argument("--num-classes", type=int, default=10, help="Number of target classes.")
+    parser.add_argument("--num-classes", type=int, default=None, help="Number of target classes.")
     parser.add_argument(
         "--dataset-root",
-        default=os.environ.get("TM_MNIST_ROOT", "/tmp/mnist"),
-        help="Root directory for the MNIST dataset.",
+        default=DEFAULT_DATA_ROOT,
+        help="Root directory where the selected dataset will be stored.",
     )
     parser.add_argument(
         "--download",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Allow torchvision to download MNIST if missing.",
+        help="Allow torchvision to download the dataset if missing.",
     )
     parser.add_argument("--num-workers", type=int, default=4, help="Number of worker processes for DataLoaders.")
     parser.add_argument(
@@ -151,27 +190,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--write-bool-dataset",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Toggle writing cached boolean MNIST datasets.",
+        help="Toggle writing cached boolean dataset dumps to disk.",
     )
     parser.add_argument(
         "--bool-threshold",
         type=float,
         default=0.5,
-        help="Threshold applied when binarizing MNIST tensors.",
+        help="Threshold applied when binarizing input tensors.",
     )
     parser.add_argument(
         "--bool-train-path",
-        default="/tmp/MNISTTrainingData.txt",
+        default=DEFAULT_BOOL_TRAIN_PATH,
         help="File path for the boolean training dataset export.",
     )
     parser.add_argument(
         "--bool-test-path",
-        default="/tmp/MNISTTestData.txt",
+        default=DEFAULT_BOOL_TEST_PATH,
         help="File path for the boolean test dataset export.",
     )
     parser.add_argument(
         "--output-json",
-        default="/tmp/mnist_equiv_results.json",
+        default=DEFAULT_OUTPUT_JSON,
         help="Path to the metrics summary JSON file.",
     )
     parser.add_argument(
@@ -182,7 +221,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--export-prefix",
-        default="tm_mnist",
+        default=DEFAULT_EXPORT_PREFIX,
         help="Prefix used for compiled literal artifact filenames.",
     )
     parser.add_argument(
@@ -201,6 +240,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=bool_env("TM_MNIST_REPORT_EPOCH", False),
         help="Include training accuracy in epoch summary lines.",
+    )
+    parser.add_argument(
+        "--report-epoch-test",
+        action=argparse.BooleanOptionalAction,
+        default=bool_env("TM_MNIST_REPORT_EPOCH_TEST", False),
+        help="Evaluate on the test set and log test accuracy after each epoch.",
     )
     parser.add_argument(
         "--device",
@@ -344,9 +389,12 @@ def evaluate_model(model: nn.Module,
                    prepare_fn: Callable[[torch.Tensor], torch.Tensor],
                    loader: DataLoader,
                    device: torch.device,
-                   use_ste: bool) -> Tuple[float, List[int]]:
+                   use_ste: bool,
+                   *,
+                   collect_preds: bool = True) -> Tuple[float, List[int]]:
+    was_training = model.training
     model.eval()
-    preds = []
+    preds: List[int] = [] if collect_preds else []
     correct = 0
     total = 0
     with torch.no_grad():
@@ -355,10 +403,13 @@ def evaluate_model(model: nn.Module,
             xb = prepare_fn(x)
             logits, _ = model(xb, use_ste=use_ste)
             pred = logits.argmax(dim=1)
-            preds.extend(pred.cpu().tolist())
+            if collect_preds:
+                preds.extend(pred.cpu().tolist())
             correct += (pred == y).sum().item()
             total += y.size(0)
     acc = correct / total
+    if was_training:
+        model.train()
     return acc, preds
 
 
@@ -372,7 +423,8 @@ def train_tm_model(model: nn.Module,
                    use_ste_eval: bool,
                    epochs: int,
                    report_train_acc: bool,
-                   report_epoch_acc: bool) -> Tuple[Optional[float], float, float, List[int]]:
+                   report_epoch_acc: bool,
+                   report_epoch_test: bool) -> Tuple[Optional[float], float, float, List[int]]:
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -403,13 +455,25 @@ def train_tm_model(model: nn.Module,
         dur = time.time() - epoch_start
         avg_loss = running_loss / batch_idx
         epoch_acc = None
+        epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
-        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss {avg_loss:.4f}"
+        if report_epoch_test:
+            epoch_test_acc, _ = evaluate_model(
+                model,
+                prepare_fn,
+                test_loader,
+                device,
+                use_ste=use_ste_eval,
+                collect_preds=False,
+            )
+        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
         if epoch_acc is not None and report_epoch_acc:
-            log_msg += f" | train_acc {epoch_acc:.4f}"
-        log_msg += f" | {dur:5.1f}s | seen {batch_idx * train_loader.batch_size}"
+            log_msg += f" | train_acc={epoch_acc:.4f}"
+        if epoch_test_acc is not None:
+            log_msg += f" | test_acc={epoch_test_acc:.4f}"
+        log_msg += f" | {dur:4.1f}s"
         print(log_msg)
     train_time = time.time() - start
     test_acc, preds = evaluate_model(model, prepare_fn, test_loader, device, use_ste=use_ste_eval)
@@ -419,10 +483,17 @@ def train_tm_model(model: nn.Module,
 class CNNHybrid(nn.Module):
     """Small CNN backbone + learnable binarizer feeding a TM head."""
 
-    def __init__(self, thresholds: int = 32, tm_clauses: int = 384, n_classes: int = 10):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        thresholds: int = 32,
+        tm_clauses: int = 384,
+        n_classes: int = 10,
+        tm_tau: float = 0.5,
+    ):
         super().__init__()
         self.backbone = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(in_channels, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
         )
         self.binarizer = CNNSingleBinarizer(in_channels=64, num_thresholds=thresholds, init_temperature=1.0)
@@ -432,7 +503,7 @@ class CNNHybrid(nn.Module):
             nn.Linear(fused_dim, max(64, fused_dim)), nn.GELU(),
             nn.Linear(max(64, fused_dim), max(32, fused_dim // 2)), nn.Sigmoid(),
         )
-        self.tm = FuzzyPatternTM_STE(max(32, fused_dim // 2), tm_clauses, n_classes, tau=0.5)
+        self.tm = FuzzyPatternTM_STE(max(32, fused_dim // 2), tm_clauses, n_classes, tau=tm_tau)
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
         feats = self.backbone(x)
@@ -450,6 +521,8 @@ def run_variant_tm(train_loader,
                    epochs: int,
                    report_train_acc: bool,
                    report_epoch_acc: bool,
+                   report_epoch_test: bool,
+                   n_features: int,
                    tm_impl: str,
                    tm_tau: float,
                    tm_lf: int,
@@ -458,7 +531,6 @@ def run_variant_tm(train_loader,
                    tm_n_clauses: int,
                    n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
-    n_features = 28 * 28
     if tm_impl == "fptm":
         model = FuzzyPatternTMFPTM(
             n_features=n_features,
@@ -493,6 +565,7 @@ def run_variant_tm(train_loader,
         epochs=epochs,
         report_train_acc=report_train_acc,
         report_epoch_acc=report_epoch_acc,
+        report_epoch_test=report_epoch_test,
     )
     bundle = model.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle
@@ -505,13 +578,15 @@ def run_variant_deeptm(train_loader,
                        epochs: int,
                        report_train_acc: bool,
                        report_epoch_acc: bool,
+                       report_epoch_test: bool,
+                       input_dim: int,
                        hidden_dims: List[int],
                        n_clauses: int,
                        dropout: float,
                        tau: float,
                        n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = DeepTMNetwork(
-        input_dim=28 * 28,
+        input_dim=input_dim,
         hidden_dims=hidden_dims,
         n_classes=n_classes,
         n_clauses=n_clauses,
@@ -531,6 +606,7 @@ def run_variant_deeptm(train_loader,
         epochs=epochs,
         report_train_acc=report_train_acc,
         report_epoch_acc=report_epoch_acc,
+        report_epoch_test=report_epoch_test,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle
@@ -543,10 +619,19 @@ def run_variant_hybrid(train_loader,
                        epochs: int,
                        report_train_acc: bool,
                        report_epoch_acc: bool,
+                       report_epoch_test: bool,
+                       in_channels: int,
                        thresholds: int,
                        tm_clauses: int,
+                       tm_tau: float,
                        n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
-    model = CNNHybrid(thresholds=thresholds, tm_clauses=tm_clauses, n_classes=n_classes).to(device)
+    model = CNNHybrid(
+        in_channels=in_channels,
+        thresholds=thresholds,
+        tm_clauses=tm_clauses,
+        n_classes=n_classes,
+        tm_tau=tm_tau,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -577,28 +662,28 @@ def run_variant_hybrid(train_loader,
         dur = time.time() - epoch_start
         avg_loss = running_loss / batch_idx
         epoch_acc = None
+        epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
-        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss {avg_loss:.4f}"
+        if report_epoch_test:
+            epoch_test_acc, _ = evaluate_model(
+                model,
+                lambda t: t,
+                test_loader,
+                device,
+                use_ste=True,
+                collect_preds=False,
+            )
+        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
         if epoch_acc is not None and report_epoch_acc:
-            log_msg += f" | train_acc {epoch_acc:.4f}"
-        log_msg += f" | {dur:5.1f}s | seen {batch_idx * train_loader.batch_size}"
+            log_msg += f" | train_acc={epoch_acc:.4f}"
+        if epoch_test_acc is not None:
+            log_msg += f" | test_acc={epoch_test_acc:.4f}"
+        log_msg += f" | {dur:4.1f}s"
         print(log_msg)
     train_time = time.time() - start
-    model.eval()
-    preds = []
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for x, y in test_loader:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            logits, _ = model(x, use_ste=True)
-            pred = logits.argmax(dim=1)
-            preds.extend(pred.cpu().tolist())
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-    test_acc = correct / total
+    test_acc, preds = evaluate_model(model, lambda t: t, test_loader, device, use_ste=True)
     bundle = model.tm.discretize(threshold=0.5)
     return label, last_train_acc, test_acc, train_time, preds, bundle
 
@@ -610,17 +695,43 @@ def run_variant_transformer(train_loader,
                             epochs: int,
                             report_train_acc: bool,
                             report_epoch_acc: bool,
+                            report_epoch_test: bool,
                             vocab_size: int,
                             d_model: int,
                             n_heads: int,
                             num_layers: int,
-                            n_clauses: int) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
+                            n_clauses: int,
+                            max_len: int) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
+    def eval_transformer(model: nn.Module,
+                         loader: DataLoader,
+                         device: torch.device,
+                         *,
+                         collect_preds: bool) -> Tuple[float, List[int]]:
+        was_training = model.training
+        model.eval()
+        preds: List[int] = [] if collect_preds else []
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x, y in loader:
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                tokens = (x.view(x.size(0), -1) * 255).long()
+                logits = model(tokens, use_ste=True)
+                pred = logits[:, -1, :].argmax(dim=1)
+                if collect_preds:
+                    preds.extend(pred.cpu().tolist())
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+        acc = correct / total
+        if was_training:
+            model.train()
+        return acc, preds
     model = UnifiedTMTransformer(
         vocab_size=vocab_size,
         d_model=d_model,
         n_heads=n_heads,
         num_layers=num_layers,
-        max_len=28 * 28,
+        max_len=max_len,
         n_clauses=n_clauses,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=7e-4, weight_decay=1e-5)
@@ -654,29 +765,21 @@ def run_variant_transformer(train_loader,
         dur = time.time() - epoch_start
         avg_loss = running_loss / batch_idx
         epoch_acc = None
+        epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
-        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss {avg_loss:.4f}"
+        if report_epoch_test:
+            epoch_test_acc, _ = eval_transformer(model, test_loader, device, collect_preds=False)
+        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
         if epoch_acc is not None and report_epoch_acc:
-            log_msg += f" | train_acc {epoch_acc:.4f}"
-        log_msg += f" | {dur:5.1f}s | seen {batch_idx * train_loader.batch_size}"
+            log_msg += f" | train_acc={epoch_acc:.4f}"
+        if epoch_test_acc is not None:
+            log_msg += f" | test_acc={epoch_test_acc:.4f}"
+        log_msg += f" | {dur:4.1f}s"
         print(log_msg)
     train_time = time.time() - start
-    model.eval()
-    preds = []
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for x, y in test_loader:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            tokens = (x.view(x.size(0), -1) * 255).long()
-            logits = model(tokens, use_ste=True)
-            pred = logits[:, -1, :].argmax(dim=1)
-            preds.extend(pred.cpu().tolist())
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-    test_acc = correct / total
+    test_acc, preds = eval_transformer(model, test_loader, device, collect_preds=True)
     return label, last_train_acc, test_acc, train_time, preds, None
 
 
@@ -685,6 +788,24 @@ def main(argv: Optional[List[str]] = None):
     args = parser.parse_args(argv)
 
     maybe_set_seed(args.seed)
+    dataset_key = args.dataset.lower()
+    if dataset_key not in DATASET_CONFIGS:
+        raise ValueError(f"Unsupported dataset '{args.dataset}'. Available: {', '.join(sorted(DATASET_CONFIGS))}")
+    dataset_cfg = DATASET_CONFIGS[dataset_key]
+    if args.num_classes is None:
+        args.num_classes = dataset_cfg["num_classes"]
+
+    if dataset_key != "mnist":
+        dataset_upper = dataset_key.upper()
+        if args.bool_train_path == DEFAULT_BOOL_TRAIN_PATH:
+            args.bool_train_path = f"/tmp/{dataset_upper}TrainingData.txt"
+        if args.bool_test_path == DEFAULT_BOOL_TEST_PATH:
+            args.bool_test_path = f"/tmp/{dataset_upper}TestData.txt"
+        if args.output_json == DEFAULT_OUTPUT_JSON:
+            args.output_json = f"/tmp/{dataset_key}_equiv_results.json"
+        if args.export_prefix == DEFAULT_EXPORT_PREFIX:
+            args.export_prefix = f"tm_{dataset_key}"
+
     device = current_device(args.device)
 
     pin_memory = args.pin_memory
@@ -697,15 +818,15 @@ def main(argv: Optional[List[str]] = None):
     if args.num_workers == 0:
         persistent_workers = False
 
-    transform = transforms.ToTensor()
+    transform = dataset_cfg["transform"]
     with profile_block("load-dataset"):
-        train_ds = datasets.MNIST(
+        train_ds = dataset_cfg["train_class"](
             root=args.dataset_root,
             train=True,
             download=args.download,
             transform=transform,
         )
-        test_ds = datasets.MNIST(
+        test_ds = dataset_cfg["test_class"](
             root=args.dataset_root,
             train=False,
             download=args.download,
@@ -742,6 +863,10 @@ def main(argv: Optional[List[str]] = None):
     if not selected_models:
         raise ValueError("No model variants selected.")
 
+    input_channels = dataset_cfg["input_channels"]
+    image_h, image_w = dataset_cfg["image_size"]
+    flat_dim = input_channels * image_h * image_w
+
     hidden_dims = parse_int_list(args.deeptm_hidden_dims)
     if not hidden_dims:
         hidden_dims = [256, 128]
@@ -758,6 +883,8 @@ def main(argv: Optional[List[str]] = None):
                     epochs=args.epochs,
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    n_features=flat_dim,
                     tm_impl=args.tm_impl,
                     tm_tau=args.tm_tau,
                     tm_lf=args.tm_lf,
@@ -775,6 +902,8 @@ def main(argv: Optional[List[str]] = None):
                     epochs=args.epochs,
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    input_dim=flat_dim,
                     hidden_dims=hidden_dims,
                     n_clauses=args.deeptm_n_clauses,
                     dropout=args.deeptm_dropout,
@@ -791,8 +920,11 @@ def main(argv: Optional[List[str]] = None):
                     epochs=args.epochs,
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    in_channels=input_channels,
                     thresholds=args.hybrid_thresholds,
                     tm_clauses=args.hybrid_clauses,
+                    tm_tau=args.tm_tau,
                     n_classes=hybrid_classes,
                 )
                 variant_classes = hybrid_classes
@@ -804,11 +936,13 @@ def main(argv: Optional[List[str]] = None):
                     epochs=args.epochs,
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
                     vocab_size=args.transformer_vocab,
                     d_model=args.transformer_d_model,
                     n_heads=args.transformer_heads,
                     num_layers=args.transformer_layers,
                     n_clauses=args.transformer_clauses,
+                    max_len=flat_dim,
                 )
                 variant_classes = args.num_classes
             else:
