@@ -1,0 +1,1044 @@
+{
+  "run_name": "pyramid_tm",
+  "metadata": {
+    "model_name": "PyramidTM",
+    "epochs": 20,
+    "lr": 0.0008,
+    "min_lr": 0.0001,
+    "weight_decay": 1e-05,
+    "grad_clip": 0.5,
+    "grad_accum": 1,
+    "tau_start": 0.6,
+    "tau_end": 0.3,
+    "warmup_epochs": 2,
+    "stage_configs": [
+      {
+        "pool_size": 28,
+        "projection_dim": 256,
+        "n_clauses": 256,
+        "tau": 0.6,
+        "dropout": 0.05,
+        "clause_pool": "mean",
+        "logit_norm": "sqrt"
+      },
+      {
+        "pool_size": 14,
+        "projection_dim": 192,
+        "n_clauses": 192,
+        "tau": 0.6,
+        "dropout": 0.05,
+        "clause_pool": "mean",
+        "logit_norm": "sqrt"
+      },
+      {
+        "pool_size": 7,
+        "projection_dim": 128,
+        "n_clauses": 160,
+        "tau": 0.6,
+        "dropout": 0.05,
+        "clause_pool": "mean",
+        "logit_norm": "sqrt"
+      },
+      {
+        "pool_size": 1,
+        "projection_dim": 96,
+        "n_clauses": 128,
+        "tau": 0.6,
+        "dropout": 0.0,
+        "clause_pool": "mean",
+        "logit_norm": "sqrt"
+      }
+    ],
+    "seed": 123,
+    "device": "cuda",
+    "attention_heads": 2,
+    "use_clause_attention": false,
+    "use_scale_attention": false,
+    "scale_entropy_weight": 0.01,
+    "ema_decay": 0.0,
+    "input_noise_std": 0.0,
+    "export_path": null
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "train_loss": 2.298132922857809,
+      "train_accuracy": 0.11236666666666667,
+      "eval_accuracy": 0.1135,
+      "duration_s": 18.204651594161987,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.6,
+          "stages.1.tm": 0.6,
+          "stages.2.tm": 0.6,
+          "stages.3.tm": 0.6
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.471282958984375,
+            "negative": 0.479766845703125,
+            "positive_inv": 0.48126220703125,
+            "negative_inv": 0.474212646484375,
+            "overall": 0.47663116455078125
+          },
+          "stages.1.tm": {
+            "positive": 0.4922960102558136,
+            "negative": 0.4876844584941864,
+            "positive_inv": 0.4695638120174408,
+            "negative_inv": 0.4676649272441864,
+            "overall": 0.479302316904068
+          },
+          "stages.2.tm": {
+            "positive": 0.48457032442092896,
+            "negative": 0.4849609434604645,
+            "positive_inv": 0.46611329913139343,
+            "negative_inv": 0.4677734375,
+            "overall": 0.4758544862270355
+          },
+          "stages.3.tm": {
+            "positive": 0.4488932490348816,
+            "negative": 0.4710286557674408,
+            "positive_inv": 0.451171875,
+            "negative_inv": 0.4573567807674408,
+            "overall": 0.4571126401424408
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0004
+      }
+    },
+    {
+      "epoch": 2,
+      "train_loss": 2.169037391127808,
+      "train_accuracy": 0.25525,
+      "eval_accuracy": 0.4019,
+      "duration_s": 17.438266038894653,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.5842105263157894,
+          "stages.1.tm": 0.5842105263157894,
+          "stages.2.tm": 0.5842105263157894,
+          "stages.3.tm": 0.5842105263157894
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.451446533203125,
+            "negative": 0.458251953125,
+            "positive_inv": 0.455230712890625,
+            "negative_inv": 0.455291748046875,
+            "overall": 0.45505523681640625
+          },
+          "stages.1.tm": {
+            "positive": 0.4856770932674408,
+            "negative": 0.486382395029068,
+            "positive_inv": 0.4709743857383728,
+            "negative_inv": 0.471245676279068,
+            "overall": 0.478569895029068
+          },
+          "stages.2.tm": {
+            "positive": 0.47089844942092896,
+            "negative": 0.46992188692092896,
+            "positive_inv": 0.44384765625,
+            "negative_inv": 0.44560548663139343,
+            "overall": 0.45756837725639343
+          },
+          "stages.3.tm": {
+            "positive": 0.4982096552848816,
+            "negative": 0.4925130307674408,
+            "positive_inv": 0.5087890625,
+            "negative_inv": 0.49755859375,
+            "overall": 0.499267578125
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0008
+      }
+    },
+    {
+      "epoch": 3,
+      "train_loss": 1.584663003492457,
+      "train_accuracy": 0.4852666666666667,
+      "eval_accuracy": 0.5487,
+      "duration_s": 17.67461371421814,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.5684210526315789,
+          "stages.1.tm": 0.5684210526315789,
+          "stages.2.tm": 0.5684210526315789,
+          "stages.3.tm": 0.5684210526315789
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.44873046875,
+            "negative": 0.448577880859375,
+            "positive_inv": 0.45330810546875,
+            "negative_inv": 0.449737548828125,
+            "overall": 0.4500885009765625
+          },
+          "stages.1.tm": {
+            "positive": 0.4962022602558136,
+            "negative": 0.4967990517616272,
+            "positive_inv": 0.4840494692325592,
+            "negative_inv": 0.4836696982383728,
+            "overall": 0.4901801347732544
+          },
+          "stages.2.tm": {
+            "positive": 0.49072265625,
+            "negative": 0.4888671934604645,
+            "positive_inv": 0.4647460877895355,
+            "negative_inv": 0.46240234375,
+            "overall": 0.4766845703125
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.490234375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.498046875,
+            "overall": 0.4970703125
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0007946827135542729
+      }
+    },
+    {
+      "epoch": 4,
+      "train_loss": 1.1587478147386743,
+      "train_accuracy": 0.5712,
+      "eval_accuracy": 0.581,
+      "duration_s": 17.559956550598145,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.5526315789473684,
+          "stages.1.tm": 0.5526315789473684,
+          "stages.2.tm": 0.5526315789473684,
+          "stages.3.tm": 0.5526315789473684
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.44512939453125,
+            "negative": 0.445556640625,
+            "positive_inv": 0.449615478515625,
+            "negative_inv": 0.445068359375,
+            "overall": 0.44634246826171875
+          },
+          "stages.1.tm": {
+            "positive": 0.5016276240348816,
+            "negative": 0.5018988847732544,
+            "positive_inv": 0.4873046875,
+            "negative_inv": 0.487358957529068,
+            "overall": 0.4945475161075592
+          },
+          "stages.2.tm": {
+            "positive": 0.49736329913139343,
+            "negative": 0.4947265684604645,
+            "positive_inv": 0.4722656309604645,
+            "negative_inv": 0.46953126788139343,
+            "overall": 0.48347169160842896
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.4881184995174408,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.4962565302848816,
+            "overall": 0.49609375
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.000778892417275068
+      }
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.9782193976678828,
+      "train_accuracy": 0.5818,
+      "eval_accuracy": 0.5828,
+      "duration_s": 18.260035514831543,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.5368421052631579,
+          "stages.1.tm": 0.5368421052631579,
+          "stages.2.tm": 0.5368421052631579,
+          "stages.3.tm": 0.5368421052631579
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.437530517578125,
+            "negative": 0.43988037109375,
+            "positive_inv": 0.44049072265625,
+            "negative_inv": 0.438385009765625,
+            "overall": 0.4390716552734375
+          },
+          "stages.1.tm": {
+            "positive": 0.5033094882965088,
+            "negative": 0.5032009482383728,
+            "positive_inv": 0.488335520029068,
+            "negative_inv": 0.4884440004825592,
+            "overall": 0.4958224892616272
+          },
+          "stages.2.tm": {
+            "positive": 0.49921876192092896,
+            "negative": 0.4971679747104645,
+            "positive_inv": 0.47607421875,
+            "negative_inv": 0.47607421875,
+            "overall": 0.48713380098342896
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.5035807490348816,
+            "overall": 0.4999186396598816
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0007531088913245536
+      }
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.8866621086846537,
+      "train_accuracy": 0.5976666666666667,
+      "eval_accuracy": 0.6349,
+      "duration_s": 17.911346197128296,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.5210526315789473,
+          "stages.1.tm": 0.5210526315789473,
+          "stages.2.tm": 0.5210526315789473,
+          "stages.3.tm": 0.5210526315789473
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.43701171875,
+            "negative": 0.43963623046875,
+            "positive_inv": 0.438995361328125,
+            "negative_inv": 0.439544677734375,
+            "overall": 0.4387969970703125
+          },
+          "stages.1.tm": {
+            "positive": 0.5042860507965088,
+            "negative": 0.5042317509651184,
+            "positive_inv": 0.488823801279068,
+            "negative_inv": 0.4892035722732544,
+            "overall": 0.496636301279068
+          },
+          "stages.2.tm": {
+            "positive": 0.4999023377895355,
+            "negative": 0.49833986163139343,
+            "positive_inv": 0.47900390625,
+            "negative_inv": 0.4786132872104645,
+            "overall": 0.48896485567092896
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0007181155550916422
+      }
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.7902675239262043,
+      "train_accuracy": 0.6926833333333333,
+      "eval_accuracy": 0.6922,
+      "duration_s": 17.451695919036865,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.5052631578947369,
+          "stages.1.tm": 0.5052631578947369,
+          "stages.2.tm": 0.5052631578947369,
+          "stages.3.tm": 0.5052631578947369
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.434173583984375,
+            "negative": 0.432281494140625,
+            "positive_inv": 0.434844970703125,
+            "negative_inv": 0.43060302734375,
+            "overall": 0.43297576904296875
+          },
+          "stages.1.tm": {
+            "positive": 0.504503071308136,
+            "negative": 0.5047743320465088,
+            "positive_inv": 0.4898546040058136,
+            "negative_inv": 0.4896375834941864,
+            "overall": 0.4971923828125
+          },
+          "stages.2.tm": {
+            "positive": 0.501757800579071,
+            "negative": 0.4994140565395355,
+            "positive_inv": 0.4786132872104645,
+            "negative_inv": 0.4789062440395355,
+            "overall": 0.48967286944389343
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0006749756633902886
+      }
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.6909345595567211,
+      "train_accuracy": 0.7069,
+      "eval_accuracy": 0.7442,
+      "duration_s": 17.328973054885864,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.4894736842105263,
+          "stages.1.tm": 0.4894736842105263,
+          "stages.2.tm": 0.4894736842105263,
+          "stages.3.tm": 0.4894736842105263
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.432647705078125,
+            "negative": 0.42364501953125,
+            "positive_inv": 0.433135986328125,
+            "negative_inv": 0.42120361328125,
+            "overall": 0.4276580810546875
+          },
+          "stages.1.tm": {
+            "positive": 0.5048285722732544,
+            "negative": 0.504991352558136,
+            "positive_inv": 0.4903971254825592,
+            "negative_inv": 0.4905599057674408,
+            "overall": 0.4976942241191864
+          },
+          "stages.2.tm": {
+            "positive": 0.5023437738418579,
+            "negative": 0.5005859732627869,
+            "positive_inv": 0.47871094942092896,
+            "negative_inv": 0.4784179627895355,
+            "overall": 0.4900146424770355
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0006249999999999999
+      }
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.6348965461574384,
+      "train_accuracy": 0.7596833333333334,
+      "eval_accuracy": 0.7765,
+      "duration_s": 17.35958743095398,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.4736842105263158,
+          "stages.1.tm": 0.4736842105263158,
+          "stages.2.tm": 0.4736842105263158,
+          "stages.3.tm": 0.4736842105263158
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.43145751953125,
+            "negative": 0.42132568359375,
+            "positive_inv": 0.43255615234375,
+            "negative_inv": 0.417938232421875,
+            "overall": 0.42581939697265625
+          },
+          "stages.1.tm": {
+            "positive": 0.5049370527267456,
+            "negative": 0.5052626132965088,
+            "positive_inv": 0.4906141459941864,
+            "negative_inv": 0.4908854067325592,
+            "overall": 0.4979248046875
+          },
+          "stages.2.tm": {
+            "positive": 0.5029296875,
+            "negative": 0.501757800579071,
+            "positive_inv": 0.47832033038139343,
+            "negative_inv": 0.47822266817092896,
+            "overall": 0.49030762910842896
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.000569707050163984
+      }
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.5709991090968728,
+      "train_accuracy": 0.8103333333333333,
+      "eval_accuracy": 0.8325,
+      "duration_s": 17.297075986862183,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.45789473684210524,
+          "stages.1.tm": 0.45789473684210524,
+          "stages.2.tm": 0.45789473684210524,
+          "stages.3.tm": 0.45789473684210524
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.4310302734375,
+            "negative": 0.417144775390625,
+            "positive_inv": 0.431640625,
+            "negative_inv": 0.41357421875,
+            "overall": 0.42334747314453125
+          },
+          "stages.1.tm": {
+            "positive": 0.5050455927848816,
+            "negative": 0.50537109375,
+            "positive_inv": 0.4909939169883728,
+            "negative_inv": 0.4909939169883728,
+            "overall": 0.498101145029068
+          },
+          "stages.2.tm": {
+            "positive": 0.502734363079071,
+            "negative": 0.5028320550918579,
+            "positive_inv": 0.47734376788139343,
+            "negative_inv": 0.47773438692092896,
+            "overall": 0.49016115069389343
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0005107768621834256
+      }
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.4913152713002935,
+      "train_accuracy": 0.8473333333333334,
+      "eval_accuracy": 0.8454,
+      "duration_s": 17.381438970565796,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.4421052631578947,
+          "stages.1.tm": 0.4421052631578947,
+          "stages.2.tm": 0.4421052631578947,
+          "stages.3.tm": 0.4421052631578947
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.431060791015625,
+            "negative": 0.416046142578125,
+            "positive_inv": 0.43206787109375,
+            "negative_inv": 0.412689208984375,
+            "overall": 0.42296600341796875
+          },
+          "stages.1.tm": {
+            "positive": 0.5053168535232544,
+            "negative": 0.5055338740348816,
+            "positive_inv": 0.4912109375,
+            "negative_inv": 0.4912109375,
+            "overall": 0.4983181357383728
+          },
+          "stages.2.tm": {
+            "positive": 0.502148449420929,
+            "negative": 0.5013672113418579,
+            "positive_inv": 0.4766601622104645,
+            "negative_inv": 0.47529298067092896,
+            "overall": 0.4888671934604645
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0004499999999999999
+      }
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.424974459384296,
+      "train_accuracy": 0.8823166666666666,
+      "eval_accuracy": 0.917,
+      "duration_s": 17.43987798690796,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.4263157894736842,
+          "stages.1.tm": 0.4263157894736842,
+          "stages.2.tm": 0.4263157894736842,
+          "stages.3.tm": 0.4263157894736842
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.430267333984375,
+            "negative": 0.416290283203125,
+            "positive_inv": 0.431488037109375,
+            "negative_inv": 0.41351318359375,
+            "overall": 0.42288970947265625
+          },
+          "stages.1.tm": {
+            "positive": 0.5053168535232544,
+            "negative": 0.5056965947151184,
+            "positive_inv": 0.491753488779068,
+            "negative_inv": 0.4916449785232544,
+            "overall": 0.4986029863357544
+          },
+          "stages.2.tm": {
+            "positive": 0.5015625357627869,
+            "negative": 0.500683605670929,
+            "positive_inv": 0.47578126192092896,
+            "negative_inv": 0.47509765625,
+            "overall": 0.48828125
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0003892231378165743
+      }
+    },
+    {
+      "epoch": 13,
+      "train_loss": 0.36580732045397324,
+      "train_accuracy": 0.9274166666666667,
+      "eval_accuracy": 0.9304,
+      "duration_s": 17.756639003753662,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.4105263157894737,
+          "stages.1.tm": 0.4105263157894737,
+          "stages.2.tm": 0.4105263157894737,
+          "stages.3.tm": 0.4105263157894737
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.430267333984375,
+            "negative": 0.416900634765625,
+            "positive_inv": 0.4315185546875,
+            "negative_inv": 0.415252685546875,
+            "overall": 0.42348480224609375
+          },
+          "stages.1.tm": {
+            "positive": 0.5055881142616272,
+            "negative": 0.5058051347732544,
+            "positive_inv": 0.4919162392616272,
+            "negative_inv": 0.491753488779068,
+            "overall": 0.4987657368183136
+          },
+          "stages.2.tm": {
+            "positive": 0.501269519329071,
+            "negative": 0.5000976920127869,
+            "positive_inv": 0.4756835997104645,
+            "negative_inv": 0.4749999940395355,
+            "overall": 0.4880127012729645
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.000330292949836016
+      }
+    },
+    {
+      "epoch": 14,
+      "train_loss": 0.31828628496320516,
+      "train_accuracy": 0.9371166666666667,
+      "eval_accuracy": 0.9361,
+      "duration_s": 17.486804008483887,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.39473684210526316,
+          "stages.1.tm": 0.39473684210526316,
+          "stages.2.tm": 0.39473684210526316,
+          "stages.3.tm": 0.39473684210526316
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.4305419921875,
+            "negative": 0.41778564453125,
+            "positive_inv": 0.432281494140625,
+            "negative_inv": 0.415924072265625,
+            "overall": 0.42413330078125
+          },
+          "stages.1.tm": {
+            "positive": 0.5057508945465088,
+            "negative": 0.5058051347732544,
+            "positive_inv": 0.492241770029068,
+            "negative_inv": 0.4920247495174408,
+            "overall": 0.498955637216568
+          },
+          "stages.2.tm": {
+            "positive": 0.501269519329071,
+            "negative": 0.5000976920127869,
+            "positive_inv": 0.4755859375,
+            "negative_inv": 0.47490236163139343,
+            "overall": 0.48796388506889343
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.000275
+      }
+    },
+    {
+      "epoch": 15,
+      "train_loss": 0.28591339369572555,
+      "train_accuracy": 0.9426333333333333,
+      "eval_accuracy": 0.9372,
+      "duration_s": 17.2844021320343,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.3789473684210526,
+          "stages.1.tm": 0.3789473684210526,
+          "stages.2.tm": 0.3789473684210526,
+          "stages.3.tm": 0.3789473684210526
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.4306640625,
+            "negative": 0.41839599609375,
+            "positive_inv": 0.432586669921875,
+            "negative_inv": 0.41668701171875,
+            "overall": 0.42458343505859375
+          },
+          "stages.1.tm": {
+            "positive": 0.5057508945465088,
+            "negative": 0.5058051347732544,
+            "positive_inv": 0.4922960102558136,
+            "negative_inv": 0.492241770029068,
+            "overall": 0.4990234375
+          },
+          "stages.2.tm": {
+            "positive": 0.501269519329071,
+            "negative": 0.500292956829071,
+            "positive_inv": 0.4756835997104645,
+            "negative_inv": 0.47480469942092896,
+            "overall": 0.4880127012729645
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.00022502433660971118
+      }
+    },
+    {
+      "epoch": 16,
+      "train_loss": 0.2629045782439998,
+      "train_accuracy": 0.9461,
+      "eval_accuracy": 0.9394,
+      "duration_s": 17.382808685302734,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.3631578947368421,
+          "stages.1.tm": 0.3631578947368421,
+          "stages.2.tm": 0.3631578947368421,
+          "stages.3.tm": 0.3631578947368421
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.4310302734375,
+            "negative": 0.419281005859375,
+            "positive_inv": 0.433258056640625,
+            "negative_inv": 0.41754150390625,
+            "overall": 0.4252777099609375
+          },
+          "stages.1.tm": {
+            "positive": 0.5057508945465088,
+            "negative": 0.505859375,
+            "positive_inv": 0.4922960102558136,
+            "negative_inv": 0.4923502504825592,
+            "overall": 0.4990641176700592
+          },
+          "stages.2.tm": {
+            "positive": 0.5010742545127869,
+            "negative": 0.5003906488418579,
+            "positive_inv": 0.4756835997104645,
+            "negative_inv": 0.47480469942092896,
+            "overall": 0.48798829317092896
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0001818844449083577
+      }
+    },
+    {
+      "epoch": 17,
+      "train_loss": 0.24696017423672462,
+      "train_accuracy": 0.9493,
+      "eval_accuracy": 0.9413,
+      "duration_s": 17.26659631729126,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.3473684210526316,
+          "stages.1.tm": 0.3473684210526316,
+          "stages.2.tm": 0.3473684210526316,
+          "stages.3.tm": 0.3473684210526316
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.43145751953125,
+            "negative": 0.420074462890625,
+            "positive_inv": 0.433563232421875,
+            "negative_inv": 0.418426513671875,
+            "overall": 0.42588043212890625
+          },
+          "stages.1.tm": {
+            "positive": 0.5058051347732544,
+            "negative": 0.505859375,
+            "positive_inv": 0.4923502504825592,
+            "negative_inv": 0.4923502504825592,
+            "overall": 0.4990912675857544
+          },
+          "stages.2.tm": {
+            "positive": 0.501269519329071,
+            "negative": 0.50048828125,
+            "positive_inv": 0.47578126192092896,
+            "negative_inv": 0.47490236163139343,
+            "overall": 0.48811036348342896
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.00014689110867544653
+      }
+    },
+    {
+      "epoch": 18,
+      "train_loss": 0.23489797251946382,
+      "train_accuracy": 0.9520833333333333,
+      "eval_accuracy": 0.9418,
+      "duration_s": 17.385087251663208,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.33157894736842103,
+          "stages.1.tm": 0.33157894736842103,
+          "stages.2.tm": 0.33157894736842103,
+          "stages.3.tm": 0.33157894736842103
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.431549072265625,
+            "negative": 0.420806884765625,
+            "positive_inv": 0.43377685546875,
+            "negative_inv": 0.41912841796875,
+            "overall": 0.4263153076171875
+          },
+          "stages.1.tm": {
+            "positive": 0.505859375,
+            "negative": 0.505859375,
+            "positive_inv": 0.4924045205116272,
+            "negative_inv": 0.4923502504825592,
+            "overall": 0.4991183876991272
+          },
+          "stages.2.tm": {
+            "positive": 0.501171886920929,
+            "negative": 0.500292956829071,
+            "positive_inv": 0.47587892413139343,
+            "negative_inv": 0.47490236163139343,
+            "overall": 0.4880615174770355
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.00012110758272493209
+      }
+    },
+    {
+      "epoch": 19,
+      "train_loss": 0.22579080803689164,
+      "train_accuracy": 0.9531166666666666,
+      "eval_accuracy": 0.9422,
+      "duration_s": 17.181255340576172,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.3157894736842105,
+          "stages.1.tm": 0.3157894736842105,
+          "stages.2.tm": 0.3157894736842105,
+          "stages.3.tm": 0.3157894736842105
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.431640625,
+            "negative": 0.421844482421875,
+            "positive_inv": 0.434173583984375,
+            "negative_inv": 0.4197998046875,
+            "overall": 0.4268646240234375
+          },
+          "stages.1.tm": {
+            "positive": 0.505859375,
+            "negative": 0.505859375,
+            "positive_inv": 0.4924587607383728,
+            "negative_inv": 0.4924045205116272,
+            "overall": 0.4991455078125
+          },
+          "stages.2.tm": {
+            "positive": 0.501171886920929,
+            "negative": 0.500292956829071,
+            "positive_inv": 0.47587892413139343,
+            "negative_inv": 0.47480469942092896,
+            "overall": 0.488037109375
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0001053172864457272
+      }
+    },
+    {
+      "epoch": 20,
+      "train_loss": 0.21735785291520263,
+      "train_accuracy": 0.9548333333333333,
+      "eval_accuracy": 0.9436,
+      "duration_s": 17.36002254486084,
+      "diagnostics": {
+        "tau": {
+          "stages.0.tm": 0.3,
+          "stages.1.tm": 0.3,
+          "stages.2.tm": 0.3,
+          "stages.3.tm": 0.3
+        },
+        "clause_sparsity": {
+          "stages.0.tm": {
+            "positive": 0.431671142578125,
+            "negative": 0.422637939453125,
+            "positive_inv": 0.4344482421875,
+            "negative_inv": 0.420867919921875,
+            "overall": 0.42740631103515625
+          },
+          "stages.1.tm": {
+            "positive": 0.505859375,
+            "negative": 0.505859375,
+            "positive_inv": 0.4924587607383728,
+            "negative_inv": 0.4924587607383728,
+            "overall": 0.4991590678691864
+          },
+          "stages.2.tm": {
+            "positive": 0.501171886920929,
+            "negative": 0.500292956829071,
+            "positive_inv": 0.47587892413139343,
+            "negative_inv": 0.47480469942092896,
+            "overall": 0.488037109375
+          },
+          "stages.3.tm": {
+            "positive": 0.4947916865348816,
+            "negative": 0.49609375,
+            "positive_inv": 0.5052083730697632,
+            "negative_inv": 0.50390625,
+            "overall": 0.5
+          }
+        },
+        "attention": {}
+      },
+      "extra": {
+        "lr": 0.0001
+      }
+    }
+  ]
+}
