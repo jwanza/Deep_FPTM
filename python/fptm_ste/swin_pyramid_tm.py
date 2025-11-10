@@ -296,6 +296,8 @@ class SwinLikePyramidTM(nn.Module):
             self.attention_oracle = None
         self._scale_entropy_loss: Optional[torch.Tensor] = None
         self.last_attention_weights: Optional[torch.Tensor] = None
+        self.last_scale_fused_logits: Optional[torch.Tensor] = None
+        self.last_clause_attention_logits: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
         if x.dim() == 2:
@@ -335,17 +337,22 @@ class SwinLikePyramidTM(nn.Module):
             else:
                 self._scale_entropy_loss = None
             self.last_attention_weights = weights.detach()
-            final_output = weighted
+            scale_fused = weighted
         else:
             stacked = torch.stack(scale_logits, dim=0)
-            final_output = stacked.mean(dim=0)
+            scale_fused = stacked.mean(dim=0)
             self.last_attention_weights = None
             self._scale_entropy_loss = None
+        self.last_scale_fused_logits = scale_fused.detach()
 
         if self.attention_oracle is not None:
             gate = torch.sigmoid(self.attention_gate)
             attn_out = self.attention_oracle(scale_logits, all_clauses)
-            final_output = gate * attn_out + (1.0 - gate) * final_output
+            self.last_clause_attention_logits = attn_out.detach()
+            final_output = gate * attn_out + (1.0 - gate) * scale_fused
+        else:
+            self.last_clause_attention_logits = None
+            final_output = scale_fused
 
         return final_output, scale_logits, all_clauses
 

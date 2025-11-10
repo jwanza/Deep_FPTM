@@ -182,6 +182,10 @@ def evaluate(model_core, loader: DataLoader, device: torch.device, use_ste: bool
     stage_correct: List[float] = []
     stage_total = 0.0
     attn_records: List[torch.Tensor] = []
+    scale_correct = 0.0
+    clause_correct = 0.0
+    scale_available = False
+    clause_available = False
 
     with torch.no_grad():
         for x, y in loader:
@@ -197,6 +201,14 @@ def evaluate(model_core, loader: DataLoader, device: torch.device, use_ste: bool
                     stage_correct.extend([0.0] * (idx + 1 - len(stage_correct)))
                 stage_correct[idx] += (s_logits.argmax(dim=1) == y).sum().item()
             stage_total += y.size(0)
+            scale_logits = getattr(model_core, "last_scale_fused_logits", None)
+            if scale_logits is not None:
+                scale_correct += (scale_logits.argmax(dim=1) == y).sum().item()
+                scale_available = True
+            clause_logits = getattr(model_core, "last_clause_attention_logits", None)
+            if clause_logits is not None:
+                clause_correct += (clause_logits.argmax(dim=1) == y).sum().item()
+                clause_available = True
             attn_summary = summarize_attention_weights(model_core)
             if attn_summary is not None:
                 attn_records.append(attn_summary)
@@ -211,6 +223,14 @@ def evaluate(model_core, loader: DataLoader, device: torch.device, use_ste: bool
             dist.all_reduce(stage_tensor, op=dist.ReduceOp.SUM)
             stage_total = stage_tensor[-1].item()
             stage_correct = stage_tensor[:-1].tolist()
+        extra_tensor = torch.tensor([scale_correct, clause_correct], device=device, dtype=torch.float64)
+        dist.all_reduce(extra_tensor, op=dist.ReduceOp.SUM)
+        scale_correct = extra_tensor[0].item()
+        clause_correct = extra_tensor[1].item()
+        flag_tensor = torch.tensor([float(scale_available), float(clause_available)], device=device, dtype=torch.float64)
+        dist.all_reduce(flag_tensor, op=dist.ReduceOp.SUM)
+        scale_available = flag_tensor[0].item() > 0.0
+        clause_available = flag_tensor[1].item() > 0.0
 
     acc = correct / total if total else 0.0
     stage_accs = [sc / stage_total for sc in stage_correct] if stage_total else []
@@ -220,7 +240,12 @@ def evaluate(model_core, loader: DataLoader, device: torch.device, use_ste: bool
         if all(shape == shapes[0] for shape in shapes):
             attn_stack = torch.stack(attn_records, dim=0)
             attn_avg = attn_stack.mean(dim=0).tolist()
-    return acc, stage_accs, attn_avg
+    attention_accs: Dict[str, float] = {}
+    if scale_available and total:
+        attention_accs["scale"] = scale_correct / total
+    if clause_available and total:
+        attention_accs["clause"] = clause_correct / total
+    return acc, stage_accs, attn_avg, attention_accs
 
 
 def linear_tau(initial: float, final: float, epoch: int, total_epochs: int) -> float:
@@ -605,7 +630,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
 
         if ema is not None:
             ema.apply_shadow(model_core)
-        test_acc, stage_accs, attn_avg = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
+        test_acc, stage_accs, attn_avg, attention_accs = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
         if ema is not None:
             ema.restore(model_core)
 
@@ -628,6 +653,8 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
             if attn_avg is not None:
                 for idx, val in enumerate(attn_avg):
                     extra_metrics[f"attention_{idx}"] = val
+            for name, val in attention_accs.items():
+                extra_metrics[f"attention_{name}_acc"] = val
             logger.log_epoch(
                 EpochMetrics(
                     epoch=epoch,
@@ -642,10 +669,13 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
             stage_msg = ""
             if stage_accs:
                 stage_msg = " " + ", ".join(f"s{idx}={acc:.3f}" for idx, acc in enumerate(stage_accs))
+            attn_msg = ""
+            if attention_accs:
+                attn_msg = " " + ", ".join(f"att_{name}={val:.3f}" for name, val in attention_accs.items())
             print(
                 f"{args.tm_variant.upper()} | epoch {epoch:02d}/{args.epochs:02d} | loss={avg_loss:.4f} | "
                 f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f} | best_acc={best_test_acc:.4f} | "
-                f"lr={current_lr:.5f} | {duration:4.1f}s{stage_msg}"
+                f"lr={current_lr:.5f} | {duration:4.1f}s{stage_msg}{attn_msg}"
             )
 
         new_tau = linear_tau(args.tau_start, args.tau_end, epoch, args.epochs)
@@ -659,7 +689,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
 
     if ema is not None:
         ema.apply_shadow(model_core)
-    final_acc, _, _ = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
+    final_acc, _, _, _ = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
     if ema is not None:
         ema.restore(model_core)
 

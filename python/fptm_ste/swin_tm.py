@@ -989,6 +989,8 @@ class SwinTM(nn.Module):
         self.last_stage_logits: List[torch.Tensor] = []
         self.last_clause_summaries: List[List[torch.Tensor]] = []
         self.last_attention_weights: List[List[torch.Tensor]] = []
+        self.last_scale_fused_logits: Optional[torch.Tensor] = None
+        self.last_clause_attention_logits: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, *, use_ste: bool = True):
         if x.dim() == 2:
@@ -1014,6 +1016,8 @@ class SwinTM(nn.Module):
         self.last_stage_logits = stage_logits + [final_logits]
         self.last_clause_summaries = summary_lists
         self.last_attention_weights = attn_lists
+        self.last_scale_fused_logits = None
+        self.last_clause_attention_logits = None
         return final_logits, stage_logits, clause_lists, final_clauses
 
 

@@ -176,6 +176,8 @@ class PyramidTM(nn.Module):
         self.last_clause_summaries: List[torch.Tensor] | None = None
         self.last_attention_weights: torch.Tensor | None = None
         self._scale_entropy_loss: torch.Tensor | None = None
+        self.last_scale_fused_logits: torch.Tensor | None = None
+        self.last_clause_attention_logits: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
         if x.dim() == 2:
@@ -201,7 +203,7 @@ class PyramidTM(nn.Module):
 
         if self.scale_logits_param is not None:
             weights = torch.softmax(self.scale_logits_param, dim=0)
-            final_logits = torch.sum(stacked * weights.view(-1, 1, 1), dim=0)
+            scale_fused = torch.sum(stacked * weights.view(-1, 1, 1), dim=0)
             self.last_attention_weights = weights.detach()
             if self.scale_entropy_weight > 0:
                 entropy = -(weights * torch.log(weights + 1e-8)).sum()
@@ -209,14 +211,19 @@ class PyramidTM(nn.Module):
             else:
                 self._scale_entropy_loss = None
         else:
-            final_logits = stacked.mean(dim=0)
+            scale_fused = stacked.mean(dim=0)
             self.last_attention_weights = None
             self._scale_entropy_loss = None
+        self.last_scale_fused_logits = scale_fused.detach()
 
         if self.attention_oracle is not None:
             attn_logits = self.attention_oracle(logits_list, clauses_list)
+            self.last_clause_attention_logits = attn_logits.detach()
             gate = torch.sigmoid(self.attention_gate)
-            final_logits = gate * attn_logits + (1 - gate) * final_logits
+            final_logits = gate * attn_logits + (1 - gate) * scale_fused
+        else:
+            self.last_clause_attention_logits = None
+            final_logits = scale_fused
 
         self.last_logits = logits_list
         self.last_clauses = clauses_list
