@@ -1,11 +1,12 @@
-"""
-Pyramid TM experiment runner for MNIST with advanced scheduling and regularization options.
-"""
+"""TM experiment runner supporting classic pyramid and Swin-style variants."""
+
+from __future__ import annotations
 
 import argparse
 import json
 import time
 from pathlib import Path
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +15,7 @@ from torchvision import datasets, transforms
 
 from fptm_ste.experiments import EpochMetrics, ExperimentLogger, collect_tm_diagnostics
 from fptm_ste.pyramid_tm import PyramidStageConfig, PyramidTM
+from fptm_ste.swin_pyramid_tm import SwinLikePyramidTM, SwinStageConfig
 from fptm_ste.trainers import EMAWrapper, anneal_ste_factor
 
 
@@ -53,14 +55,15 @@ def flatten_images(x: torch.Tensor) -> torch.Tensor:
     return x.view(x.size(0), -1)
 
 
-def evaluate(model: PyramidTM, loader: DataLoader, device: torch.device, use_ste: bool) -> float:
+def evaluate(model, loader: DataLoader, device: torch.device, use_ste: bool) -> float:
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            logits, _, _ = model(flatten_images(x), use_ste=use_ste)
+            xb = flatten_images(x)
+            logits, _, _ = model(xb, use_ste=use_ste)
             pred = logits.argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
@@ -79,8 +82,51 @@ def parse_sequence(arg: str, cast):
     return values
 
 
+def build_pyramid(stage_clauses: List[int], stage_dropouts: List[float], tau: float, clause_attn: bool,
+                  scale_attn: bool, entropy_weight: float, input_noise: float) -> List[PyramidStageConfig]:
+    configs = [
+        PyramidStageConfig(pool_size=28, projection_dim=256, n_clauses=256, tau=tau, dropout=0.05),
+        PyramidStageConfig(pool_size=14, projection_dim=192, n_clauses=192, tau=tau, dropout=0.05),
+        PyramidStageConfig(pool_size=7, projection_dim=128, n_clauses=160, tau=tau, dropout=0.05),
+        PyramidStageConfig(pool_size=1, projection_dim=96, n_clauses=128, tau=tau, dropout=0.0),
+    ]
+    if stage_clauses:
+        if len(stage_clauses) != len(configs):
+            raise ValueError("stage_clauses length must match number of stages")
+        for cfg, val in zip(configs, stage_clauses):
+            cfg.n_clauses = val
+    if stage_dropouts:
+        if len(stage_dropouts) != len(configs):
+            raise ValueError("stage_dropouts length must match number of stages")
+        for cfg, val in zip(configs, stage_dropouts):
+            cfg.dropout = val
+    return configs
+
+
+def build_swin_configs(embed_dims: List[int], depths: List[int], window_size: int, shift_size: int,
+                       tm_hidden: List[int], tm_clauses: List[int], head_clauses: List[int],
+                       tau: float, dropouts: List[float]) -> List[SwinStageConfig]:
+    configs: List[SwinStageConfig] = []
+    num = len(embed_dims)
+    for idx in range(num):
+        configs.append(
+            SwinStageConfig(
+                embed_dim=embed_dims[idx],
+                depth=depths[idx],
+                window_size=window_size,
+                shift_size=shift_size if idx % 2 == 1 else 0,
+                tm_hidden_dim=tm_hidden[idx],
+                tm_clauses=tm_clauses[idx],
+                head_clauses=head_clauses[idx],
+                tau=tau,
+                dropout=dropouts[idx],
+            )
+        )
+    return configs
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train PyramidTM on MNIST.")
+    parser = argparse.ArgumentParser(description="Train TM variants on MNIST.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--test-batch-size", type=int, default=512)
@@ -103,6 +149,15 @@ def main() -> None:
     parser.add_argument("--stage-dropouts", type=str, default="")
     parser.add_argument("--export-path", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent)
+    parser.add_argument("--tm-variant", choices=["pyramid", "swin"], default="pyramid")
+    parser.add_argument("--swin-embed-dims", type=str, default="")
+    parser.add_argument("--swin-depths", type=str, default="")
+    parser.add_argument("--swin-window-size", type=int, default=4)
+    parser.add_argument("--swin-shift-size", type=int, default=2)
+    parser.add_argument("--swin-tm-hidden", type=str, default="")
+    parser.add_argument("--swin-tm-clauses", type=str, default="")
+    parser.add_argument("--swin-head-clauses", type=str, default="")
+    parser.add_argument("--patch-size", type=int, default=4)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -112,37 +167,76 @@ def main() -> None:
     device = get_device()
     train_loader, test_loader = load_mnist(args.batch_size, args.test_batch_size, device)
 
-    stage_configs = [
-        PyramidStageConfig(pool_size=28, projection_dim=256, n_clauses=256, tau=args.tau_start, dropout=0.05),
-        PyramidStageConfig(pool_size=14, projection_dim=192, n_clauses=192, tau=args.tau_start, dropout=0.05),
-        PyramidStageConfig(pool_size=7, projection_dim=128, n_clauses=160, tau=args.tau_start, dropout=0.05),
-        PyramidStageConfig(pool_size=1, projection_dim=96, n_clauses=128, tau=args.tau_start, dropout=0.0),
-    ]
+    stage_clause_overrides = parse_sequence(args.stage_clauses, int) if args.stage_clauses else []
+    stage_dropout_overrides = parse_sequence(args.stage_dropouts, float) if args.stage_dropouts else []
 
-    if args.stage_clauses:
-        overrides = parse_sequence(args.stage_clauses, int)
-        if len(overrides) != len(stage_configs):
-            raise ValueError("stage_clauses length must match number of stages")
-        for cfg, value in zip(stage_configs, overrides):
-            cfg.n_clauses = value
+    metadata_stage_configs: List[dict]
 
-    if args.stage_dropouts:
-        overrides = parse_sequence(args.stage_dropouts, float)
-        if len(overrides) != len(stage_configs):
-            raise ValueError("stage_dropouts length must match number of stages")
-        for cfg, value in zip(stage_configs, overrides):
-            cfg.dropout = value
+    sample_batch = next(iter(train_loader))[0]
+    if sample_batch.dim() == 4:
+        image_size = sample_batch.shape[-2:]
+        in_channels = sample_batch.shape[1]
+    else:
+        image_size = (28, 28)
+        in_channels = 1
 
-    stage_configs = tuple(stage_configs)
+    if args.tm_variant == "swin":
+        embed_dims = parse_sequence(args.swin_embed_dims, int) or [96, 192, 384, 768]
+        depths = parse_sequence(args.swin_depths, int) or [2, 2, 4, 2]
+        if len(depths) != len(embed_dims):
+            raise ValueError("Length of --swin-depths must match embed dims")
+        tm_hidden = parse_sequence(args.swin_tm_hidden, int) if args.swin_tm_hidden else []
+        if not tm_hidden:
+            tm_hidden = [256 for _ in embed_dims]
+        if tm_hidden is None or len(tm_hidden) == 0:
+            tm_hidden = [256 for _ in embed_dims]
+        tm_clauses = parse_sequence(args.swin_tm_clauses, int) or stage_clause_overrides or [256 for _ in embed_dims]
+        head_clauses = parse_sequence(args.swin_head_clauses, int) or tm_clauses
+        dropouts = stage_dropout_overrides or [0.05 for _ in embed_dims]
+        for seq in (tm_hidden, tm_clauses, head_clauses, dropouts):
+            if len(seq) != len(embed_dims):
+                seq.extend([seq[-1]] * (len(embed_dims) - len(seq)))
+        swin_configs = build_swin_configs(
+            embed_dims,
+            depths,
+            args.swin_window_size,
+            args.swin_shift_size,
+            tm_hidden,
+            tm_clauses,
+            head_clauses,
+            args.tau_start,
+            dropouts,
+        )
+        metadata_stage_configs = [cfg.__dict__ for cfg in swin_configs]
+        model = SwinLikePyramidTM(
+            image_size=image_size,
+            in_channels=in_channels,
+            num_classes=10,
+            stage_configs=swin_configs,
+            use_scale_attention=not args.no_scale_attention,
+            scale_entropy_weight=args.scale_entropy_weight,
+            patch_size=args.patch_size,
+        ).to(device)
+    else:
+        pyramid_configs = build_pyramid(
+            stage_clause_overrides,
+            stage_dropout_overrides,
+            args.tau_start,
+            not args.no_clause_attention,
+            not args.no_scale_attention,
+            args.scale_entropy_weight,
+            args.input_noise_std,
+        )
+        metadata_stage_configs = [cfg.__dict__ for cfg in pyramid_configs]
+        model = PyramidTM(
+            stage_configs=pyramid_configs,
+            use_clause_attention=not args.no_clause_attention,
+            attention_heads=args.attention_heads,
+            use_scale_attention=not args.no_scale_attention,
+            scale_entropy_weight=args.scale_entropy_weight,
+            input_noise_std=args.input_noise_std,
+        ).to(device)
 
-    model = PyramidTM(
-        stage_configs=stage_configs,
-        use_clause_attention=not args.no_clause_attention,
-        attention_heads=args.attention_heads,
-        use_scale_attention=not args.no_scale_attention,
-        scale_entropy_weight=args.scale_entropy_weight,
-        input_noise_std=args.input_noise_std,
-    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -154,9 +248,9 @@ def main() -> None:
 
     logger = ExperimentLogger(
         output_dir=args.output_dir,
-        run_name="pyramid_tm",
+        run_name=f"{args.tm_variant}_tm",
         metadata={
-            "model_name": "PyramidTM",
+            "model_name": args.tm_variant,
             "epochs": args.epochs,
             "lr": args.lr,
             "min_lr": args.min_lr,
@@ -166,7 +260,7 @@ def main() -> None:
             "tau_start": args.tau_start,
             "tau_end": args.tau_end,
             "warmup_epochs": args.warmup_epochs,
-            "stage_configs": [cfg.__dict__ for cfg in stage_configs],
+            "stage_configs": metadata_stage_configs,
             "seed": args.seed,
             "device": device.type,
             "attention_heads": args.attention_heads,
@@ -175,8 +269,8 @@ def main() -> None:
             "scale_entropy_weight": args.scale_entropy_weight,
             "ema_decay": args.ema_decay,
             "input_noise_std": args.input_noise_std,
+            "tm_variant": args.tm_variant,
             "export_path": str(args.export_path) if args.export_path else None,
-            "input_noise_std": args.input_noise_std,
         },
     )
 
@@ -206,7 +300,7 @@ def main() -> None:
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 logits, _, _ = model(xb, use_ste=False)
                 loss = F.cross_entropy(logits, y)
-                aux_loss = model.attention_entropy_loss()
+                aux_loss = model.attention_entropy_loss() if hasattr(model, "attention_entropy_loss") else None
                 if aux_loss is not None:
                     loss = loss + aux_loss
                 scaled_loss = loss / args.grad_accum
@@ -265,7 +359,7 @@ def main() -> None:
         )
 
         print(
-            f"PyramidTM | epoch {epoch:02d}/{args.epochs:02d} | loss={avg_loss:.4f} | "
+            f"{args.tm_variant.upper()} TM | epoch {epoch:02d}/{args.epochs:02d} | loss={avg_loss:.4f} | "
             f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f} | best_acc={best_test_acc:.4f} | "
             f"lr={current_lr:.5f} | {duration:4.1f}s"
         )
@@ -285,9 +379,16 @@ def main() -> None:
         ema.restore(model)
 
     if args.export_path:
-        stage_exports = {f"stage_{idx}": stage.tm.discretize() for idx, stage in enumerate(model.stages)}
+        stage_exports = {}
+        for idx, stage in enumerate(getattr(model, "stages", [])):
+            if hasattr(stage, "discretize"):
+                stage_exports[f"stage_{idx}"] = stage.discretize()
+            elif hasattr(stage, "head_tm"):
+                stage_exports[f"stage_{idx}"] = stage.head_tm.discretize()
+            elif hasattr(stage, "tm"):
+                stage_exports[f"stage_{idx}"] = stage.tm.discretize()
         attention_weights = None
-        if model.last_attention_weights is not None:
+        if hasattr(model, "last_attention_weights") and model.last_attention_weights is not None:
             attention_weights = model.last_attention_weights.detach().cpu().tolist()
         payload = {
             "final_test_accuracy": final_acc,
