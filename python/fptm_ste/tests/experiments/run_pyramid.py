@@ -180,6 +180,8 @@ def main() -> None:
         },
     )
 
+    best_test_acc = 0.0
+
     for epoch in range(1, args.epochs + 1):
         if epoch <= args.warmup_epochs:
             warmup_lr = args.lr * epoch / max(1, args.warmup_epochs)
@@ -247,6 +249,8 @@ def main() -> None:
             ema.restore(model)
 
         diagnostics = collect_tm_diagnostics(model, threshold=0.5)
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
 
         logger.log_epoch(
             EpochMetrics(
@@ -256,13 +260,14 @@ def main() -> None:
                 eval_accuracy=test_acc,
                 duration_s=duration,
                 diagnostics=diagnostics,
-                extra={"lr": current_lr},
+                extra={"lr": current_lr, "best_test_acc": best_test_acc},
             )
         )
 
         print(
             f"PyramidTM | epoch {epoch:02d}/{args.epochs:02d} | loss={avg_loss:.4f} | "
-            f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f} | lr={current_lr:.5f}"
+            f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f} | best_acc={best_test_acc:.4f} | "
+            f"lr={current_lr:.5f} | {duration:4.1f}s"
         )
 
         new_tau = linear_tau(args.tau_start, args.tau_end, epoch, args.epochs)
