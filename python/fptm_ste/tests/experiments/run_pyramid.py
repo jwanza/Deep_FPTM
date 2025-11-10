@@ -185,7 +185,7 @@ def build_swin_configs(embed_dims: List[int], depths: List[int], window_size: in
     return configs
 
 
-def run_training(args, rank: int, world_size: int, distributed: bool) -> None:
+def run_training(args, rank: int, world_size: int, distributed: bool, virtual_multiplier: int = 1) -> None:
     seed = args.seed + rank
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -210,18 +210,22 @@ def run_training(args, rank: int, world_size: int, distributed: bool) -> None:
         else None
     )
 
+    effective_train_batch = args.batch_size if distributed else args.batch_size * virtual_multiplier
+    effective_test_batch = args.test_batch_size if distributed else args.test_batch_size * virtual_multiplier
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
+        batch_size=effective_train_batch,
         shuffle=train_sampler is None,
         sampler=train_sampler,
         num_workers=4,
         pin_memory=(device.type != "cpu"),
         persistent_workers=True,
+        drop_last=(not distributed and virtual_multiplier > 1),
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=args.test_batch_size,
+        batch_size=effective_test_batch,
         shuffle=False,
         sampler=test_sampler,
         num_workers=4,
@@ -342,6 +346,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool) -> None:
                 "export_path": str(args.export_path) if args.export_path else None,
                 "patch_size": args.patch_size,
                 "batch_multiplier": world_size,
+                "virtual_batch_multiplier": virtual_multiplier,
             },
         )
         if is_main_process(rank)
@@ -370,34 +375,46 @@ def run_training(args, rank: int, world_size: int, distributed: bool) -> None:
 
         optimizer.zero_grad(set_to_none=True)
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
-            num_batches += 1
-            accum_counter += 1
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            xb = flatten_images(x)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                logits, _, _ = model(xb, use_ste=False)
-                loss = F.cross_entropy(logits, y)
-                aux_loss = model.attention_entropy_loss() if hasattr(model, "attention_entropy_loss") else None
-                if aux_loss is not None:
-                    loss = loss + aux_loss
-                scaled_loss = loss / args.grad_accum
-            scaler.scale(scaled_loss).backward()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
-            if accum_counter >= args.grad_accum:
-                scaler.unscale_(optimizer)
-                if args.grad_clip and args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model_core.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                accum_counter = 0
-                if ema is not None:
-                    ema.update(model_core)
+            if not distributed and virtual_multiplier > 1:
+                x_chunks = torch.chunk(x, virtual_multiplier, dim=0)
+                y_chunks = torch.chunk(y, virtual_multiplier, dim=0)
+            else:
+                x_chunks = (x,)
+                y_chunks = (y,)
 
-            epoch_loss += loss.item()
-            preds = logits.argmax(dim=1)
-            correct += (preds == y).sum().item()
-            total += y.size(0)
+            for micro_x, micro_y in zip(x_chunks, y_chunks):
+                if micro_x.numel() == 0:
+                    continue
+                num_batches += 1
+                accum_counter += 1
+                xb = flatten_images(micro_x)
+                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                    logits, _, _ = model(xb, use_ste=False)
+                    loss = F.cross_entropy(logits, micro_y)
+                    aux_loss = model.attention_entropy_loss() if hasattr(model, "attention_entropy_loss") else None
+                    if aux_loss is not None:
+                        loss = loss + aux_loss
+                    scaled_loss = loss / args.grad_accum
+                scaler.scale(scaled_loss).backward()
+
+                if accum_counter >= args.grad_accum:
+                    scaler.unscale_(optimizer)
+                    if args.grad_clip and args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model_core.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_counter = 0
+                    if ema is not None:
+                        ema.update(model_core)
+
+                epoch_loss += loss.item()
+                preds = logits.argmax(dim=1)
+                correct += (preds == micro_y).sum().item()
+                total += micro_y.size(0)
 
         if accum_counter > 0:
             scaler.unscale_(optimizer)
@@ -489,7 +506,7 @@ def _distributed_worker(rank: int, args) -> None:
     world_size = args.batch_multiplier
     setup_distributed(rank, world_size, args.dist_backend, args.dist_url)
     try:
-        run_training(args, rank=rank, world_size=world_size, distributed=True)
+        run_training(args, rank=rank, world_size=world_size, distributed=True, virtual_multiplier=1)
     finally:
         cleanup_distributed()
 
@@ -540,19 +557,29 @@ def main() -> None:
     if args.batch_multiplier < 1:
         raise ValueError("--batch-multiplier must be >= 1")
 
-    if args.batch_multiplier > 1:
+    available_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    if args.batch_multiplier > 1 and torch.cuda.is_available() and available_cuda >= args.batch_multiplier:
         if not args.dist_url:
             port = find_free_port()
             args.dist_url = f"tcp://127.0.0.1:{port}"
-        if args.dist_backend == "nccl" and not torch.cuda.is_available():
+        if args.dist_backend == "nccl" and available_cuda == 0:
             raise RuntimeError("NCCL backend requires CUDA devices")
-        if args.batch_multiplier > torch.cuda.device_count() and args.dist_backend == "nccl":
-            raise RuntimeError(
-                f"Requested batch multiplier {args.batch_multiplier} exceeds available CUDA devices ({torch.cuda.device_count()})"
-            )
         mp.spawn(_distributed_worker, args=(args,), nprocs=args.batch_multiplier, join=True)
     else:
-        run_training(args, rank=0, world_size=1, distributed=False)
+        virtual_multiplier = 1
+        if args.batch_multiplier > 1:
+            virtual_multiplier = args.batch_multiplier
+            if torch.cuda.is_available() and available_cuda < args.batch_multiplier:
+                print(
+                    f"[Info] Only {available_cuda} CUDA device(s) detected — running virtual batch multiplier "
+                    f"{virtual_multiplier} on a single process."
+                )
+            elif not torch.cuda.is_available():
+                print(
+                    f"[Info] CUDA not available — running virtual batch multiplier {virtual_multiplier} on CPU/MPS."
+                )
+        run_training(args, rank=0, world_size=1, distributed=False, virtual_multiplier=virtual_multiplier)
 
 
 if __name__ == "__main__":
