@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ except ImportError:  # pragma: no cover - timm is an optional dependency
 
 from .tm import FuzzyPatternTM_STE
 from .binarizers import SwinDualBinarizer, CNNSingleBinarizer
+from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
 
 
 class _SwinBackbone(nn.Module):
@@ -703,5 +705,315 @@ class MultiScaleTMEnsemble(nn.Module):
 
     def get_gate_diagnostics(self) -> Dict[str, float]:
         return dict(self.last_gate_stats)
+
+
+# ---------------------------------------------------------------------------
+# TM-native Swin backbone replacements
+
+
+def _drop_path(x: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _drop_path(x, self.drop_prob, self.training)
+
+
+@dataclass
+class SwinTMStageConfig:
+    embed_dim: int
+    depth: int
+    num_heads: int
+    window_size: int = 7
+    shift_size: int = 0
+    tm_hidden_dim: int = 256
+    tm_clauses: int = 256
+    head_clauses: int = 128
+    dropout: float = 0.0
+    drop_path: float = 0.0
+    tau: float = 0.5
+    clause_pool: str = "mean"
+
+
+def build_swin_stage_configs(
+    preset: str,
+    *,
+    tm_hidden_dim: int = 256,
+    tm_clauses: int = 256,
+    head_clauses: int = 128,
+    tau: float = 0.5,
+    window_size: int = 7,
+    dropout: float = 0.0,
+    drop_path: float = 0.0,
+) -> Tuple[SwinTMStageConfig, ...]:
+    preset = preset.lower()
+    if preset not in {"tiny", "small", "base", "large"}:
+        raise ValueError(f"Unknown Swin TM preset '{preset}'")
+    embed_dims = {
+        "tiny": (96, 192, 384, 768),
+        "small": (96, 192, 384, 768),
+        "base": (128, 256, 512, 1024),
+        "large": (192, 384, 768, 1536),
+    }[preset]
+    depths = {
+        "tiny": (2, 2, 6, 2),
+        "small": (2, 2, 18, 2),
+        "base": (2, 2, 18, 2),
+        "large": (2, 2, 18, 2),
+    }[preset]
+    heads = {
+        "tiny": (3, 6, 12, 24),
+        "small": (3, 6, 12, 24),
+        "base": (4, 8, 16, 32),
+        "large": (6, 12, 24, 48),
+    }[preset]
+    configs: List[SwinTMStageConfig] = []
+    shift_cycle = (0, window_size // 2)
+    for idx, (dim, depth, head) in enumerate(zip(embed_dims, depths, heads)):
+        configs.append(
+            SwinTMStageConfig(
+                embed_dim=dim,
+                depth=depth,
+                num_heads=head,
+                window_size=window_size,
+                shift_size=shift_cycle[idx % 2],
+                tm_hidden_dim=tm_hidden_dim,
+                tm_clauses=tm_clauses,
+                head_clauses=head_clauses,
+                dropout=dropout,
+                drop_path=drop_path,
+                tau=tau,
+            )
+        )
+    return tuple(configs)
+
+
+class WindowAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn_out, weights = self.attn(x, x, x, need_weights=True, average_attn_weights=False)
+        weights = weights.mean(dim=0)
+        return attn_out, weights
+
+
+class WindowTMFeedForward(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        window_size: int,
+        tm_hidden_dim: int,
+        tm_clauses: int,
+        tau: float,
+        dropout: float,
+        clause_pool: str,
+    ) -> None:
+        super().__init__()
+        self.window_size = window_size
+        self.norm = nn.LayerNorm(embed_dim)
+        in_dim = window_size * window_size * embed_dim
+        self.pre_tm = nn.Sequential(nn.Linear(in_dim, tm_hidden_dim), nn.Sigmoid())
+        self.tm = FuzzyPatternTM_STE(tm_hidden_dim, tm_clauses, embed_dim, tau=tau)
+        self.post_tm = nn.Sequential(nn.Linear(embed_dim, in_dim), nn.Sigmoid())
+        self.dropout = nn.Dropout(dropout)
+        self.gate = nn.Parameter(torch.tensor(0.5))
+        self.clause_pool = clause_pool
+
+    def forward(self, x: torch.Tensor, *, use_ste: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, H, W, C = x.shape
+        x_norm = self.norm(x)
+        windows = window_partition(x_norm, self.window_size)
+        windows_flat = windows.reshape(-1, self.window_size * self.window_size * C)
+        tm_in = self.pre_tm(windows_flat)
+        logits, clause_outputs = self.tm(tm_in, use_ste=use_ste)
+        window_out = self.post_tm(logits).view(-1, self.window_size, self.window_size, C)
+        merged = window_reverse(window_out, self.window_size, H, W)
+        gate = torch.sigmoid(self.gate)
+        fused = gate * merged + (1.0 - gate) * torch.sigmoid(merged)
+        delta = self.dropout(fused)
+        if self.clause_pool == "mean":
+            summary = clause_outputs.mean(dim=1)
+        elif self.clause_pool == "max":
+            summary = clause_outputs.max(dim=1)[0]
+        else:
+            summary = clause_outputs
+        return delta, summary
+
+
+class SwinTMBlock(nn.Module):
+    def __init__(self, config: SwinTMStageConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.norm1 = nn.LayerNorm(config.embed_dim)
+        self.attn = WindowAttention(config.embed_dim, config.num_heads)
+        self.drop_path1 = DropPath(config.drop_path)
+        self.window_ffn = WindowTMFeedForward(
+            embed_dim=config.embed_dim,
+            window_size=config.window_size,
+            tm_hidden_dim=config.tm_hidden_dim,
+            tm_clauses=config.tm_clauses,
+            tau=config.tau,
+            dropout=config.dropout,
+            clause_pool=config.clause_pool,
+        )
+        self.drop_path2 = DropPath(config.drop_path)
+
+    def forward(self, x: torch.Tensor, H: int, W: int, *, use_ste: bool = True):
+        B, L, C = x.shape
+        window_size = self.config.window_size
+        h = self.norm1(x).view(B, H, W, C)
+        pad_h = (window_size - H % window_size) % window_size
+        pad_w = (window_size - W % window_size) % window_size
+        if pad_h or pad_w:
+            h = h.permute(0, 3, 1, 2)
+            h = F.pad(h, (0, pad_w, 0, pad_h))
+            h = h.permute(0, 2, 3, 1)
+        H_pad, W_pad = H + pad_h, W + pad_w
+        shift = self.config.shift_size if window_size > self.config.shift_size else 0
+        if shift > 0:
+            h = torch.roll(h, shifts=(-shift, -shift), dims=(1, 2))
+        windows = window_partition(h, window_size).view(-1, window_size * window_size, C)
+        attn_out, attn_weights = self.attn(windows)
+        attn_out = attn_out.view(-1, window_size, window_size, C)
+        shifted = window_reverse(attn_out, window_size, H_pad, W_pad)
+        if shift > 0:
+            shifted = torch.roll(shifted, shifts=(shift, shift), dims=(1, 2))
+        if pad_h or pad_w:
+            shifted = shifted[:, :H, :W, :]
+        shifted_tokens = shifted.reshape(B, H * W, C)
+        x = x + self.drop_path1(shifted_tokens)
+        y = x.view(B, H, W, C)
+        if pad_h or pad_w:
+            y = y.permute(0, 3, 1, 2)
+            y = F.pad(y, (0, pad_w, 0, pad_h))
+            y = y.permute(0, 2, 3, 1)
+        delta, clause_summary = self.window_ffn(y, use_ste=use_ste)
+        if pad_h or pad_w:
+            delta = delta[:, :H, :W, :]
+        delta_tokens = delta.reshape(B, H * W, C)
+        x = x + self.drop_path2(delta_tokens)
+        return x, clause_summary, attn_weights
+
+
+class SwinTMStage(nn.Module):
+    def __init__(self, config: SwinTMStageConfig, downsample: bool, num_classes: int) -> None:
+        super().__init__()
+        self.config = config
+        blocks = []
+        for i in range(config.depth):
+            shift = config.shift_size if (i % 2 == 1) else 0
+            block_cfg = SwinTMStageConfig(
+                embed_dim=config.embed_dim,
+                depth=1,
+                num_heads=config.num_heads,
+                window_size=config.window_size,
+                shift_size=shift,
+                tm_hidden_dim=config.tm_hidden_dim,
+                tm_clauses=config.tm_clauses,
+                head_clauses=config.head_clauses,
+                dropout=config.dropout,
+                drop_path=config.drop_path,
+                tau=config.tau,
+                clause_pool=config.clause_pool,
+            )
+            blocks.append(SwinTMBlock(block_cfg))
+        self.blocks = nn.ModuleList(blocks)
+        self.patch_merge = PatchMerging(config.embed_dim, config.embed_dim * 2) if downsample else None
+        self.head_norm = nn.LayerNorm(config.embed_dim)
+        self.head_proj = nn.Sequential(nn.Linear(config.embed_dim, config.tm_hidden_dim), nn.Sigmoid())
+        self.head_tm = FuzzyPatternTM_STE(config.tm_hidden_dim, config.head_clauses, num_classes, tau=config.tau)
+
+    def forward(self, x: torch.Tensor, H: int, W: int, *, use_ste: bool = True):
+        clause_summaries: List[torch.Tensor] = []
+        attn_summaries: List[torch.Tensor] = []
+        for block in self.blocks:
+            x, summary, attn = block(x, H, W, use_ste=use_ste)
+            clause_summaries.append(summary)
+            attn_summaries.append(attn)
+        B, L, C = x.shape
+        feat = self.head_norm(x).mean(dim=1)
+        head_in = self.head_proj(feat)
+        logits, clauses = self.head_tm(head_in, use_ste=use_ste)
+        if self.patch_merge is not None:
+            x = x.view(B, H, W, C)
+            x = self.patch_merge(x)
+            H, W = x.shape[1], x.shape[2]
+            x = x.view(B, H * W, -1)
+        return x, H, W, logits, clauses, clause_summaries, attn_summaries
+
+
+class SwinTM(nn.Module):
+    def __init__(
+        self,
+        stage_configs: Optional[Sequence[SwinTMStageConfig]] = None,
+        *,
+        preset: str = "tiny",
+        num_classes: int = 10,
+        in_channels: int = 3,
+        image_size: Tuple[int, int] = (224, 224),
+    ) -> None:
+        super().__init__()
+        if stage_configs is None:
+            stage_configs = build_swin_stage_configs(preset)
+        self.stage_configs = tuple(stage_configs)
+        self.num_classes = num_classes
+        self.image_size = image_size
+        self.patch_embed = nn.Conv2d(in_channels, self.stage_configs[0].embed_dim, kernel_size=4, stride=4)
+        stages = []
+        for idx, cfg in enumerate(self.stage_configs):
+            downsample = idx < len(self.stage_configs) - 1
+            stages.append(SwinTMStage(cfg, downsample, num_classes))
+        self.stages = nn.ModuleList(stages)
+        final_dim = self.stage_configs[-1].embed_dim
+        self.final_norm = nn.LayerNorm(final_dim)
+        self.final_proj = nn.Sequential(nn.Linear(final_dim, self.stage_configs[-1].tm_hidden_dim), nn.Sigmoid())
+        self.final_tm = FuzzyPatternTM_STE(
+            self.stage_configs[-1].tm_hidden_dim,
+            self.stage_configs[-1].head_clauses,
+            num_classes,
+            tau=self.stage_configs[-1].tau,
+        )
+        self.last_stage_logits: List[torch.Tensor] = []
+        self.last_clause_summaries: List[List[torch.Tensor]] = []
+        self.last_attention_weights: List[List[torch.Tensor]] = []
+
+    def forward(self, x: torch.Tensor, *, use_ste: bool = True):
+        if x.dim() == 2:
+            H, W = self.image_size
+            C = self.patch_embed.in_channels
+            x = x.view(x.shape[0], C, H, W)
+        feats = self.patch_embed(x)
+        B, C, H, W = feats.shape
+        feats = feats.view(B, C, H * W).transpose(1, 2)
+        stage_logits: List[torch.Tensor] = []
+        clause_lists: List[torch.Tensor] = []
+        summary_lists: List[List[torch.Tensor]] = []
+        attn_lists: List[List[torch.Tensor]] = []
+        for stage in self.stages:
+            feats, H, W, s_logits, clauses, summaries, attn_summary = stage(feats, H, W, use_ste=use_ste)
+            stage_logits.append(s_logits)
+            clause_lists.append(clauses)
+            summary_lists.append(summaries)
+            attn_lists.append(attn_summary)
+        pooled = self.final_norm(feats).mean(dim=1)
+        final_in = self.final_proj(pooled)
+        final_logits, final_clauses = self.final_tm(final_in, use_ste=use_ste)
+        self.last_stage_logits = stage_logits + [final_logits]
+        self.last_clause_summaries = summary_lists
+        self.last_attention_weights = attn_lists
+        return final_logits, stage_logits, clause_lists, final_clauses
 
 

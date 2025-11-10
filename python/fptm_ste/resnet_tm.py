@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .tm import FuzzyPatternTM_STE
+
+
+def conv3x3(in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+def conv1x1(in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False)
+
+
+@dataclass
+class ResNetTMConfig:
+    layers: Sequence[int]
+    channels: Sequence[int]
+    tm_hidden: int = 256
+    tm_clauses: int = 128
+    tau: float = 0.5
+
+
+class BasicTMBlock(nn.Module):
+    expansion = 1
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        tm_hidden: int,
+        tm_clauses: int,
+        tau: float,
+        downsample: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        self.conv1 = conv3x3(in_channels, out_channels, stride)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = conv3x3(out_channels, out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = downsample
+        self.pre_tm = nn.Sequential(nn.Linear(out_channels, tm_hidden), nn.Sigmoid())
+        self.tm = FuzzyPatternTM_STE(tm_hidden, tm_clauses, out_channels, tau=tau)
+        self.post_tm = nn.Sequential(nn.Linear(out_channels, out_channels), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor, *, use_ste: bool = True) -> torch.Tensor:
+        identity = x
+
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.bn2(self.conv2(out))
+
+        B, C, H, W = out.shape
+        out_flat = out.permute(0, 2, 3, 1).contiguous().view(-1, C)
+        tm_in = self.pre_tm(out_flat)
+        logits, _ = self.tm(tm_in, use_ste=use_ste)
+        logits = logits.view(B, H, W, C)
+        out = self.post_tm(logits).permute(0, 3, 1, 2).contiguous()
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = out + identity
+        return F.relu(out, inplace=True)
+
+
+class BottleneckTMBlock(nn.Module):
+    expansion = 4
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int,
+        tm_hidden: int,
+        tm_clauses: int,
+        tau: float,
+        downsample: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        width = out_channels
+        self.conv1 = conv1x1(in_channels, width)
+        self.bn1 = nn.BatchNorm2d(width)
+        self.conv2 = conv3x3(width, width, stride)
+        self.bn2 = nn.BatchNorm2d(width)
+        self.conv3 = conv1x1(width, out_channels * self.expansion)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        self.downsample = downsample
+        self.pre_tm = nn.Sequential(nn.Linear(out_channels * self.expansion, tm_hidden), nn.Sigmoid())
+        self.tm = FuzzyPatternTM_STE(tm_hidden, tm_clauses, out_channels * self.expansion, tau=tau)
+        self.post_tm = nn.Sequential(
+            nn.Linear(out_channels * self.expansion, out_channels * self.expansion),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor, *, use_ste: bool = True) -> torch.Tensor:
+        identity = x
+
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = F.relu(self.bn2(self.conv2(out)), inplace=True)
+        out = self.bn3(self.conv3(out))
+
+        B, C, H, W = out.shape
+        out_flat = out.permute(0, 2, 3, 1).contiguous().view(-1, C)
+        tm_in = self.pre_tm(out_flat)
+        logits, _ = self.tm(tm_in, use_ste=use_ste)
+        logits = logits.view(B, H, W, C)
+        out = self.post_tm(logits).permute(0, 3, 1, 2).contiguous()
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = out + identity
+        return F.relu(out, inplace=True)
+
+
+class ResNetTM(nn.Module):
+    def __init__(
+        self,
+        config: ResNetTMConfig,
+        num_classes: int = 10,
+        in_channels: int = 3,
+        block: Callable[..., nn.Module] = BasicTMBlock,
+    ) -> None:
+        super().__init__()
+        if len(config.channels) != len(config.layers):
+            raise ValueError("channels and layers must have the same length")
+        self.config = config
+        self.in_channels = config.channels[0]
+        self.conv1 = nn.Conv2d(in_channels, self.in_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.stages = nn.ModuleList()
+        self.stage_dims: List[int] = []
+        for idx, (planes, blocks) in enumerate(zip(config.channels, config.layers)):
+            stride = 1 if idx == 0 else 2
+            layer, out_dim = self._make_layer(block, planes, blocks, stride, config)
+            self.stages.append(layer)
+            self.stage_dims.append(out_dim)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.stage_proj = nn.ModuleList(
+            nn.Sequential(nn.Linear(dim, config.tm_hidden), nn.Sigmoid()) for dim in self.stage_dims
+        )
+        self.stage_heads = nn.ModuleList(
+            FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=config.tau)
+            for _ in self.stage_dims
+        )
+        self.final_proj = nn.Sequential(nn.Linear(self.stage_dims[-1], config.tm_hidden), nn.Sigmoid())
+        self.final_tm = FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=config.tau)
+        self.last_stage_logits: List[torch.Tensor] = []
+        self.last_stage_clauses: List[torch.Tensor] = []
+
+    def _make_layer(
+        self,
+        block: Callable[..., nn.Module],
+        planes: int,
+        blocks: int,
+        stride: int,
+        config: ResNetTMConfig,
+    ) -> Tuple[nn.Sequential, int]:
+        downsample = None
+        out_channels = planes * block.expansion
+        if stride != 1 or self.in_channels != out_channels:
+            downsample = nn.Sequential(
+                conv1x1(self.in_channels, out_channels, stride),
+                nn.BatchNorm2d(out_channels),
+            )
+
+        layers = []
+        layers.append(
+            block(
+                self.in_channels,
+                planes,
+                stride,
+                config.tm_hidden,
+                config.tm_clauses,
+                config.tau,
+                downsample,
+            )
+        )
+        self.in_channels = out_channels
+        for _ in range(1, blocks):
+            layers.append(block(self.in_channels, planes, 1, config.tm_hidden, config.tm_clauses, config.tau))
+        return nn.Sequential(*layers), out_channels
+
+    def forward(self, x: torch.Tensor, *, use_ste: bool = True):
+        x = self.pool(self.relu(self.bn1(self.conv1(x))))
+        stage_logits: List[torch.Tensor] = []
+        stage_clauses: List[torch.Tensor] = []
+
+        for idx, stage in enumerate(self.stages):
+            x = stage(x)
+            pooled = self.avgpool(x).flatten(1)
+            proj = self.stage_proj[idx](pooled)
+            logits, clauses = self.stage_heads[idx](proj, use_ste=use_ste)
+            stage_logits.append(logits)
+            stage_clauses.append(clauses)
+
+        final_proj = self.final_proj(self.avgpool(x).flatten(1))
+        final_logits, final_clauses = self.final_tm(final_proj, use_ste=use_ste)
+        self.last_stage_logits = stage_logits + [final_logits]
+        self.last_stage_clauses = stage_clauses + [final_clauses]
+        return final_logits, stage_logits, stage_clauses, final_clauses
+
+
+def resnet_tm18(
+    num_classes: int = 10,
+    *,
+    in_channels: int = 3,
+    tm_hidden: int = 256,
+    tm_clauses: int = 128,
+    tau: float = 0.5,
+) -> ResNetTM:
+    config = ResNetTMConfig(layers=(2, 2, 2, 2), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
+    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BasicTMBlock)
+
+
+def resnet_tm34(
+    num_classes: int = 10,
+    *,
+    in_channels: int = 3,
+    tm_hidden: int = 256,
+    tm_clauses: int = 128,
+    tau: float = 0.5,
+) -> ResNetTM:
+    config = ResNetTMConfig(layers=(3, 4, 6, 3), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
+    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BasicTMBlock)
+
+
+def resnet_tm50(
+    num_classes: int = 10,
+    *,
+    in_channels: int = 3,
+    tm_hidden: int = 256,
+    tm_clauses: int = 128,
+    tau: float = 0.5,
+) -> ResNetTM:
+    config = ResNetTMConfig(layers=(3, 4, 6, 3), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
+    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BottleneckTMBlock)
+
+
+def resnet_tm101(
+    num_classes: int = 10,
+    *,
+    in_channels: int = 3,
+    tm_hidden: int = 256,
+    tm_clauses: int = 128,
+    tau: float = 0.5,
+) -> ResNetTM:
+    config = ResNetTMConfig(layers=(3, 4, 23, 3), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
+    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BottleneckTMBlock)

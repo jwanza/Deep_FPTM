@@ -9,7 +9,7 @@ import socket
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -22,7 +22,9 @@ from torchvision import datasets, transforms
 
 from fptm_ste.experiments import EpochMetrics, ExperimentLogger, collect_tm_diagnostics
 from fptm_ste.pyramid_tm import PyramidStageConfig, PyramidTM
+from fptm_ste.resnet_tm import ResNetTM, resnet_tm101, resnet_tm18, resnet_tm34, resnet_tm50
 from fptm_ste.swin_pyramid_tm import SwinLikePyramidTM, SwinStageConfig
+from fptm_ste.swin_tm import SwinTM, build_swin_stage_configs
 from fptm_ste.trainers import EMAWrapper, anneal_ste_factor
 
 
@@ -106,28 +108,116 @@ def reduce_max(value: float, device: torch.device) -> float:
     return tensor.item()
 
 
-def flatten_images(x: torch.Tensor) -> torch.Tensor:
-    return x.view(x.size(0), -1)
+def extract_final_and_stage_logits(model_core, outputs) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    if torch.is_tensor(outputs):
+        final_logits = outputs
+    elif isinstance(outputs, tuple):
+        final_logits = outputs[0]
+    else:
+        raise TypeError(f"Unexpected model output type: {type(outputs)!r}")
+
+    stage_logits: List[torch.Tensor] = []
+    if isinstance(model_core, PyramidTM):
+        if isinstance(outputs, tuple) and len(outputs) > 1 and isinstance(outputs[1], list):
+            stage_logits = list(outputs[1]) + [final_logits]
+    elif isinstance(model_core, SwinLikePyramidTM):
+        if isinstance(outputs, tuple) and len(outputs) > 1 and isinstance(outputs[1], list):
+            stage_logits = list(outputs[1])
+    elif isinstance(model_core, SwinTM):
+        stage_logits = list(getattr(model_core, "last_stage_logits", []))
+    elif isinstance(model_core, ResNetTM):
+        stage_logits = list(getattr(model_core, "last_stage_logits", []))
+    else:
+        if isinstance(outputs, tuple) and len(outputs) > 1 and isinstance(outputs[1], list):
+            stage_logits = list(outputs[1])
+
+    if not stage_logits:
+        stage_logits = [final_logits]
+    return final_logits, stage_logits
 
 
-def evaluate(model, loader: DataLoader, device: torch.device, use_ste: bool, *, distributed: bool = False) -> float:
-    model.eval()
-    correct = 0
-    total = 0
+def summarize_attention_weights(model_core) -> Optional[torch.Tensor]:
+    weights = getattr(model_core, "last_attention_weights", None)
+    if weights is None:
+        return None
+    if isinstance(weights, torch.Tensor):
+        return weights.detach().cpu()
+    if isinstance(weights, list):
+        flattened: List[torch.Tensor] = []
+        for item in weights:
+            if isinstance(item, torch.Tensor):
+                flattened.append(item.detach().cpu().reshape(-1))
+            elif isinstance(item, list):
+                block_means: List[torch.Tensor] = []
+                for sub in item:
+                    if isinstance(sub, torch.Tensor):
+                        block_means.append(sub.detach().cpu().mean(dim=-1, keepdim=False).reshape(-1))
+                if block_means:
+                    flattened.append(torch.cat(block_means))
+        if not flattened:
+            return None
+        return torch.cat([vec.reshape(-1) for vec in flattened])
+    return None
+
+
+def to_serializable(obj):
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.item()
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_serializable(v) for v in obj]
+    return obj
+
+
+def evaluate(model_core, loader: DataLoader, device: torch.device, use_ste: bool, *, distributed: bool = False):
+    model_core.eval()
+    correct = 0.0
+    total = 0.0
+    stage_correct: List[float] = []
+    stage_total = 0.0
+    attn_records: List[torch.Tensor] = []
+
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            xb = flatten_images(x)
-            logits, _, _ = model(xb, use_ste=use_ste)
-            pred = logits.argmax(dim=1)
-            correct += (pred == y).sum().item()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            outputs = model_core(x, use_ste=use_ste)
+            final_logits, stage_logits = extract_final_and_stage_logits(model_core, outputs)
+            preds = final_logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
             total += y.size(0)
+            for idx, s_logits in enumerate(stage_logits):
+                if len(stage_correct) <= idx:
+                    stage_correct.extend([0.0] * (idx + 1 - len(stage_correct)))
+                stage_correct[idx] += (s_logits.argmax(dim=1) == y).sum().item()
+            stage_total += y.size(0)
+            attn_summary = summarize_attention_weights(model_core)
+            if attn_summary is not None:
+                attn_records.append(attn_summary)
+
     if distributed and dist.is_available() and dist.is_initialized():
         tensor = torch.tensor([correct, total], device=device, dtype=torch.float64)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        correct = int(tensor[0].item())
-        total = int(tensor[1].item())
-    return correct / total if total else 0.0
+        correct = tensor[0].item()
+        total = tensor[1].item()
+        if stage_correct:
+            stage_tensor = torch.tensor(stage_correct + [stage_total], device=device, dtype=torch.float64)
+            dist.all_reduce(stage_tensor, op=dist.ReduceOp.SUM)
+            stage_total = stage_tensor[-1].item()
+            stage_correct = stage_tensor[:-1].tolist()
+
+    acc = correct / total if total else 0.0
+    stage_accs = [sc / stage_total for sc in stage_correct] if stage_total else []
+    attn_avg = None
+    if attn_records:
+        shapes = [vec.shape for vec in attn_records]
+        if all(shape == shapes[0] for shape in shapes):
+            attn_stack = torch.stack(attn_records, dim=0)
+            attn_avg = attn_stack.mean(dim=0).tolist()
+    return acc, stage_accs, attn_avg
 
 
 def linear_tau(initial: float, final: float, epoch: int, total_epochs: int) -> float:
@@ -281,6 +371,68 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
             scale_entropy_weight=args.scale_entropy_weight,
             patch_size=args.patch_size,
         ).to(device)
+    elif args.tm_variant == "swin_tm":
+        stage_configs = build_swin_stage_configs(
+            args.swin_tm_preset,
+            tm_hidden_dim=args.swin_tm_stage_hidden,
+            tm_clauses=args.swin_tm_stage_clauses,
+            head_clauses=args.swin_tm_stage_head_clauses,
+            tau=args.tau_start,
+            window_size=args.swin_tm_window_size,
+            dropout=args.swin_tm_dropout,
+            drop_path=args.swin_tm_drop_path,
+        )
+        metadata_stage_configs = [cfg.__dict__ for cfg in stage_configs]
+        model_core = SwinTM(
+            stage_configs=stage_configs,
+            num_classes=10,
+            in_channels=in_channels,
+            image_size=image_size,
+        ).to(device)
+    elif args.tm_variant == "resnet_tm":
+        variant = args.resnet_tm_variant
+        if variant == "18":
+            model_core = resnet_tm18(
+                num_classes=10,
+                in_channels=in_channels,
+                tm_hidden=args.resnet_tm_hidden,
+                tm_clauses=args.resnet_tm_clauses,
+                tau=args.tau_start,
+            )
+        elif variant == "34":
+            model_core = resnet_tm34(
+                num_classes=10,
+                in_channels=in_channels,
+                tm_hidden=args.resnet_tm_hidden,
+                tm_clauses=args.resnet_tm_clauses,
+                tau=args.tau_start,
+            )
+        elif variant == "50":
+            model_core = resnet_tm50(
+                num_classes=10,
+                in_channels=in_channels,
+                tm_hidden=args.resnet_tm_hidden,
+                tm_clauses=args.resnet_tm_clauses,
+                tau=args.tau_start,
+            )
+        else:
+            model_core = resnet_tm101(
+                num_classes=10,
+                in_channels=in_channels,
+                tm_hidden=args.resnet_tm_hidden,
+                tm_clauses=args.resnet_tm_clauses,
+                tau=args.tau_start,
+            )
+        model_core = model_core.to(device)
+        metadata_stage_configs = [
+            {
+                "variant": variant,
+                "layers": list(model_core.config.layers) if isinstance(model_core, ResNetTM) else [],
+                "channels": list(model_core.config.channels) if isinstance(model_core, ResNetTM) else [],
+                "tm_hidden": args.resnet_tm_hidden,
+                "tm_clauses": args.resnet_tm_clauses,
+            }
+        ]
     else:
         pyramid_configs = build_pyramid(
             stage_clause_overrides,
@@ -347,6 +499,8 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 "patch_size": args.patch_size,
                 "batch_multiplier": world_size,
                 "virtual_batch_multiplier": virtual_multiplier,
+                "swin_tm_preset": args.swin_tm_preset,
+                "resnet_tm_variant": args.resnet_tm_variant,
             },
         )
         if is_main_process(rank)
@@ -390,9 +544,9 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                     continue
                 num_batches += 1
                 accum_counter += 1
-                xb = flatten_images(micro_x)
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    logits, _, _ = model(xb, use_ste=False)
+                    outputs = model(micro_x, use_ste=False)
+                    logits, _ = extract_final_and_stage_logits(model_core, outputs)
                     loss = F.cross_entropy(logits, micro_y)
                     aux_loss = model.attention_entropy_loss() if hasattr(model, "attention_entropy_loss") else None
                     if aux_loss is not None:
@@ -440,7 +594,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
 
         if ema is not None:
             ema.apply_shadow(model_core)
-        test_acc = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
+        test_acc, stage_accs, attn_avg = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
         if ema is not None:
             ema.restore(model_core)
 
@@ -450,8 +604,19 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
         diagnostics = (
             collect_tm_diagnostics(model_core, threshold=0.5) if is_main_process(rank) else {}
         )
+        diagnostics = to_serializable(diagnostics)
 
         if is_main_process(rank):
+            extra_metrics: Dict[str, float] = {
+                "lr": current_lr,
+                "best_test_acc": best_test_acc,
+                "world_size": world_size,
+            }
+            for idx, stage_acc in enumerate(stage_accs):
+                extra_metrics[f"stage_acc_{idx}"] = stage_acc
+            if attn_avg is not None:
+                for idx, val in enumerate(attn_avg):
+                    extra_metrics[f"attention_{idx}"] = val
             logger.log_epoch(
                 EpochMetrics(
                     epoch=epoch,
@@ -460,13 +625,16 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                     eval_accuracy=test_acc,
                     duration_s=duration,
                     diagnostics=diagnostics,
-                    extra={"lr": current_lr, "best_test_acc": best_test_acc, "world_size": world_size},
+                    extra=extra_metrics,
                 )
             )
+            stage_msg = ""
+            if stage_accs:
+                stage_msg = " " + ", ".join(f"s{idx}={acc:.3f}" for idx, acc in enumerate(stage_accs))
             print(
-                f"PyramidTM | epoch {epoch:02d}/{args.epochs:02d} | loss={avg_loss:.4f} | "
+                f"{args.tm_variant.upper()} | epoch {epoch:02d}/{args.epochs:02d} | loss={avg_loss:.4f} | "
                 f"train_acc={train_acc:.4f} | test_acc={test_acc:.4f} | best_acc={best_test_acc:.4f} | "
-                f"lr={current_lr:.5f} | {duration:4.1f}s"
+                f"lr={current_lr:.5f} | {duration:4.1f}s{stage_msg}"
             )
 
         new_tau = linear_tau(args.tau_start, args.tau_end, epoch, args.epochs)
@@ -480,20 +648,30 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
 
     if ema is not None:
         ema.apply_shadow(model_core)
-    final_acc = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
+    final_acc, _, _ = evaluate(model_core, test_loader, device, use_ste=True, distributed=distributed)
     if ema is not None:
         ema.restore(model_core)
 
     if is_main_process(rank):
         if args.export_path:
-            stage_exports = {f"stage_{idx}": stage.tm.discretize() for idx, stage in enumerate(model_core.stages)}
-            attention_weights = None
-            if hasattr(model_core, "last_attention_weights") and model_core.last_attention_weights is not None:
-                attention_weights = model_core.last_attention_weights.detach().cpu().tolist()
+            stage_exports: Dict[str, object] = {}
+            if hasattr(model_core, "stages"):
+                for idx, stage in enumerate(getattr(model_core, "stages")):
+                    export_obj = None
+                    if hasattr(stage, "discretize"):
+                        export_obj = stage.discretize()
+                    elif hasattr(stage, "head_tm") and hasattr(stage.head_tm, "discretize"):
+                        export_obj = stage.head_tm.discretize()
+                    elif hasattr(stage, "tm") and hasattr(stage.tm, "discretize"):
+                        export_obj = stage.tm.discretize()
+                    if export_obj is not None:
+                        stage_exports[f"stage_{idx}"] = export_obj
+            attention_summary = summarize_attention_weights(model_core)
+            attention_payload = attention_summary.tolist() if attention_summary is not None else None
             payload = {
                 "final_test_accuracy": final_acc,
                 "stage_exports": stage_exports,
-                "attention_weights": attention_weights,
+                "attention_weights": attention_payload,
             }
             args.export_path.parent.mkdir(parents=True, exist_ok=True)
             args.export_path.write_text(json.dumps(payload, indent=2))
@@ -535,7 +713,7 @@ def main() -> None:
     parser.add_argument("--stage-dropouts", type=str, default="")
     parser.add_argument("--export-path", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent)
-    parser.add_argument("--tm-variant", choices=["pyramid", "swin"], default="pyramid")
+    parser.add_argument("--tm-variant", choices=["pyramid", "swin", "swin_tm", "resnet_tm"], default="pyramid")
     parser.add_argument("--swin-embed-dims", type=str, default="")
     parser.add_argument("--swin-depths", type=str, default="")
     parser.add_argument("--swin-window-size", type=int, default=4)
@@ -543,6 +721,16 @@ def main() -> None:
     parser.add_argument("--swin-tm-hidden", type=str, default="")
     parser.add_argument("--swin-tm-clauses", type=str, default="")
     parser.add_argument("--swin-head-clauses", type=str, default="")
+    parser.add_argument("--swin-tm-preset", type=str, default="tiny", choices=["tiny", "small", "base", "large"])
+    parser.add_argument("--swin-tm-window-size", type=int, default=7)
+    parser.add_argument("--swin-tm-stage-hidden", type=int, default=256)
+    parser.add_argument("--swin-tm-stage-clauses", type=int, default=256)
+    parser.add_argument("--swin-tm-stage-head-clauses", type=int, default=128)
+    parser.add_argument("--swin-tm-dropout", type=float, default=0.0)
+    parser.add_argument("--swin-tm-drop-path", type=float, default=0.0)
+    parser.add_argument("--resnet-tm-variant", type=str, default="18", choices=["18", "34", "50", "101"])
+    parser.add_argument("--resnet-tm-hidden", type=int, default=256)
+    parser.add_argument("--resnet-tm-clauses", type=int, default=128)
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--batch-multiplier", type=int, default=1, help="Number of parallel replicas (world size)")
     parser.add_argument("--dist-backend", type=str, default="nccl", help="Distributed backend to use")

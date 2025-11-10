@@ -14,7 +14,7 @@
       "tau": 0.5,
       "noise_std": 0.0
     },
-    "epochs": 10,
+    "epochs": 2,
     "lr": 0.001,
     "weight_decay": 1e-05,
     "grad_clip": 0.5,
@@ -25,10 +25,10 @@
   "epochs": [
     {
       "epoch": 1,
-      "train_loss": 1.2430554939104295,
-      "train_accuracy": 0.6997,
-      "eval_accuracy": 0.8769,
-      "duration_s": 10.75486421585083,
+      "train_loss": 1.2427470450208131,
+      "train_accuracy": 0.697,
+      "eval_accuracy": 0.8826,
+      "duration_s": 11.002309560775757,
       "diagnostics": {
         "tau": {
           "layers.0": 0.5,
@@ -37,25 +37,25 @@
         },
         "clause_sparsity": {
           "layers.0": {
-            "positive": 0.3517817258834839,
-            "negative": 0.33982381224632263,
-            "positive_inv": 0.5001893043518066,
-            "negative_inv": 0.4993921220302582,
-            "overall": 0.42279675602912903
+            "positive": 0.32961973547935486,
+            "negative": 0.32421875,
+            "positive_inv": 0.5026108026504517,
+            "negative_inv": 0.5038365125656128,
+            "overall": 0.41507142782211304
           },
           "layers.1": {
-            "positive": 0.15325927734375,
-            "negative": 0.147186279296875,
-            "positive_inv": 0.503021240234375,
-            "negative_inv": 0.49896240234375,
-            "overall": 0.3256072998046875
+            "positive": 0.11041259765625,
+            "negative": 0.11798095703125,
+            "positive_inv": 0.502105712890625,
+            "negative_inv": 0.501068115234375,
+            "overall": 0.307891845703125
           },
           "classifier": {
-            "positive": 0.409637451171875,
-            "negative": 0.4083251953125,
-            "positive_inv": 0.506988525390625,
-            "negative_inv": 0.50665283203125,
-            "overall": 0.4579010009765625
+            "positive": 0.41204833984375,
+            "negative": 0.411865234375,
+            "positive_inv": 0.506927490234375,
+            "negative_inv": 0.50634765625,
+            "overall": 0.45929718017578125
           }
         },
         "attention": {}
@@ -63,10 +63,10 @@
     },
     {
       "epoch": 2,
-      "train_loss": 0.35375679447961006,
-      "train_accuracy": 0.8991833333333333,
-      "eval_accuracy": 0.9151,
-      "duration_s": 10.688873767852783,
+      "train_loss": 0.3615668154855781,
+      "train_accuracy": 0.8990833333333333,
+      "eval_accuracy": 0.9142,
+      "duration_s": 10.830149412155151,
       "diagnostics": {
         "tau": {
           "layers.0": 0.5,
@@ -75,329 +75,25 @@
         },
         "clause_sparsity": {
           "layers.0": {
-            "positive": 0.30904215574264526,
-            "negative": 0.2980807423591614,
-            "positive_inv": 0.51416015625,
-            "negative_inv": 0.5122469067573547,
-            "overall": 0.40838247537612915
+            "positive": 0.2538364827632904,
+            "negative": 0.24967114627361298,
+            "positive_inv": 0.5098951458930969,
+            "negative_inv": 0.5113699436187744,
+            "overall": 0.3811931908130646
           },
           "layers.1": {
-            "positive": 0.06695556640625,
-            "negative": 0.064849853515625,
-            "positive_inv": 0.50225830078125,
-            "negative_inv": 0.500335693359375,
-            "overall": 0.283599853515625
+            "positive": 0.02593994140625,
+            "negative": 0.029571533203125,
+            "positive_inv": 0.4990234375,
+            "negative_inv": 0.49615478515625,
+            "overall": 0.26267242431640625
           },
           "classifier": {
-            "positive": 0.3900146484375,
-            "negative": 0.388031005859375,
-            "positive_inv": 0.513031005859375,
-            "negative_inv": 0.511871337890625,
-            "overall": 0.45073699951171875
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 3,
-      "train_loss": 0.27001039272368843,
-      "train_accuracy": 0.9198,
-      "eval_accuracy": 0.9236,
-      "duration_s": 10.775077104568481,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.26393094658851624,
-            "negative": 0.26085180044174194,
-            "positive_inv": 0.5183055400848389,
-            "negative_inv": 0.51708984375,
-            "overall": 0.39004454016685486
-          },
-          "layers.1": {
-            "positive": 0.03717041015625,
-            "negative": 0.034759521484375,
-            "positive_inv": 0.50244140625,
-            "negative_inv": 0.49957275390625,
-            "overall": 0.26848602294921875
-          },
-          "classifier": {
-            "positive": 0.38409423828125,
-            "negative": 0.382415771484375,
-            "positive_inv": 0.515411376953125,
-            "negative_inv": 0.51422119140625,
-            "overall": 0.44903564453125
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 4,
-      "train_loss": 0.23389041541354744,
-      "train_accuracy": 0.92975,
-      "eval_accuracy": 0.9331,
-      "duration_s": 10.87621784210205,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.2271902859210968,
-            "negative": 0.22478874027729034,
-            "positive_inv": 0.5191824436187744,
-            "negative_inv": 0.5165916085243225,
-            "overall": 0.3719382584095001
-          },
-          "layers.1": {
-            "positive": 0.02374267578125,
-            "negative": 0.02178955078125,
-            "positive_inv": 0.499969482421875,
-            "negative_inv": 0.497833251953125,
-            "overall": 0.260833740234375
-          },
-          "classifier": {
-            "positive": 0.379974365234375,
-            "negative": 0.37841796875,
-            "positive_inv": 0.517486572265625,
-            "negative_inv": 0.51666259765625,
-            "overall": 0.4481353759765625
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 5,
-      "train_loss": 0.2131929352228194,
-      "train_accuracy": 0.9358166666666666,
-      "eval_accuracy": 0.9354,
-      "duration_s": 10.910307884216309,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.18838687241077423,
-            "negative": 0.19140625,
-            "positive_inv": 0.5200892686843872,
-            "negative_inv": 0.5179468393325806,
-            "overall": 0.354457288980484
-          },
-          "layers.1": {
-            "positive": 0.020538330078125,
-            "negative": 0.017303466796875,
-            "positive_inv": 0.497894287109375,
-            "negative_inv": 0.496002197265625,
-            "overall": 0.2579345703125
-          },
-          "classifier": {
-            "positive": 0.376953125,
-            "negative": 0.37628173828125,
-            "positive_inv": 0.518402099609375,
-            "negative_inv": 0.5179443359375,
-            "overall": 0.44739532470703125
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 6,
-      "train_loss": 0.1960567214023838,
-      "train_accuracy": 0.9409333333333333,
-      "eval_accuracy": 0.9362,
-      "duration_s": 10.725275039672852,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.16781927645206451,
-            "negative": 0.17275190353393555,
-            "positive_inv": 0.5223114490509033,
-            "negative_inv": 0.5184949040412903,
-            "overall": 0.3453443944454193
-          },
-          "layers.1": {
-            "positive": 0.01910400390625,
-            "negative": 0.01519775390625,
-            "positive_inv": 0.498199462890625,
-            "negative_inv": 0.495452880859375,
-            "overall": 0.256988525390625
-          },
-          "classifier": {
-            "positive": 0.3756103515625,
-            "negative": 0.374725341796875,
-            "positive_inv": 0.518585205078125,
-            "negative_inv": 0.51922607421875,
-            "overall": 0.4470367431640625
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 7,
-      "train_loss": 0.18260925646021423,
-      "train_accuracy": 0.9435,
-      "eval_accuracy": 0.9377,
-      "duration_s": 10.690185785293579,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.1640625,
-            "negative": 0.1705496609210968,
-            "positive_inv": 0.5317283272743225,
-            "negative_inv": 0.5268056392669678,
-            "overall": 0.348286509513855
-          },
-          "layers.1": {
-            "positive": 0.0177001953125,
-            "negative": 0.01373291015625,
-            "positive_inv": 0.497802734375,
-            "negative_inv": 0.493682861328125,
-            "overall": 0.25572967529296875
-          },
-          "classifier": {
-            "positive": 0.373046875,
-            "negative": 0.372772216796875,
-            "positive_inv": 0.519683837890625,
-            "negative_inv": 0.51959228515625,
-            "overall": 0.4462738037109375
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 8,
-      "train_loss": 0.1692367980220933,
-      "train_accuracy": 0.9481166666666667,
-      "eval_accuracy": 0.9419,
-      "duration_s": 10.808467388153076,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.15665856003761292,
-            "negative": 0.1642717570066452,
-            "positive_inv": 0.5394810438156128,
-            "negative_inv": 0.5321468114852905,
-            "overall": 0.34813955426216125
-          },
-          "layers.1": {
-            "positive": 0.01824951171875,
-            "negative": 0.0142822265625,
-            "positive_inv": 0.4967041015625,
-            "negative_inv": 0.494415283203125,
-            "overall": 0.25591278076171875
-          },
-          "classifier": {
-            "positive": 0.3709716796875,
-            "negative": 0.371734619140625,
-            "positive_inv": 0.520660400390625,
-            "negative_inv": 0.520477294921875,
-            "overall": 0.44596099853515625
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 9,
-      "train_loss": 0.16068478476708886,
-      "train_accuracy": 0.9499,
-      "eval_accuracy": 0.9464,
-      "duration_s": 10.518898010253906,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.1432059109210968,
-            "negative": 0.15594108402729034,
-            "positive_inv": 0.542390763759613,
-            "negative_inv": 0.5352359414100647,
-            "overall": 0.3441934287548065
-          },
-          "layers.1": {
-            "positive": 0.01812744140625,
-            "negative": 0.013916015625,
-            "positive_inv": 0.49615478515625,
-            "negative_inv": 0.4932861328125,
-            "overall": 0.25537109375
-          },
-          "classifier": {
-            "positive": 0.36993408203125,
-            "negative": 0.3699951171875,
-            "positive_inv": 0.521392822265625,
-            "negative_inv": 0.520599365234375,
-            "overall": 0.4454803466796875
-          }
-        },
-        "attention": {}
-      }
-    },
-    {
-      "epoch": 10,
-      "train_loss": 0.15109910777033264,
-      "train_accuracy": 0.9535833333333333,
-      "eval_accuracy": 0.9481,
-      "duration_s": 10.615003108978271,
-      "diagnostics": {
-        "tau": {
-          "layers.0": 0.5,
-          "layers.1": 0.5,
-          "classifier": 0.5
-        },
-        "clause_sparsity": {
-          "layers.0": {
-            "positive": 0.13227438926696777,
-            "negative": 0.14812858402729034,
-            "positive_inv": 0.5503826141357422,
-            "negative_inv": 0.5403081178665161,
-            "overall": 0.3427734375
-          },
-          "layers.1": {
-            "positive": 0.019561767578125,
-            "negative": 0.01495361328125,
-            "positive_inv": 0.495849609375,
-            "negative_inv": 0.492919921875,
-            "overall": 0.25582122802734375
-          },
-          "classifier": {
-            "positive": 0.369293212890625,
-            "negative": 0.3681640625,
-            "positive_inv": 0.52227783203125,
-            "negative_inv": 0.521087646484375,
-            "overall": 0.4452056884765625
+            "positive": 0.392303466796875,
+            "negative": 0.392547607421875,
+            "positive_inv": 0.513153076171875,
+            "negative_inv": 0.51025390625,
+            "overall": 0.45206451416015625
           }
         },
         "attention": {}
