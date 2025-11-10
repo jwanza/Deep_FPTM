@@ -1,6 +1,6 @@
 module FuzzyPatternTM
 
-export TMInput, TMClassifier, train!, predict, accuracy, save, load
+export TMInput, TMClassifier, train!, predict, accuracy, save, load, TMClassifierSTE, train_ste!, discretize!, initialize_ste!, save_compiled_to_json, load_compiled_from_json
 
 using Dates
 using Random
@@ -96,6 +96,8 @@ struct TMClassifierCompiled{ClassType} <: AbstractTMClassifier
         return new{ClassType}(clauses_num, T, S, s, L, LF, Dict())
     end
 end
+
+# Optional differentiable STE path and JSON bridge (non-breaking)
 
 
 abstract type AbstractTMInput <: AbstractVector{Bool} end
@@ -767,5 +769,8 @@ function diff_count(tm::AbstractTMClassifier)::Tuple{Int64, Int64, Int64, Int64,
     # FIXME: irrelevant info
     return count, length(union(pos, neg)), length(intersect(pos, neg)), length(pos) - length(Set(pos)), length(neg) - length(Set(neg))
 end
+# Optional differentiable STE path and JSON bridge (non-breaking)
+include("STE.jl")
+include("JsonBridge.jl")
 
 end # module
