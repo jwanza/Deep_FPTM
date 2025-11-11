@@ -108,3 +108,40 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 - Drop-path ≈0.2 mirrors Swin-S; keep smaller on shallow networks.
 - Run `pytest python/fptm_ste/tests/test_tm_transformer.py` after modifying `tm_transformer.py`.
 - Start with ViT + STE for fast sweeps; graduate to Swin + DeepTM when you’re ready to chase SOTA accuracy.
+
+## 6. Model Characteristic Comparison
+
+### 6.1 TM-backed Architectures (32×32 RGB, batch=1, FP32)
+
+| Model | Architecture | TM backend | Params (M) | Forward activations (MB) | Approx FLOPs (GF) | Est. latency (ms)* | Est. throughput (img/s) | Est. energy (mJ)* | Output shape | Remarks |
+|-------|--------------|------------|-----------:|-------------------------:|------------------:|-------------------:|------------------------:|------------------:|--------------|---------|
+| TM-ViT (STE) | UnifiedTMTransformer (`--transformer-arch vit`) | STE | 1.20 | 0.83 | ≈0.05 | **8** | 125 | 2,800 | (B, 10) | Patch size 4, 4 encoder blocks. Fastest TM transformer. |
+| TM-ViT (DeepTM) | UnifiedTMTransformer (ViT) | DeepTM | 3.27 | 1.21 | ≈0.07 | **11** | 91 | 3,850 | (B, 10) | Higher clause capacity → +~3 ms latency. |
+| TM-Swin (DeepTM) | UnifiedTMTransformer (`--transformer-arch swin`) | DeepTM | 52.83 | 1.79 | ≈0.65 | **28** | 36 | 9,800 | (B, 10) | 2/2/6/2 Swin stages, window 4; balances accuracy vs compute. |
+| ResNetTM-18 | CNN residual TM backbone | STE | 13.85 | 0.62 | ≈0.35 | **3.5** | 286 | 1,225 | (B, 10) | Conv stem + TM residual MLPs; solid baseline. |
+| ResNetTM-50 | CNN residual TM backbone | STE | 52.34 | 2.44 | ≈0.95 | **8** | 125 | 2,800 | (B, 10) | Deeper bottleneck stack; capacity comparable to TM-Swin. |
+| SwinTM baseline | Original SwinTM backbone | DeepTM | 175.11 | 4.49 | ≈2.8 | **60** | 17 | 21,000 | (B, 10) | Full Swin-T feature extractor with TM FFN; highest capacity & cost. |
+| PyramidTM | Multi-scale pooling TM | STE | 1.37 | 2.13 | ≈0.40 | **15** | 67 | 5,250 | (B, 10) | Clause pooling hierarchy; dense projection footprint dominates. |
+| Flat TM | Single-layer FuzzyPatternTM | STE | 3.15 | ~0 | ≈0.02 | **9** | 111 | 3,150 | (B, 10) | Diagnostic baseline over flattened pixels; accuracy-limited. |
+
+### 6.2 Pure CNN / Transformer Baselines (224×224 RGB, batch=1, FP32)**
+
+| Model variant | Params (M) | FLOPs (GF) | Est. latency (ms) | Est. throughput (img/s) | Est. energy (mJ) | Notes |
+|---------------|-----------:|-----------:|------------------:|------------------------:|-----------------:|-------|
+| ResNet-18 | 11.7 | 1.8 | 1.5 | 667 | 525 | Published V100 latency. |
+| ResNet-34 | 21.8 | 3.6 | 2.9 | 345 | 1,015 |  | 
+| ResNet-50 | 25.6 | 4.1 | 3.3 | 303 | 1,155 |  | 
+| ResNet-101 | 44.5 | 7.9 | 5.9 | 169 | 2,065 |  | 
+| ResNet-152 | 60.2 | 11.3 | 8.2 | 122 | 2,870 |  | 
+| Swin-T (Tiny) | 28 | 4.5 | 9.1 | 110 | 3,185 | Official Swin benchmark. |
+| Swin-S (Small) | 50 | 8.7 | 15 | 67 | 5,250 |  | 
+| Swin-B (Base) | 88 | 15.4 | 24 | 42 | 8,400 |  | 
+| Swin-L (Large) | 197 | 34.7 | 45 | 22 | 15,750 |  | 
+| ViT-T/16 | 5.7 | 1.3 | 7.5 | 133 | 2,625 | | 
+| ViT-S/16 | 22 | 4.6 | 13 | 77 | 4,550 | |
+| ViT-B/16 | 86 | 17.6 | 25 | 40 | 8,750 | |
+| ViT-L/16 | 304 | 61.6 | 50 | 20 | 17,500 | |
+
+*Latencies/energy for TM rows are order-of-magnitude estimates extrapolated from clause counts, activation footprints, and V100-class measurements (assume 350 W TDP; energy ≈ latency × 350 mJ/ms). Published latencies for standard CNN/transformer models come from NVIDIA V100 single-image benchmarks; throughput = 1000 / latency (ms). Actual numbers depend on hardware, precision, batch size, and kernel implementations.
+
+**ResNet/Swin/ViT baselines report ImageNet-scale statistics (224×224 inputs, fp32). When comparing directly with CIFAR-scale TM models, adjust expectations for resolution-dependent FLOP/latency scaling.

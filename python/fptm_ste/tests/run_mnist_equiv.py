@@ -178,6 +178,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=int_env("TM_MNIST_TEST_BATCH", 512),
         help="Evaluation batch size.",
     )
+    parser.add_argument("--lr", type=float, default=None, help="Base learning rate for AdamW optimizers.")
+    parser.add_argument("--min-lr", type=float, default=None, help="Minimum learning rate for cosine decay.")
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="Number of warmup epochs before cosine decay.")
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay value for AdamW optimizers.")
     parser.add_argument("--num-classes", type=int, default=None, help="Number of target classes.")
     parser.add_argument(
         "--dataset-root",
@@ -255,13 +259,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--report-epoch-acc",
         action=argparse.BooleanOptionalAction,
-        default=bool_env("TM_MNIST_REPORT_EPOCH", False),
+        default=bool_env("TM_MNIST_REPORT_EPOCH", True),
         help="Include training accuracy in epoch summary lines.",
     )
     parser.add_argument(
         "--report-epoch-test",
         action=argparse.BooleanOptionalAction,
-        default=bool_env("TM_MNIST_REPORT_EPOCH_TEST", False),
+        default=bool_env("TM_MNIST_REPORT_EPOCH_TEST", True),
         help="Evaluate on the test set and log test accuracy after each epoch.",
     )
     parser.add_argument(
@@ -551,15 +555,15 @@ def current_device(preferred: str = "auto") -> torch.device:
     preferred = (preferred or "auto").lower()
     if preferred == "cpu":
         return torch.device("cpu")
+    if preferred == "cuda" and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        return torch.device("cuda")
     if preferred == "cuda":
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            return torch.device("cuda")
         print("Requested CUDA device is unavailable; falling back to CPU.")
         return torch.device("cpu")
+    if preferred == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
     if preferred == "mps":
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return torch.device("mps")
         print("Requested MPS device is unavailable; falling back to CPU.")
         return torch.device("cpu")
     if torch.cuda.is_available():
@@ -587,6 +591,38 @@ def optimizer_lr(optimizer: Optimizer) -> float:
     if not optimizer.param_groups:
         return 0.0
     return float(optimizer.param_groups[0].get("lr", 0.0))
+
+
+def set_optimizer_lr(optimizer: Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def cosine_warmup_lr(epoch: int, total_epochs: int, base_lr: float, min_lr: float, warmup_epochs: int) -> float:
+    if total_epochs <= 0:
+        return base_lr
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        warm_progress = float(epoch + 1) / float(max(1, warmup_epochs))
+        return base_lr * warm_progress
+    if total_epochs <= warmup_epochs:
+        return min_lr
+    progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def update_cosine_warmup_lr(
+    optimizer: Optimizer,
+    epoch: int,
+    total_epochs: int,
+    base_lr: float,
+    min_lr: float,
+    warmup_epochs: int,
+) -> float:
+    lr = cosine_warmup_lr(epoch, total_epochs, base_lr, min_lr, warmup_epochs)
+    set_optimizer_lr(optimizer, lr)
+    return lr
 
 
 def format_epoch_log(
@@ -707,8 +743,7 @@ def evaluate_model(model: nn.Module,
             outputs = model(xb, use_ste=use_ste)
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
             pred = logits.argmax(dim=1)
-            if collect_preds:
-                preds.extend(pred.cpu().tolist())
+            if collect_preds: preds.extend(pred.cpu().tolist())
             correct += (pred == y).sum().item()
             total += y.size(0)
     acc = correct / total
@@ -728,13 +763,19 @@ def train_tm_model(model: nn.Module,
                    epochs: int,
                    report_train_acc: bool,
                    report_epoch_acc: bool,
-                   report_epoch_test: bool) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+                   report_epoch_test: bool,
+                   *,
+                   base_lr: float,
+                   min_lr: float,
+                   warmup_epochs: int,
+                   weight_decay: float) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+    opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
     best_test_acc: Optional[float] = None
     for epoch in range(epochs):
+        epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
@@ -778,7 +819,6 @@ def train_tm_model(model: nn.Module,
             )
             if epoch_test_acc is not None:
                 best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
-        current_lr = optimizer_lr(opt)
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
@@ -787,7 +827,7 @@ def train_tm_model(model: nn.Module,
             train_acc=epoch_acc if report_epoch_acc else None,
             test_acc=epoch_test_acc,
             best_acc=best_test_acc,
-            lr=current_lr,
+            lr=epoch_lr,
             duration=dur,
             extras=None,
         )
@@ -852,7 +892,11 @@ def run_variant_tm(train_loader,
                    input_shape: Optional[Tuple[int, int, int]],
                    auto_expand_grayscale: bool,
                    allow_channel_reduce: bool,
-                   n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                   n_classes: int = 10,
+                   base_lr: float = 1e-3,
+                   min_lr: float = 1e-3,
+                   warmup_epochs: int = 0,
+                   weight_decay: float = 1e-5) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
     if tm_impl == "fptm":
         model = FuzzyPatternTMFPTM(
@@ -895,6 +939,10 @@ def run_variant_tm(train_loader,
         report_train_acc=report_train_acc,
         report_epoch_acc=report_epoch_acc,
         report_epoch_test=report_epoch_test,
+        base_lr=base_lr,
+        min_lr=min_lr,
+        warmup_epochs=warmup_epochs,
+        weight_decay=weight_decay,
     )
     bundle = model.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
@@ -917,7 +965,11 @@ def run_variant_deeptm(train_loader,
                        input_shape: Optional[Tuple[int, int, int]],
                        auto_expand_grayscale: bool,
                        allow_channel_reduce: bool,
-                       n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       n_classes: int = 10,
+                       base_lr: float = 1e-3,
+                       min_lr: float = 1e-3,
+                       warmup_epochs: int = 0,
+                       weight_decay: float = 1e-5) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = DeepTMNetwork(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -943,6 +995,10 @@ def run_variant_deeptm(train_loader,
         report_train_acc=report_train_acc,
         report_epoch_acc=report_epoch_acc,
         report_epoch_test=report_epoch_test,
+        base_lr=base_lr,
+        min_lr=min_lr,
+        warmup_epochs=warmup_epochs,
+        weight_decay=weight_decay,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
@@ -960,7 +1016,11 @@ def run_variant_hybrid(train_loader,
                        thresholds: int,
                        tm_clauses: int,
                        tm_tau: float,
-                       n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       n_classes: int = 10,
+                       base_lr: float = 1e-3,
+                       min_lr: float = 1e-3,
+                       warmup_epochs: int = 0,
+                       weight_decay: float = 1e-5) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = CNNHybrid(
         in_channels=in_channels,
         thresholds=thresholds,
@@ -968,13 +1028,14 @@ def run_variant_hybrid(train_loader,
         n_classes=n_classes,
         tm_tau=tm_tau,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
     best_test_acc: Optional[float] = None
     label = "Hybrid"
     for epoch in range(epochs):
+        epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
@@ -1016,7 +1077,6 @@ def run_variant_hybrid(train_loader,
             )
             if epoch_test_acc is not None:
                 best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
-        current_lr = optimizer_lr(opt)
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
@@ -1025,7 +1085,7 @@ def run_variant_hybrid(train_loader,
             train_acc=epoch_acc if report_epoch_acc else None,
             test_acc=epoch_test_acc,
             best_acc=best_test_acc,
-            lr=current_lr,
+            lr=epoch_lr,
             duration=dur,
             extras=None,
         )
@@ -1034,8 +1094,7 @@ def run_variant_hybrid(train_loader,
     test_acc, preds = evaluate_model(model, lambda t: t, test_loader, device, use_ste=True)
     if best_test_acc is None or test_acc > best_test_acc:
         best_test_acc = test_acc
-    bundle = model.tm.discretize(threshold=0.5)
-    return label, last_train_acc, test_acc, train_time, preds, bundle, best_test_acc
+    return label, last_train_acc, test_acc, train_time, preds, best_test_acc
 
 
 def run_variant_transformer(train_loader,
@@ -1067,6 +1126,10 @@ def run_variant_transformer(train_loader,
                             ema_decay: float,
                             mixup_alpha: float,
                             cutmix_alpha: float,
+                            base_lr: float = 7e-4,
+                            min_lr: float = 7e-4,
+                            warmup_epochs: int = 0,
+                            weight_decay: float = 1e-5,
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
     model = UnifiedTMTransformer(
         num_classes=num_classes,
@@ -1089,7 +1152,7 @@ def run_variant_transformer(train_loader,
         pool=pool,
         grad_checkpoint=grad_checkpoint,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=7e-4, weight_decay=1e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     ema_model = copy.deepcopy(model) if ema_decay > 0 else None
     start = time.time()
@@ -1097,6 +1160,7 @@ def run_variant_transformer(train_loader,
     best_test_acc: Optional[float] = None
     label = f"Transformer-{architecture.upper()}"
     for epoch in range(epochs):
+        epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
@@ -1149,7 +1213,6 @@ def run_variant_transformer(train_loader,
             eval_model.train()
             if epoch_test_acc is not None:
                 best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
-        current_lr = optimizer_lr(opt)
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
@@ -1158,7 +1221,7 @@ def run_variant_transformer(train_loader,
             train_acc=epoch_acc if report_epoch_acc else None,
             test_acc=epoch_test_acc,
             best_acc=best_test_acc,
-            lr=current_lr,
+            lr=epoch_lr,
             duration=dur,
             extras=None,
         )
@@ -1373,6 +1436,19 @@ def main(argv: Optional[List[str]] = None):
     if not hidden_dims:
         hidden_dims = [256, 128]
 
+    warmup_epochs = args.warmup_epochs
+    weight_decay = args.weight_decay
+
+    def resolve_lr(default_base: float) -> Tuple[float, float]:
+        base = args.lr if args.lr is not None else default_base
+        min_lr = args.min_lr if args.min_lr is not None else base
+        return base, min_lr
+
+    tm_base_lr, tm_min_lr = resolve_lr(1e-3)
+    deeptm_base_lr, deeptm_min_lr = resolve_lr(1e-3)
+    hybrid_base_lr, hybrid_min_lr = resolve_lr(1e-3)
+    transformer_base_lr, transformer_min_lr = resolve_lr(7e-4)
+
     results: Dict[str, Dict[str, Any]] = {}
 
     for model_key in selected_models:
@@ -1398,6 +1474,10 @@ def main(argv: Optional[List[str]] = None):
                     auto_expand_grayscale=tm_auto_expand,
                     allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
+                    base_lr=tm_base_lr,
+                    min_lr=tm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
@@ -1419,6 +1499,10 @@ def main(argv: Optional[List[str]] = None):
                     auto_expand_grayscale=tm_auto_expand,
                     allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
+                    base_lr=deeptm_base_lr,
+                    min_lr=deeptm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
                 )
                 variant_classes = args.num_classes
             elif model_key == "hybrid":
@@ -1436,6 +1520,10 @@ def main(argv: Optional[List[str]] = None):
                     tm_clauses=args.hybrid_clauses,
                     tm_tau=args.tm_tau,
                     n_classes=hybrid_classes,
+                    base_lr=hybrid_base_lr,
+                    min_lr=hybrid_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
                 )
                 variant_classes = hybrid_classes
             elif model_key == "transformer":
@@ -1468,6 +1556,10 @@ def main(argv: Optional[List[str]] = None):
                     ema_decay=args.transformer_ema_decay,
                     mixup_alpha=args.mixup_alpha,
                     cutmix_alpha=args.cutmix_alpha,
+                    base_lr=transformer_base_lr,
+                    min_lr=transformer_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
                 )
                 variant_classes = args.num_classes
             else:
