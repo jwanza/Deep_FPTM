@@ -16,6 +16,33 @@ from .binarizers import SwinDualBinarizer, CNNSingleBinarizer
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
 
 
+class InstrumentedMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, C = x.shape
+        qkv = self.qkv(x).view(B, T, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn_scores = torch.matmul(q * self.scale, k.transpose(-2, -1))
+        attn_weights = attn_scores.softmax(dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        context = torch.matmul(attn_weights, v)
+        context_merge = context.transpose(1, 2).contiguous().view(B, T, C)
+        out = self.out_proj(context_merge)
+        return out, context, attn_weights
+
+
 class _SwinBackbone(nn.Module):
     """Flexible Swin Transformer backbone with optional channel projection."""
 
@@ -812,14 +839,14 @@ def build_swin_stage_configs(
 
 
 class WindowAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int) -> None:
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
         super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.attn = InstrumentedMultiheadAttention(embed_dim, num_heads, dropout)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        attn_out, weights = self.attn(x, x, x, need_weights=True, average_attn_weights=False)
-        weights = weights.mean(dim=0)
-        return attn_out, weights
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_out, context, weights = self.attn(x)
+        weights_mean = weights.mean(dim=0)
+        return attn_out, weights_mean, context
 
 
 class WindowTMFeedForward(nn.Module):
@@ -898,14 +925,22 @@ class SwinTMBlock(nn.Module):
         if shift > 0:
             h = torch.roll(h, shifts=(-shift, -shift), dims=(1, 2))
         windows = window_partition(h, window_size).view(-1, window_size * window_size, C)
-        attn_out, attn_weights = self.attn(windows)
+        attn_out, attn_weights, head_context = self.attn(windows)
         attn_out = attn_out.view(-1, window_size, window_size, C)
+        head_dim = self.attn.attn.head_dim
+        head_context = head_context.view(-1, window_size, window_size, self.config.num_heads, head_dim)
+        head_context_flat = head_context.view(-1, window_size, window_size, self.config.num_heads * head_dim)
+        head_context_merged = window_reverse(head_context_flat, window_size, H_pad, W_pad)
+        head_context_merged = head_context_merged.view(B, H_pad, W_pad, self.config.num_heads, head_dim)
         shifted = window_reverse(attn_out, window_size, H_pad, W_pad)
         if shift > 0:
             shifted = torch.roll(shifted, shifts=(shift, shift), dims=(1, 2))
+            head_context_merged = torch.roll(head_context_merged, shifts=(shift, shift), dims=(1, 2))
         if pad_h or pad_w:
             shifted = shifted[:, :H, :W, :]
+            head_context_merged = head_context_merged[:, :H, :W, :, :]
         shifted_tokens = shifted.reshape(B, H * W, C)
+        head_context_tokens = head_context_merged.reshape(B, H * W, self.config.num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
         x = x + self.drop_path1(shifted_tokens)
         y = x.view(B, H, W, C)
         if pad_h or pad_w:
@@ -917,7 +952,7 @@ class SwinTMBlock(nn.Module):
             delta = delta[:, :H, :W, :]
         delta_tokens = delta.reshape(B, H * W, C)
         x = x + self.drop_path2(delta_tokens)
-        return x, clause_summary, attn_weights
+        return x, clause_summary, attn_weights, head_context_tokens
 
 
 class SwinTMStage(nn.Module):
@@ -949,17 +984,24 @@ class SwinTMStage(nn.Module):
         self.head_proj = nn.Sequential(nn.Linear(config.embed_dim, config.tm_hidden_dim), nn.Sigmoid())
         self.head_tm = FuzzyPatternTM_STE(config.tm_hidden_dim, config.head_clauses, num_classes, tau=config.tau)
 
-    def forward(self, x: torch.Tensor, H: int, W: int, *, use_ste: bool = True):
+    def forward(self, x: torch.Tensor, H: int, W: int, *, use_ste: bool = True,
+                collect_diagnostics: bool = False,
+                record_callback: Optional[Callable[[str, torch.Tensor, int, int, Optional[torch.Tensor]], None]] = None,
+                stage_index: int = 0):
         clause_summaries: List[torch.Tensor] = []
         attn_summaries: List[torch.Tensor] = []
-        for block in self.blocks:
-            x, summary, attn = block(x, H, W, use_ste=use_ste)
+        for block_idx, block in enumerate(self.blocks):
+            x, summary, attn, head_tokens = block(x, H, W, use_ste=use_ste)
             clause_summaries.append(summary)
             attn_summaries.append(attn)
+            if collect_diagnostics and record_callback is not None:
+                record_callback(f"stage{stage_index + 1}_block{block_idx + 1}", x, H, W, head_tokens)
         B, L, C = x.shape
         feat = self.head_norm(x).mean(dim=1)
         head_in = self.head_proj(feat)
         logits, clauses = self.head_tm(head_in, use_ste=use_ste)
+        if collect_diagnostics and record_callback is not None:
+            record_callback(f"stage{stage_index + 1}_out", x, H, W, None)
         if self.patch_merge is not None:
             x = x.view(B, H, W, C)
             x = self.patch_merge(x)

@@ -67,7 +67,18 @@ def test_unified_tm_transformer_vit_diagnostics():
     x = torch.rand(1, 3, 32, 32)
     logits, diagnostics = model(x, use_ste=True, collect_diagnostics=True)
     assert logits.shape == (1, 10)
-    assert set(diagnostics.keys()) == {"patch_embed", "block_1", "block_2", "pre_head"}
+    expected = {
+        "patch_embed",
+        "block_1",
+        "block_1_head1",
+        "block_1_head2",
+        "block_2",
+        "block_2_head1",
+        "block_2_head2",
+        "pre_head",
+        "final_decision",
+    }
+    assert set(diagnostics.keys()) == expected
     for key, value in diagnostics.items():
         assert value.shape == (1, 10), key
 
@@ -93,10 +104,17 @@ def test_unified_tm_transformer_swin_diagnostics():
     expected = {
         "patch_embed",
         "stage1_block1",
+        "stage1_block1_head1",
+        "stage1_block1_head2",
         "stage1_out",
         "stage2_block1",
+        "stage2_block1_head1",
+        "stage2_block1_head2",
+        "stage2_block1_head3",
+        "stage2_block1_head4",
         "stage2_out",
         "pre_head",
+        "final_decision",
     }
     assert set(diagnostics.keys()) == expected
     for key, value in diagnostics.items():

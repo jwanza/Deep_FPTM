@@ -8,7 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .tm import FuzzyPatternTM_STE
 from .deep_tm import DeepTMNetwork
-from .swin_tm import DropPath, WindowAttention
+from .swin_tm import DropPath, WindowAttention, InstrumentedMultiheadAttention
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
 
 
@@ -107,7 +107,7 @@ class TMEncoderBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=attn_drop, batch_first=True)
+        self.attn = InstrumentedMultiheadAttention(dim, num_heads, attn_drop)
         self.attn_drop = nn.Dropout(drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         hidden_dim = int(dim * mlp_ratio)
@@ -120,12 +120,21 @@ class TMEncoderBlock(nn.Module):
             dropout=drop,
         )
         self.norm2 = nn.LayerNorm(dim)
+        self.num_heads = num_heads
 
-    def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        use_ste: bool = True,
+        *,
+        collect_diagnostics: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_in = self.norm1(x)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        attn_out, head_context, _ = self.attn(attn_in)
         x = x + self.drop_path(self.attn_drop(attn_out))
         x = x + self.drop_path(self.ffn(self.norm2(x), use_ste=use_ste))
+        if collect_diagnostics:
+            return x, head_context
         return x
 
 
@@ -152,7 +161,7 @@ class TMSwinBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowAttention(dim, num_heads)
+        self.attn = WindowAttention(dim, num_heads, attn_drop)
         self.attn_drop = nn.Dropout(drop)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         hidden_dim = int(dim * mlp_ratio)
@@ -167,7 +176,15 @@ class TMSwinBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor, H: int, W: int, use_ste: bool = True) -> Tuple[torch.Tensor, int, int]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        H: int,
+        W: int,
+        use_ste: bool = True,
+        *,
+        collect_diagnostics: bool = False,
+    ) -> Tuple[torch.Tensor, int, int, Optional[torch.Tensor]]:
         B, L, C = x.shape
         assert L == H * W, "Unexpected token count for Swin block"
         shortcut = x
@@ -183,18 +200,26 @@ class TMSwinBlock(nn.Module):
             x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
         windows = window_partition(x, self.window_size).view(-1, self.window_size * self.window_size, C)
-        attn_out, _ = self.attn(windows)
+        attn_out, attn_weights, head_context = self.attn(windows)
         attn_out = attn_out.view(-1, self.window_size, self.window_size, C)
+        head_dim = self.attn.attn.head_dim
+        head_context = head_context.view(-1, self.window_size, self.window_size, self.attn.attn.num_heads, head_dim)
+        head_context_flat = head_context.view(-1, self.window_size, self.window_size, self.attn.attn.num_heads * head_dim)
+        head_context_merged = window_reverse(head_context_flat, self.window_size, H_pad, W_pad)
+        head_context_merged = head_context_merged.view(B, H_pad, W_pad, self.attn.attn.num_heads, head_dim)
         if self.shift_size > 0:
             attn_out = torch.roll(attn_out, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            head_context_merged = torch.roll(head_context_merged, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         x = window_reverse(attn_out, self.window_size, H_pad, W_pad)
         if pad_h or pad_w:
             x = x[:, :H, :W, :]
+            head_context_merged = head_context_merged[:, :H, :W, :, :]
         x = x.reshape(B, H * W, C)
+        head_tokens = head_context_merged.reshape(B, H * W, self.attn.attn.num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
         x = shortcut + self.drop_path1(self.attn_drop(x))
 
         x = x + self.drop_path2(self.ffn(self.norm2(x), use_ste=use_ste))
-        return x, H, W
+        return x, H, W, head_tokens if collect_diagnostics else None
 
 
 class TMSwinStage(nn.Module):
@@ -242,26 +267,26 @@ class TMSwinStage(nn.Module):
 
     def forward(self, x: torch.Tensor, H: int, W: int, use_ste: bool = True,
                 *, collect_diagnostics: bool = False,
-                record_callback: Optional[Callable[[str, torch.Tensor, int, int], None]] = None,
+                record_callback: Optional[Callable[[str, torch.Tensor, int, int, Optional[torch.Tensor]], None]] = None,
                 stage_index: int = 0) -> Tuple[torch.Tensor, int, int]:
         for block_idx, block in enumerate(self.blocks):
             if self.use_checkpoint and self.training and x.requires_grad:
                 def _forward(inp, blk=block, h=H, w=W):  # type: ignore
-                    out, _, _ = blk(inp, h, w, use_ste=use_ste)
+                    out, _, _, _ = blk(inp, h, w, use_ste=use_ste, collect_diagnostics=False)
                     return out
 
                 x = checkpoint(_forward, x)
+                head_tokens = None
             else:
-                x, H, W = block(x, H, W, use_ste=use_ste)
+                x, H, W, head_tokens = block(x, H, W, use_ste=use_ste, collect_diagnostics=collect_diagnostics)
             if collect_diagnostics and record_callback is not None:
-                record_callback(f"stage{stage_index + 1}_block{block_idx + 1}", x, H, W)
+                record_callback(f"stage{stage_index + 1}_block{block_idx + 1}", x, H, W, head_tokens)
         if collect_diagnostics and record_callback is not None:
-            record_callback(f"stage{stage_index + 1}_out", x, H, W)
+            record_callback(f"stage{stage_index + 1}_out", x, H, W, None)
         if self.downsample is not None:
             x = x.reshape(-1, H, W, x.shape[-1])
             x = self.downsample(x)
-            H //= 2
-            W //= 2
+            H, W = x.shape[1], x.shape[2]
             x = x.reshape(x.shape[0], -1, x.shape[-1])
         return x, H, W
 
@@ -302,6 +327,7 @@ class UnifiedTMTransformer(nn.Module):
         self.component_dims: Dict[str, int] = {}
         self.component_order: List[str] = []
         self.diagnostic_heads: nn.ModuleDict = nn.ModuleDict()
+        self.attn_head_heads: nn.ModuleDict = nn.ModuleDict()
 
         if self.architecture not in {"vit", "swin"}:
             raise ValueError("architecture must be 'vit' or 'swin'.")
@@ -341,6 +367,15 @@ class UnifiedTMTransformer(nn.Module):
             self.component_order = ["patch_embed"] + [f"block_{i + 1}" for i in range(depth)] + ["pre_head"]
             for name in self.component_order:
                 self.component_dims[name] = int(embed_dim)
+            head_dim = int(embed_dim) // head
+            for block_idx in range(depth):
+                for head_idx in range(head):
+                    key = f"block_{block_idx + 1}_head{head_idx + 1}"
+                    layer = nn.Linear(head_dim, num_classes)
+                    nn.init.trunc_normal_(layer.weight, std=0.02)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+                    self.attn_head_heads[key] = layer
         else:
             if isinstance(depths, int):
                 raise ValueError("depths must be a sequence for Swin architecture.")
@@ -379,6 +414,7 @@ class UnifiedTMTransformer(nn.Module):
             self.norm = nn.LayerNorm(stage_dims[-1])
             self.head = nn.Linear(stage_dims[-1], num_classes)
             component_names: List[str] = ["patch_embed"]
+            self.component_dims["patch_embed"] = stage_dims[0]
             for idx, depth in enumerate(stage_depths):
                 dim = stage_dims[idx]
                 for block_idx in range(depth):
@@ -391,6 +427,16 @@ class UnifiedTMTransformer(nn.Module):
             component_names.append("pre_head")
             self.component_dims["pre_head"] = stage_dims[-1]
             self.component_order = component_names
+            for idx, depth in enumerate(stage_depths):
+                head_dim = stage_dims[idx] // stage_heads[idx]
+                for block_idx in range(depth):
+                    for head_idx in range(stage_heads[idx]):
+                        key = f"stage{idx + 1}_block{block_idx + 1}_head{head_idx + 1}"
+                        layer = nn.Linear(head_dim, num_classes)
+                        nn.init.trunc_normal_(layer.weight, std=0.02)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
+                        self.attn_head_heads[key] = layer
 
         nn.init.trunc_normal_(self.head.weight, std=0.02)
         if self.head.bias is not None:
@@ -410,9 +456,14 @@ class UnifiedTMTransformer(nn.Module):
             return x[:, 0]
         return x.mean(dim=1)
 
-    def _pool_swin_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """Pool tokens for Swin architecture."""
-        return x.mean(dim=1)
+    @staticmethod
+    def _pool_swin_tokens(tokens: torch.Tensor) -> torch.Tensor:
+        return tokens.mean(dim=1)
+
+    def _pool_attention_heads(self, head_tokens: torch.Tensor, mode: str) -> torch.Tensor:
+        if mode == "vit" and self.pool == "cls" and head_tokens.size(2) > 0:
+            return head_tokens[:, :, 0, :]
+        return head_tokens.mean(dim=2)
 
     def forward(
         self,
@@ -433,35 +484,56 @@ class UnifiedTMTransformer(nn.Module):
                 x = torch.cat((cls_tokens, x), dim=1)
             x = x + self.pos_embed[:, : x.size(1), :]
             x = self.pos_drop(x)
-            if collecting:
+            if collecting and "patch_embed" in self.diagnostic_heads:
                 diagnostics["patch_embed"] = self.diagnostic_heads["patch_embed"](self._pool_vit_tokens(x))
             for idx, block in enumerate(self.blocks):
-                if self.grad_checkpoint and self.training and x.requires_grad:
-                    x = checkpoint(lambda inp, blk=block: blk(inp, use_ste=use_ste), x)
-                else:
-                    x = block(x, use_ste=use_ste)
                 component_key = f"block_{idx + 1}"
+                use_ckpt = self.grad_checkpoint and self.training and x.requires_grad and not collecting
+                if use_ckpt:
+                    x = checkpoint(lambda inp, blk=block: blk(inp, use_ste=use_ste, collect_diagnostics=False), x)
+                    head_context = None
+                else:
+                    result = block(x, use_ste=use_ste, collect_diagnostics=collecting)
+                    if collecting:
+                        x, head_context = result  # type: ignore[misc]
+                    else:
+                        x = result  # type: ignore[assignment]
+                        head_context = None
                 if collecting and component_key in self.diagnostic_heads:
                     diagnostics[component_key] = self.diagnostic_heads[component_key](self._pool_vit_tokens(x))
+                    if head_context is not None:
+                        head_feats = self._pool_attention_heads(head_context, mode="vit")
+                        for head_idx in range(head_feats.shape[1]):
+                            head_key = f"{component_key}_head{head_idx + 1}"
+                            if head_key in self.attn_head_heads:
+                                diagnostics[head_key] = self.attn_head_heads[head_key](head_feats[:, head_idx, :])
             x = self.norm(x)
             if collecting and "pre_head" in self.diagnostic_heads:
                 diagnostics["pre_head"] = self.diagnostic_heads["pre_head"](self._pool_vit_tokens(x))
             feats = self._pool_vit_tokens(x)
             logits = self.head(feats)
             if collecting:
+                diagnostics["final_decision"] = logits
                 return logits, diagnostics
             return logits
 
-        x = self.patch_embed(x)
-        B, H, W, C = x.shape
-        tokens = x.reshape(B, H * W, C)
+        tokens = self.patch_embed(x)
+        B, H, W, C = tokens.shape
+        tokens = tokens.reshape(B, H * W, C)
         if collecting and "patch_embed" in self.diagnostic_heads:
             diagnostics["patch_embed"] = self.diagnostic_heads["patch_embed"](self._pool_swin_tokens(tokens))
+
         for stage_idx, stage in enumerate(self.stages):
             if collecting:
-                def stage_record(name: str, comps: torch.Tensor, h: int, w: int) -> None:
+                def stage_record(name: str, comps: torch.Tensor, h: int, w: int, head_tokens: Optional[torch.Tensor]) -> None:
                     if name in self.diagnostic_heads:
                         diagnostics[name] = self.diagnostic_heads[name](self._pool_swin_tokens(comps))
+                    if head_tokens is not None:
+                        head_feats = self._pool_attention_heads(head_tokens, mode="swin")
+                        for head_idx in range(head_feats.shape[1]):
+                            head_key = f"{name}_head{head_idx + 1}"
+                            if head_key in self.attn_head_heads:
+                                diagnostics[head_key] = self.attn_head_heads[head_key](head_feats[:, head_idx, :])
             else:
                 stage_record = None
             tokens, H, W = stage(
@@ -473,12 +545,14 @@ class UnifiedTMTransformer(nn.Module):
                 record_callback=stage_record,
                 stage_index=stage_idx,
             )
+
         x = self.norm(tokens)
         if collecting and "pre_head" in self.diagnostic_heads:
             diagnostics["pre_head"] = self.diagnostic_heads["pre_head"](self._pool_swin_tokens(x))
         feats = self._pool_swin_tokens(x)
         logits = self.head(feats)
         if collecting:
+            diagnostics["final_decision"] = logits
             return logits, diagnostics
         return logits
 
