@@ -14,6 +14,7 @@ import resource
 import time
 import math
 import copy
+from collections import defaultdict
 from dataclasses import replace
 from contextlib import contextmanager
 from datetime import datetime
@@ -506,6 +507,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Dropout probability for transformer attention and TM replacements.",
     )
     parser.add_argument(
+        "--transformer-aux-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary cross-entropy weight for transformer diagnostic heads.",
+    )
+    parser.add_argument(
         "--transformer-ema-decay",
         type=float,
         default=0.0,
@@ -750,6 +757,48 @@ def evaluate_model(model: nn.Module,
     if was_training:
         model.train()
     return acc, preds
+
+
+def evaluate_transformer_components(
+    model: UnifiedTMTransformer,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    collect_preds: bool = True,
+) -> Tuple[float, Dict[str, float], List[int]]:
+    was_training = model.training
+    model.eval()
+    total_correct = 0
+    total = 0
+    component_correct: Dict[str, int] = defaultdict(int)
+    component_total: Dict[str, int] = defaultdict(int)
+    preds: List[int] = []
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            outputs = model(x, use_ste=True, collect_diagnostics=True)
+            if isinstance(outputs, tuple):
+                logits, diagnostics = outputs
+            else:
+                logits, diagnostics = outputs, {}
+            batch_preds = logits.argmax(dim=1)
+            if collect_preds:
+                preds.extend(batch_preds.cpu().tolist())
+            total_correct += (batch_preds == y).sum().item()
+            total += y.size(0)
+            for name, comp_logits in diagnostics.items():
+                comp_pred = comp_logits.argmax(dim=1)
+                component_correct[name] += (comp_pred == y).sum().item()
+                component_total[name] += y.size(0)
+    if was_training:
+        model.train()
+    final_acc = total_correct / total if total > 0 else 0.0
+    component_acc = {
+        name: (component_correct[name] / component_total[name]) if component_total[name] > 0 else 0.0
+        for name in sorted(component_correct)
+    }
+    return final_acc, component_acc, preds
 
 
 def train_tm_model(model: nn.Module,
@@ -1130,6 +1179,7 @@ def run_variant_transformer(train_loader,
                             min_lr: float = 7e-4,
                             warmup_epochs: int = 0,
                             weight_decay: float = 1e-5,
+                            aux_weight: float = 0.0,
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
     model = UnifiedTMTransformer(
         num_classes=num_classes,
@@ -1159,6 +1209,9 @@ def run_variant_transformer(train_loader,
     last_train_acc: Optional[float] = None
     best_test_acc: Optional[float] = None
     label = f"Transformer-{architecture.upper()}"
+    collect_aux = aux_weight > 0
+    component_history: List[Dict[str, Any]] = []
+
     for epoch in range(epochs):
         epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
@@ -1172,11 +1225,24 @@ def run_variant_transformer(train_loader,
             x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_alpha, cutmix_alpha)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                logits = model(x_aug, use_ste=True)
+                outputs = model(x_aug, use_ste=True, collect_diagnostics=collect_aux)
+                if isinstance(outputs, tuple):
+                    logits, aux_outputs = outputs
+                else:
+                    logits, aux_outputs = outputs, {}
                 if lam is not None:
                     loss = lam * F.cross_entropy(logits, targets_a) + (1 - lam) * F.cross_entropy(logits, targets_b)
                 else:
                     loss = F.cross_entropy(logits, y)
+                if collect_aux and aux_outputs:
+                    aux_loss = 0.0
+                    for aux_logits in aux_outputs.values():
+                        if lam is not None:
+                            aux_loss += lam * F.cross_entropy(aux_logits, targets_a) + (1 - lam) * F.cross_entropy(aux_logits, targets_b)
+                        else:
+                            aux_loss += F.cross_entropy(aux_logits, y)
+                    aux_loss = aux_loss / max(len(aux_outputs), 1)
+                    loss = loss + aux_weight * aux_loss
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -1195,43 +1261,56 @@ def run_variant_transformer(train_loader,
         dur = time.time() - epoch_start
         avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
-        epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
-        if report_epoch_test:
-            eval_model = ema_model if ema_model is not None else model
-            eval_model.eval()
-            epoch_test_acc, _ = evaluate_model(
-                eval_model,
-                lambda t: t,
-                test_loader,
-                device,
-                use_ste=True,
-                collect_preds=False,
-            )
-            eval_model.train()
-            if epoch_test_acc is not None:
-                best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+
+        eval_model = ema_model if ema_model is not None else model
+        epoch_test_acc, component_acc, _ = evaluate_transformer_components(
+            eval_model,
+            test_loader,
+            device,
+            collect_preds=False,
+        )
+        best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+        component_history.append(
+            {
+                "epoch": epoch + 1,
+                "test_accuracy": epoch_test_acc,
+                "component_accuracy": component_acc,
+            }
+        )
+
+        extras = {f"{name}_acc": acc for name, acc in component_acc.items()}
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
             total_epochs=epochs,
             loss=avg_loss,
             train_acc=epoch_acc if report_epoch_acc else None,
-            test_acc=epoch_test_acc,
+            test_acc=epoch_test_acc if report_epoch_test else None,
             best_acc=best_test_acc,
             lr=epoch_lr,
             duration=dur,
-            extras=None,
+            extras=extras if extras else None,
         )
         print("  " + log_msg)
+
     train_time = time.time() - start
     eval_model = ema_model if ema_model is not None else model
-    test_acc, preds = evaluate_model(eval_model, lambda t: t, test_loader, device, use_ste=True)
+    test_acc, final_component_acc, preds = evaluate_transformer_components(
+        eval_model,
+        test_loader,
+        device,
+        collect_preds=True,
+    )
     if best_test_acc is None or test_acc > best_test_acc:
         best_test_acc = test_acc
-    return label, last_train_acc, test_acc, train_time, preds, None, best_test_acc
+    diagnostics = {
+        "per_epoch": component_history,
+        "final": final_component_acc,
+    }
+    return label, last_train_acc, test_acc, train_time, preds, diagnostics, best_test_acc
 
 
 def main(argv: Optional[List[str]] = None):
@@ -1453,6 +1532,7 @@ def main(argv: Optional[List[str]] = None):
 
     for model_key in selected_models:
         with profile_block(f"variant-{model_key}"):
+            diagnostics: Optional[Dict[str, Any]] = None
             if model_key == "tm":
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_tm(
                     tm_train_loader,
@@ -1527,7 +1607,7 @@ def main(argv: Optional[List[str]] = None):
                 )
                 variant_classes = hybrid_classes
             elif model_key == "transformer":
-                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_transformer(
+                label, train_acc, test_acc, train_time, preds, diagnostics, best_epoch_test_acc = run_variant_transformer(
                     train_loader,
                     test_loader,
                     device,
@@ -1560,13 +1640,15 @@ def main(argv: Optional[List[str]] = None):
                     min_lr=transformer_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
+                    aux_weight=args.transformer_aux_weight,
                 )
+                bundle = None
                 variant_classes = args.num_classes
             else:
                 raise ValueError(f"Unknown model variant '{model_key}'.")
 
         export_path = None
-        if args.export_compiled and bundle is not None:
+        if model_key in {"tm", "deep_tm", "hybrid"} and args.export_compiled and bundle is not None:
             os.makedirs(args.export_dir, exist_ok=True)
             export_base = os.path.join(
                 args.export_dir,
@@ -1601,6 +1683,8 @@ def main(argv: Optional[List[str]] = None):
                     "augmentations": tm_bundle.augmentation_names,
                     "config": tm_bundle.config_name,
                 }
+        if model_key == "transformer" and diagnostics is not None:
+            results[model_key]["diagnostics"] = diagnostics
 
     output_dir = os.path.dirname(args.output_json)
     if output_dir:

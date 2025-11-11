@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -240,8 +240,11 @@ class TMSwinStage(nn.Module):
         self.downsample = PatchMerging(dim, dim * 2) if downsample else None
         self.use_checkpoint = use_checkpoint
 
-    def forward(self, x: torch.Tensor, H: int, W: int, use_ste: bool = True) -> Tuple[torch.Tensor, int, int]:
-        for block in self.blocks:
+    def forward(self, x: torch.Tensor, H: int, W: int, use_ste: bool = True,
+                *, collect_diagnostics: bool = False,
+                record_callback: Optional[Callable[[str, torch.Tensor, int, int], None]] = None,
+                stage_index: int = 0) -> Tuple[torch.Tensor, int, int]:
+        for block_idx, block in enumerate(self.blocks):
             if self.use_checkpoint and self.training and x.requires_grad:
                 def _forward(inp, blk=block, h=H, w=W):  # type: ignore
                     out, _, _ = blk(inp, h, w, use_ste=use_ste)
@@ -250,6 +253,10 @@ class TMSwinStage(nn.Module):
                 x = checkpoint(_forward, x)
             else:
                 x, H, W = block(x, H, W, use_ste=use_ste)
+            if collect_diagnostics and record_callback is not None:
+                record_callback(f"stage{stage_index + 1}_block{block_idx + 1}", x, H, W)
+        if collect_diagnostics and record_callback is not None:
+            record_callback(f"stage{stage_index + 1}_out", x, H, W)
         if self.downsample is not None:
             x = x.reshape(-1, H, W, x.shape[-1])
             x = self.downsample(x)
@@ -292,6 +299,10 @@ class UnifiedTMTransformer(nn.Module):
         self.pool = pool
         self.grad_checkpoint = grad_checkpoint
 
+        self.component_dims: Dict[str, int] = {}
+        self.component_order: List[str] = []
+        self.diagnostic_heads: nn.ModuleDict = nn.ModuleDict()
+
         if self.architecture not in {"vit", "swin"}:
             raise ValueError("architecture must be 'vit' or 'swin'.")
 
@@ -327,6 +338,9 @@ class UnifiedTMTransformer(nn.Module):
             nn.init.trunc_normal_(self.pos_embed, std=0.02)
             if self.cls_token is not None:
                 nn.init.trunc_normal_(self.cls_token, std=0.02)
+            self.component_order = ["patch_embed"] + [f"block_{i + 1}" for i in range(depth)] + ["pre_head"]
+            for name in self.component_order:
+                self.component_dims[name] = int(embed_dim)
         else:
             if isinstance(depths, int):
                 raise ValueError("depths must be a sequence for Swin architecture.")
@@ -364,14 +378,53 @@ class UnifiedTMTransformer(nn.Module):
             self.stages = nn.ModuleList(stages)
             self.norm = nn.LayerNorm(stage_dims[-1])
             self.head = nn.Linear(stage_dims[-1], num_classes)
+            component_names: List[str] = ["patch_embed"]
+            for idx, depth in enumerate(stage_depths):
+                dim = stage_dims[idx]
+                for block_idx in range(depth):
+                    name = f"stage{idx + 1}_block{block_idx + 1}"
+                    component_names.append(name)
+                    self.component_dims[name] = dim
+                stage_out_name = f"stage{idx + 1}_out"
+                component_names.append(stage_out_name)
+                self.component_dims[stage_out_name] = dim
+            component_names.append("pre_head")
+            self.component_dims["pre_head"] = stage_dims[-1]
+            self.component_order = component_names
 
         nn.init.trunc_normal_(self.head.weight, std=0.02)
         if self.head.bias is not None:
             nn.init.zeros_(self.head.bias)
 
-    def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
+        for name in self.component_order:
+            dim = self.component_dims[name]
+            head = nn.Linear(dim, num_classes)
+            nn.init.trunc_normal_(head.weight, std=0.02)
+            if head.bias is not None:
+                nn.init.zeros_(head.bias)
+            self.diagnostic_heads[name] = head
+
+    def _pool_vit_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool tokens for ViT architecture."""
+        if self.pool == "cls":
+            return x[:, 0]
+        return x.mean(dim=1)
+
+    def _pool_swin_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool tokens for Swin architecture."""
+        return x.mean(dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        use_ste: bool = True,
+        collect_diagnostics: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         if x.dim() != 4:
             raise ValueError("UnifiedTMTransformer expects image tensor of shape (B, C, H, W).")
+
+        diagnostics: Dict[str, torch.Tensor] = {}
+        collecting = collect_diagnostics
 
         if self.architecture == "vit":
             x = self.patch_embed(x)
@@ -380,27 +433,53 @@ class UnifiedTMTransformer(nn.Module):
                 x = torch.cat((cls_tokens, x), dim=1)
             x = x + self.pos_embed[:, : x.size(1), :]
             x = self.pos_drop(x)
-            for block in self.blocks:
+            if collecting:
+                diagnostics["patch_embed"] = self.diagnostic_heads["patch_embed"](self._pool_vit_tokens(x))
+            for idx, block in enumerate(self.blocks):
                 if self.grad_checkpoint and self.training and x.requires_grad:
                     x = checkpoint(lambda inp, blk=block: blk(inp, use_ste=use_ste), x)
                 else:
                     x = block(x, use_ste=use_ste)
+                component_key = f"block_{idx + 1}"
+                if collecting and component_key in self.diagnostic_heads:
+                    diagnostics[component_key] = self.diagnostic_heads[component_key](self._pool_vit_tokens(x))
             x = self.norm(x)
-            if hasattr(self, "cls_token") and self.cls_token is not None and self.pool == "cls":
-                feats = x[:, 0]
-            else:
-                feats = x.mean(dim=1)
+            if collecting and "pre_head" in self.diagnostic_heads:
+                diagnostics["pre_head"] = self.diagnostic_heads["pre_head"](self._pool_vit_tokens(x))
+            feats = self._pool_vit_tokens(x)
             logits = self.head(feats)
+            if collecting:
+                return logits, diagnostics
             return logits
 
         x = self.patch_embed(x)
         B, H, W, C = x.shape
-        x = x.reshape(B, H * W, C)
-        for stage in self.stages:
-            x, H, W = stage(x, H, W, use_ste=use_ste)
-        x = self.norm(x)
-        feats = x.mean(dim=1)
+        tokens = x.reshape(B, H * W, C)
+        if collecting and "patch_embed" in self.diagnostic_heads:
+            diagnostics["patch_embed"] = self.diagnostic_heads["patch_embed"](self._pool_swin_tokens(tokens))
+        for stage_idx, stage in enumerate(self.stages):
+            if collecting:
+                def stage_record(name: str, comps: torch.Tensor, h: int, w: int) -> None:
+                    if name in self.diagnostic_heads:
+                        diagnostics[name] = self.diagnostic_heads[name](self._pool_swin_tokens(comps))
+            else:
+                stage_record = None
+            tokens, H, W = stage(
+                tokens,
+                H,
+                W,
+                use_ste=use_ste,
+                collect_diagnostics=collecting,
+                record_callback=stage_record,
+                stage_index=stage_idx,
+            )
+        x = self.norm(tokens)
+        if collecting and "pre_head" in self.diagnostic_heads:
+            diagnostics["pre_head"] = self.diagnostic_heads["pre_head"](self._pool_swin_tokens(x))
+        feats = self._pool_swin_tokens(x)
         logits = self.head(feats)
+        if collecting:
+            return logits, diagnostics
         return logits
 
 
