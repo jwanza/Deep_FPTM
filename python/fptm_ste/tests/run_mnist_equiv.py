@@ -14,6 +14,7 @@ import resource
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -28,6 +29,7 @@ from fptm_ste.binarizers import CNNSingleBinarizer
 from fptm_ste.deep_tm import DeepTMNetwork
 from fptm_ste.export import export_compiled_to_json
 from fptm_ste.tm_transformer import UnifiedTMTransformer
+from fptm_ste.datasets import prepare_fashion_augmented_bundle
 
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
@@ -269,6 +271,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Implementation for the TM baseline.",
     )
     parser.add_argument(
+        "--tm-feature-mode",
+        choices=["raw", "fashion_aug"],
+        default=os.environ.get("TM_MNIST_FEATURE_MODE", "raw"),
+        help="Feature preprocessing pipeline for TM variants.",
+    )
+    parser.add_argument(
+        "--tm-feature-cache",
+        default=os.environ.get("TM_FEATURE_CACHE_DIR", "/tmp/fptm_features"),
+        help="Directory used to cache booleanised TM feature datasets.",
+    )
+    parser.add_argument(
+        "--tm-feature-batch",
+        type=int,
+        default=int_env("TM_FEATURE_BATCH", 256),
+        help="Batch size used when materialising TM feature caches.",
+    )
+    parser.add_argument(
+        "--tm-feature-force",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force regeneration of cached TM feature datasets.",
+    )
+    parser.add_argument(
+        "--tm-augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable geometric augmentations when preparing TM feature datasets (Fashion-MNIST only).",
+    )
+    parser.add_argument(
         "--tm-tau",
         type=float,
         default=float_env("TM_MNIST_TAU", 0.4),
@@ -293,6 +324,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional vote clamp for FPTM (set to 'none' to disable).",
     )
     parser.add_argument("--tm-n-clauses", type=int, default=256, help="Number of clauses for TM variants.")
+    parser.add_argument(
+        "--tm-L",
+        type=int,
+        default=None,
+        help="Literal budget L embedded into exported TM JSON metadata (defaults to --tm-literal-budget or 16).",
+    )
+    parser.add_argument(
+        "--tm-LF",
+        type=int,
+        default=None,
+        help="LF parameter embedded into exported TM JSON metadata (defaults to --tm-lf).",
+    )
     parser.add_argument(
         "--tm-target-channels",
         type=optional_int_arg,
@@ -350,6 +393,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=192,
         help="Number of clauses used in transformer TM heads.",
+    )
+    parser.add_argument(
+        "--transformer-backend",
+        choices=["ste", "deeptm"],
+        default="ste",
+        help="Choose TM backend for transformer feed-forward replacements.",
+    )
+    parser.add_argument(
+        "--transformer-ff",
+        type=int,
+        default=512,
+        help="Hidden dimension used inside TM-based feed-forward replacements.",
+    )
+    parser.add_argument(
+        "--transformer-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability for transformer attention and TM replacements.",
     )
 
     return parser
@@ -550,13 +611,14 @@ def run_variant_tm(train_loader,
                    report_epoch_acc: bool,
                    report_epoch_test: bool,
                    n_features: int,
+                   prepare_fn: Callable[[torch.Tensor], torch.Tensor],
                    tm_impl: str,
                    tm_tau: float,
                    tm_lf: int,
                    tm_literal_budget: Optional[int],
                    tm_vote_clamp: Optional[float],
                    tm_n_clauses: int,
-                   input_shape: Tuple[int, int, int],
+                   input_shape: Optional[Tuple[int, int, int]],
                    auto_expand_grayscale: bool,
                    allow_channel_reduce: bool,
                    n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
@@ -591,7 +653,7 @@ def run_variant_tm(train_loader,
 
     train_acc, test_acc, ttrain, preds = train_tm_model(
         model,
-        lambda t: t,
+        prepare_fn,
         train_loader,
         test_loader,
         device,
@@ -743,7 +805,12 @@ def run_variant_transformer(train_loader,
                             n_heads: int,
                             num_layers: int,
                             n_clauses: int,
-                            max_len: int) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
+                            max_len: int,
+                            backend: str,
+                            dim_feedforward: int,
+                            dropout: float,
+                            tm_tau: float,
+                            ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
     def eval_transformer(model: nn.Module,
                          loader: DataLoader,
                          device: torch.device,
@@ -775,6 +842,10 @@ def run_variant_transformer(train_loader,
         num_layers=num_layers,
         max_len=max_len,
         n_clauses=n_clauses,
+        backend=backend,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        tm_tau=tm_tau,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=7e-4, weight_decay=1e-5)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -830,6 +901,11 @@ def main(argv: Optional[List[str]] = None):
     args = parser.parse_args(argv)
 
     maybe_set_seed(args.seed)
+    if args.tm_L is None:
+        args.tm_L = args.tm_literal_budget if args.tm_literal_budget is not None else 16
+    if args.tm_LF is None:
+        args.tm_LF = args.tm_lf
+
     dataset_key = args.dataset.lower()
     if dataset_key not in DATASET_CONFIGS:
         raise ValueError(f"Unsupported dataset '{args.dataset}'. Available: {', '.join(sorted(DATASET_CONFIGS))}")
@@ -915,6 +991,12 @@ def main(argv: Optional[List[str]] = None):
                 thr=args.bool_threshold,
             )
 
+    tm_feature_mode = args.tm_feature_mode.lower()
+    tm_bundle = None
+    tm_train_loader = train_loader
+    tm_test_loader = test_loader
+    tm_prepare_fn: Callable[[torch.Tensor], torch.Tensor] = flatten_images
+
     selected_models = tuple(args.models or DEFAULT_MODELS)
     if not selected_models:
         raise ValueError("No model variants selected.")
@@ -923,8 +1005,48 @@ def main(argv: Optional[List[str]] = None):
     image_h, image_w = target_size
     flat_dim = input_channels * image_h * image_w
     tm_input_shape = (input_channels, image_h, image_w)
+    tm_input_shape_active: Optional[Tuple[int, int, int]] = tm_input_shape
     tm_auto_expand = args.tm_auto_expand_grayscale
     tm_allow_reduce = args.tm_allow_channel_reduce
+    tm_n_features = flat_dim
+
+    if tm_feature_mode == "fashion_aug":
+        if dataset_key != "fashionmnist":
+            raise ValueError("--tm-feature-mode=fashion_aug is only supported for Fashion-MNIST.")
+        cache_dir = Path(args.tm_feature_cache)
+        with profile_block("prepare-fashion-augmented-features"):
+            tm_bundle = prepare_fashion_augmented_bundle(
+                train_ds,
+                test_ds,
+                cache_dir,
+                batch_size=args.tm_feature_batch,
+                force=args.tm_feature_force,
+                apply_augmentations=args.tm_augment,
+            )
+        tm_train_loader = DataLoader(
+            tm_bundle.train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+        tm_test_loader = DataLoader(
+            tm_bundle.test_dataset,
+            batch_size=args.test_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+        tm_prepare_fn = lambda t: t
+        tm_n_features = tm_bundle.num_bits
+        tm_input_shape_active = None
+    elif tm_feature_mode == "raw":
+        tm_input_shape_active = tm_input_shape
+        tm_prepare_fn = lambda t: t
+    else:
+        raise ValueError(f"Unknown tm feature mode '{tm_feature_mode}'.")
 
     hidden_dims = parse_int_list(args.deeptm_hidden_dims)
     if not hidden_dims:
@@ -936,21 +1058,22 @@ def main(argv: Optional[List[str]] = None):
         with profile_block(f"variant-{model_key}"):
             if model_key == "tm":
                 label, train_acc, test_acc, train_time, preds, bundle = run_variant_tm(
-                    train_loader,
-                    test_loader,
+                    tm_train_loader,
+                    tm_test_loader,
                     device,
                     epochs=args.epochs,
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
                     report_epoch_test=args.report_epoch_test,
-                    n_features=flat_dim,
+                    n_features=tm_n_features,
+                    prepare_fn=tm_prepare_fn,
                     tm_impl=args.tm_impl,
                     tm_tau=args.tm_tau,
                     tm_lf=args.tm_lf,
                     tm_literal_budget=args.tm_literal_budget,
                     tm_vote_clamp=args.tm_vote_clamp,
                     tm_n_clauses=args.tm_n_clauses,
-                    input_shape=tm_input_shape,
+                    input_shape=tm_input_shape_active,
                     auto_expand_grayscale=tm_auto_expand,
                     allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
@@ -1008,6 +1131,10 @@ def main(argv: Optional[List[str]] = None):
                     num_layers=args.transformer_layers,
                     n_clauses=args.transformer_clauses,
                     max_len=flat_dim,
+                    backend=args.transformer_backend,
+                    dim_feedforward=args.transformer_ff,
+                    dropout=args.transformer_dropout,
+                    tm_tau=args.tm_tau,
                 )
                 variant_classes = args.num_classes
             else:
@@ -1025,8 +1152,8 @@ def main(argv: Optional[List[str]] = None):
                 [str(i) for i in range(variant_classes)],
                 export_base,
                 bundle["clauses_num"],
-                L=16,
-                LF=4,
+                L=int(args.tm_L),
+                LF=int(args.tm_LF),
             )
 
         results[model_key] = {
@@ -1037,6 +1164,16 @@ def main(argv: Optional[List[str]] = None):
             "json": export_path,
             "preds": preds,
         }
+        if model_key == "tm":
+            results[model_key]["feature_mode"] = tm_feature_mode
+            results[model_key]["n_features"] = tm_n_features
+            if tm_bundle is not None:
+                results[model_key]["feature_cache"] = {
+                    "train_path": str(tm_bundle.train_dataset.data_path),
+                    "test_path": str(tm_bundle.test_dataset.data_path),
+                    "num_bits": tm_bundle.num_bits,
+                    "augmentations": tm_bundle.augmentation_names,
+                }
 
     output_dir = os.path.dirname(args.output_json)
     if output_dir:
