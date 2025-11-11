@@ -39,6 +39,7 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
   --epochs 20 --batch-size 128
 ```
 
+
 ### 3.2 Swin + DeepTM backend (CIFAR-10, hierarchical)
 ```bash
 source venv/bin/activate
