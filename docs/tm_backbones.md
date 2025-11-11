@@ -17,6 +17,15 @@
 - `last_stage_logits`/`last_stage_clauses` store per-stage results for accuracy breakdown and diagnostics.
 - Avoids in-place residual modifications to maintain STE gradient correctness.
 
+## Input Channel Handling
+- `run_pyramid.py` auto-detects dataset channels and records them in run metadata (`dataset_channels`, `target_channels`).
+- New CLI flags:
+  - `--force-channels`: override detected channel count (e.g., force 3 for RGB-style backbones).
+  - `--auto-expand-grayscale/--no-auto-expand-grayscale`: control whether single-channel tensors are duplicated to match the requested count.
+- `fptm_ste.utils.data.ChannelAdjust` powers the duplication/reduction logic and is covered by unit tests in `test_data_utils.py`.
+- Grayscale datasets can now drive color-aware backbones without manual preprocessing; RGB datasets pass through unchanged.
+- When `tm-variant` is `swin`, `swin_tm`, or `resnet_tm`, inputs are automatically resized to 224×224 with bicubic filtering so stage geometries match native backbones.
+
 ## Instrumentation & Logging
 - `run_pyramid.py` extended with helper utilities:
   - `extract_final_and_stage_logits` to normalize outputs across Pyramid, Swin-like, SwinTM, and ResNetTM.

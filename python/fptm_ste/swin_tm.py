@@ -744,6 +744,7 @@ class SwinTMStageConfig:
     drop_path: float = 0.0
     tau: float = 0.5
     clause_pool: str = "mean"
+    drop_path_schedule: Optional[Tuple[float, ...]] = None
 
 
 def build_swin_stage_configs(
@@ -756,6 +757,7 @@ def build_swin_stage_configs(
     window_size: int = 7,
     dropout: float = 0.0,
     drop_path: float = 0.0,
+    clause_pool: str = "mean",
 ) -> Tuple[SwinTMStageConfig, ...]:
     preset = preset.lower()
     if preset not in {"tiny", "small", "base", "large"}:
@@ -780,7 +782,15 @@ def build_swin_stage_configs(
     }[preset]
     configs: List[SwinTMStageConfig] = []
     shift_cycle = (0, window_size // 2)
+    total_blocks = sum(depths)
+    if drop_path > 0:
+        drop_path_rates = torch.linspace(0, drop_path, total_blocks).tolist()
+    else:
+        drop_path_rates = [0.0 for _ in range(total_blocks)]
+    rate_index = 0
     for idx, (dim, depth, head) in enumerate(zip(embed_dims, depths, heads)):
+        stage_rates = tuple(drop_path_rates[rate_index : rate_index + depth])
+        rate_index += depth
         configs.append(
             SwinTMStageConfig(
                 embed_dim=dim,
@@ -792,8 +802,10 @@ def build_swin_stage_configs(
                 tm_clauses=tm_clauses,
                 head_clauses=head_clauses,
                 dropout=dropout,
-                drop_path=drop_path,
+                drop_path=stage_rates[-1] if stage_rates else drop_path,
                 tau=tau,
+                clause_pool=clause_pool,
+                drop_path_schedule=stage_rates,
             )
         )
     return tuple(configs)
@@ -913,6 +925,7 @@ class SwinTMStage(nn.Module):
         super().__init__()
         self.config = config
         blocks = []
+        schedule = config.drop_path_schedule or tuple([config.drop_path] * config.depth)
         for i in range(config.depth):
             shift = config.shift_size if (i % 2 == 1) else 0
             block_cfg = SwinTMStageConfig(
@@ -925,7 +938,7 @@ class SwinTMStage(nn.Module):
                 tm_clauses=config.tm_clauses,
                 head_clauses=config.head_clauses,
                 dropout=config.dropout,
-                drop_path=config.drop_path,
+                drop_path=schedule[i],
                 tau=config.tau,
                 clause_pool=config.clause_pool,
             )
@@ -991,6 +1004,20 @@ class SwinTM(nn.Module):
         self.last_attention_weights: List[List[torch.Tensor]] = []
         self.last_scale_fused_logits: Optional[torch.Tensor] = None
         self.last_clause_attention_logits: Optional[torch.Tensor] = None
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.trunc_normal_(self.patch_embed.weight, std=0.02)
+        if self.patch_embed.bias is not None:
+            nn.init.zeros_(self.patch_embed.bias)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor, *, use_ste: bool = True):
         if x.dim() == 2:

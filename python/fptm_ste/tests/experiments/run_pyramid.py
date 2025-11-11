@@ -9,7 +9,7 @@ import socket
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import torch
 import torch.distributed as dist
@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
 
 from fptm_ste.experiments import EpochMetrics, ExperimentLogger, collect_tm_diagnostics
 from fptm_ste.pyramid_tm import PyramidStageConfig, PyramidTM
@@ -26,6 +27,7 @@ from fptm_ste.resnet_tm import ResNetTM, resnet_tm101, resnet_tm18, resnet_tm34,
 from fptm_ste.swin_pyramid_tm import SwinLikePyramidTM, SwinStageConfig
 from fptm_ste.swin_tm import SwinTM, build_swin_stage_configs
 from fptm_ste.trainers import EMAWrapper, anneal_ste_factor
+from fptm_ste.utils.data import ChannelAdjust
 
 
 def get_device(local_rank: Optional[int] = None) -> torch.device:
@@ -313,9 +315,37 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
     if device.type == "cuda" and device.index is not None:
         torch.cuda.set_device(device)
 
-    transform = transforms.ToTensor()
-    train_ds = datasets.MNIST(root="/tmp/mnist", train=True, download=True, transform=transform)
-    test_ds = datasets.MNIST(root="/tmp/mnist", train=False, download=True, transform=transform)
+    base_transform = transforms.ToTensor()
+    train_ds = datasets.MNIST(root="/tmp/mnist", train=True, download=True, transform=base_transform)
+    test_ds = datasets.MNIST(root="/tmp/mnist", train=False, download=True, transform=base_transform)
+
+    raw_sample = train_ds[0][0]
+    dataset_channels = raw_sample.shape[0] if raw_sample.dim() == 3 else 1
+    target_channels = args.force_channels if args.force_channels is not None else dataset_channels
+    if target_channels <= 0:
+        raise ValueError("--force-channels must be a positive integer.")
+
+    target_size = canonical_input_size(args.tm_variant)
+    transform_steps: List[Callable] = []
+    if target_size is not None:
+        transform_steps.append(
+            transforms.Resize(target_size, interpolation=InterpolationMode.BICUBIC, antialias=True)
+        )
+    transform_steps.append(transforms.ToTensor())
+    if target_channels != dataset_channels:
+        if dataset_channels == 1 and target_channels > 1:
+            if not args.auto_expand_grayscale:
+                raise ValueError(
+                    "Requested multi-channel input but auto expansion from grayscale is disabled. "
+                    "Enable --auto-expand-grayscale or adjust --force-channels."
+                )
+            transform_steps.append(ChannelAdjust(target_channels, allow_expand=True, allow_reduce=False))
+        else:
+            transform_steps.append(ChannelAdjust(target_channels, allow_expand=True, allow_reduce=True))
+
+    composed_transform = transforms.Compose(transform_steps)
+    train_ds.transform = composed_transform
+    test_ds.transform = composed_transform
 
     train_sampler = (
         DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
@@ -355,9 +385,11 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
     if sample.dim() == 3:
         in_channels = sample.shape[0]
         image_size = sample.shape[-2:]
-    else:
+    elif sample.dim() == 2:
         in_channels = 1
-        image_size = (28, 28)
+        image_size = sample.shape[-2:]
+    else:
+        raise ValueError(f"Unexpected sample shape {tuple(sample.shape)} after channel adjustment.")
 
     stage_clause_overrides = parse_sequence(args.stage_clauses, int) if args.stage_clauses else []
     stage_dropout_overrides = parse_sequence(args.stage_dropouts, float) if args.stage_dropouts else []
@@ -426,6 +458,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 tm_hidden=args.resnet_tm_hidden,
                 tm_clauses=args.resnet_tm_clauses,
                 tau=args.tau_start,
+                input_norm="batchnorm",
             )
         elif variant == "34":
             model_core = resnet_tm34(
@@ -434,6 +467,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 tm_hidden=args.resnet_tm_hidden,
                 tm_clauses=args.resnet_tm_clauses,
                 tau=args.tau_start,
+                input_norm="batchnorm",
             )
         elif variant == "50":
             model_core = resnet_tm50(
@@ -442,6 +476,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 tm_hidden=args.resnet_tm_hidden,
                 tm_clauses=args.resnet_tm_clauses,
                 tau=args.tau_start,
+                input_norm="batchnorm",
             )
         else:
             model_core = resnet_tm101(
@@ -450,6 +485,7 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 tm_hidden=args.resnet_tm_hidden,
                 tm_clauses=args.resnet_tm_clauses,
                 tau=args.tau_start,
+                input_norm="batchnorm",
             )
         model_core = model_core.to(device)
         metadata_stage_configs = [
@@ -516,6 +552,13 @@ def run_training(args, rank: int, world_size: int, distributed: bool, virtual_mu
                 "stage_configs": metadata_stage_configs,
                 "seed": args.seed,
                 "device": device.type,
+                "dataset_channels": dataset_channels,
+                "input_channels": in_channels,
+                "target_channels": target_channels,
+                "auto_expand_grayscale": args.auto_expand_grayscale,
+                "force_channels": args.force_channels,
+                "canonical_image_size": target_size,
+                "input_image_size": image_size,
                 "attention_heads": args.attention_heads,
                 "use_clause_attention": not args.no_clause_attention,
                 "use_scale_attention": not args.no_scale_attention,
@@ -781,6 +824,13 @@ def main() -> None:
         type=str,
         default="",
         help="Initialization URL for distributed training (defaults to tcp://127.0.0.1:<free_port>)",
+    )
+    parser.add_argument("--force-channels", type=int, default=None, help="Override detected input channels (e.g., 3 for RGB).")
+    parser.add_argument(
+        "--auto-expand-grayscale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically duplicate grayscale inputs to match requested channel count.",
     )
     args = parser.parse_args()
 

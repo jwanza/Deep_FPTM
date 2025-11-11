@@ -56,6 +56,7 @@ class PatchEmbedding(nn.Module):
         self.patch_size = patch_size
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.norm = norm_layer(embed_dim) if norm_layer is not None else None
+        self._reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
@@ -63,6 +64,14 @@ class PatchEmbedding(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
         return x
+
+    def _reset_parameters(self) -> None:
+        nn.init.trunc_normal_(self.proj.weight, std=0.02)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        if self.norm is not None:
+            nn.init.ones_(self.norm.weight)
+            nn.init.zeros_(self.norm.bias)
 
 
 class PatchMerging(nn.Module):

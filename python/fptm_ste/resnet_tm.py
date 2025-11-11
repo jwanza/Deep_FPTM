@@ -25,6 +25,7 @@ class ResNetTMConfig:
     tm_hidden: int = 256
     tm_clauses: int = 128
     tau: float = 0.5
+    tau_schedule: Optional[Sequence[float]] = None
 
 
 class BasicTMBlock(nn.Module):
@@ -125,14 +126,19 @@ class ResNetTM(nn.Module):
         num_classes: int = 10,
         in_channels: int = 3,
         block: Callable[..., nn.Module] = BasicTMBlock,
+        input_norm: Optional[str] = None,
     ) -> None:
         super().__init__()
         if len(config.channels) != len(config.layers):
             raise ValueError("channels and layers must have the same length")
         self.config = config
-        self.in_channels = config.channels[0]
-        self.conv1 = nn.Conv2d(in_channels, self.in_channels, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(self.in_channels)
+        self.stage_taus = self._build_stage_taus(config)
+        self.final_tau = self.stage_taus[-1]
+        stem_out_channels = config.channels[0]
+        self.input_norm = self._build_input_norm(input_norm, in_channels)
+        self.in_channels = stem_out_channels
+        self.conv1 = nn.Conv2d(in_channels, stem_out_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(stem_out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
@@ -140,7 +146,7 @@ class ResNetTM(nn.Module):
         self.stage_dims: List[int] = []
         for idx, (planes, blocks) in enumerate(zip(config.channels, config.layers)):
             stride = 1 if idx == 0 else 2
-            layer, out_dim = self._make_layer(block, planes, blocks, stride, config)
+            layer, out_dim = self._make_layer(block, planes, blocks, stride, config, self.stage_taus[idx])
             self.stages.append(layer)
             self.stage_dims.append(out_dim)
 
@@ -149,13 +155,49 @@ class ResNetTM(nn.Module):
             nn.Sequential(nn.Linear(dim, config.tm_hidden), nn.Sigmoid()) for dim in self.stage_dims
         )
         self.stage_heads = nn.ModuleList(
-            FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=config.tau)
-            for _ in self.stage_dims
+            FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=tau)
+            for tau in self.stage_taus
         )
         self.final_proj = nn.Sequential(nn.Linear(self.stage_dims[-1], config.tm_hidden), nn.Sigmoid())
-        self.final_tm = FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=config.tau)
+        self.final_tm = FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=self.final_tau)
         self.last_stage_logits: List[torch.Tensor] = []
         self.last_stage_clauses: List[torch.Tensor] = []
+        self._reset_parameters()
+
+    def _build_stage_taus(self, config: ResNetTMConfig) -> List[float]:
+        if config.tau_schedule is None:
+            return [config.tau for _ in config.layers]
+        tau_schedule = list(config.tau_schedule)
+        if len(tau_schedule) != len(config.layers):
+            raise ValueError("tau_schedule length must match number of layers")
+        return [float(t) for t in tau_schedule]
+
+    @staticmethod
+    def _build_input_norm(norm_type: Optional[str], channels: int) -> nn.Module:
+        if norm_type is None or norm_type.lower() == "none":
+            return nn.Identity()
+        norm = norm_type.lower()
+        if norm == "batchnorm":
+            return nn.BatchNorm2d(channels)
+        if norm == "layernorm":
+            return nn.GroupNorm(1, channels)
+        if norm == "instancenorm":
+            return nn.InstanceNorm2d(channels, affine=True)
+        raise ValueError(f"Unknown input_norm '{norm_type}'")
+
+    def _reset_parameters(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.InstanceNorm2d)):
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def _make_layer(
         self,
@@ -164,6 +206,7 @@ class ResNetTM(nn.Module):
         blocks: int,
         stride: int,
         config: ResNetTMConfig,
+        tau: float,
     ) -> Tuple[nn.Sequential, int]:
         downsample = None
         out_channels = planes * block.expansion
@@ -181,16 +224,17 @@ class ResNetTM(nn.Module):
                 stride,
                 config.tm_hidden,
                 config.tm_clauses,
-                config.tau,
+                tau,
                 downsample,
             )
         )
         self.in_channels = out_channels
         for _ in range(1, blocks):
-            layers.append(block(self.in_channels, planes, 1, config.tm_hidden, config.tm_clauses, config.tau))
+            layers.append(block(self.in_channels, planes, 1, config.tm_hidden, config.tm_clauses, tau))
         return nn.Sequential(*layers), out_channels
 
     def forward(self, x: torch.Tensor, *, use_ste: bool = True):
+        x = self.input_norm(x)
         x = self.pool(self.relu(self.bn1(self.conv1(x))))
         stage_logits: List[torch.Tensor] = []
         stage_clauses: List[torch.Tensor] = []
@@ -217,9 +261,24 @@ def resnet_tm18(
     tm_hidden: int = 256,
     tm_clauses: int = 128,
     tau: float = 0.5,
+    tau_schedule: Optional[Sequence[float]] = None,
+    input_norm: Optional[str] = None,
 ) -> ResNetTM:
-    config = ResNetTMConfig(layers=(2, 2, 2, 2), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
-    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BasicTMBlock)
+    config = ResNetTMConfig(
+        layers=(2, 2, 2, 2),
+        channels=(64, 128, 256, 512),
+        tm_hidden=tm_hidden,
+        tm_clauses=tm_clauses,
+        tau=tau,
+        tau_schedule=tau_schedule,
+    )
+    return ResNetTM(
+        config,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        block=BasicTMBlock,
+        input_norm=input_norm,
+    )
 
 
 def resnet_tm34(
@@ -229,9 +288,24 @@ def resnet_tm34(
     tm_hidden: int = 256,
     tm_clauses: int = 128,
     tau: float = 0.5,
+    tau_schedule: Optional[Sequence[float]] = None,
+    input_norm: Optional[str] = None,
 ) -> ResNetTM:
-    config = ResNetTMConfig(layers=(3, 4, 6, 3), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
-    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BasicTMBlock)
+    config = ResNetTMConfig(
+        layers=(3, 4, 6, 3),
+        channels=(64, 128, 256, 512),
+        tm_hidden=tm_hidden,
+        tm_clauses=tm_clauses,
+        tau=tau,
+        tau_schedule=tau_schedule,
+    )
+    return ResNetTM(
+        config,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        block=BasicTMBlock,
+        input_norm=input_norm,
+    )
 
 
 def resnet_tm50(
@@ -241,9 +315,24 @@ def resnet_tm50(
     tm_hidden: int = 256,
     tm_clauses: int = 128,
     tau: float = 0.5,
+    tau_schedule: Optional[Sequence[float]] = None,
+    input_norm: Optional[str] = None,
 ) -> ResNetTM:
-    config = ResNetTMConfig(layers=(3, 4, 6, 3), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
-    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BottleneckTMBlock)
+    config = ResNetTMConfig(
+        layers=(3, 4, 6, 3),
+        channels=(64, 128, 256, 512),
+        tm_hidden=tm_hidden,
+        tm_clauses=tm_clauses,
+        tau=tau,
+        tau_schedule=tau_schedule,
+    )
+    return ResNetTM(
+        config,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        block=BottleneckTMBlock,
+        input_norm=input_norm,
+    )
 
 
 def resnet_tm101(
@@ -253,6 +342,21 @@ def resnet_tm101(
     tm_hidden: int = 256,
     tm_clauses: int = 128,
     tau: float = 0.5,
+    tau_schedule: Optional[Sequence[float]] = None,
+    input_norm: Optional[str] = None,
 ) -> ResNetTM:
-    config = ResNetTMConfig(layers=(3, 4, 23, 3), channels=(64, 128, 256, 512), tm_hidden=tm_hidden, tm_clauses=tm_clauses, tau=tau)
-    return ResNetTM(config, num_classes=num_classes, in_channels=in_channels, block=BottleneckTMBlock)
+    config = ResNetTMConfig(
+        layers=(3, 4, 23, 3),
+        channels=(64, 128, 256, 512),
+        tm_hidden=tm_hidden,
+        tm_clauses=tm_clauses,
+        tau=tau,
+        tau_schedule=tau_schedule,
+    )
+    return ResNetTM(
+        config,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        block=BottleneckTMBlock,
+        input_norm=input_norm,
+    )
