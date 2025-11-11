@@ -190,7 +190,7 @@ class TMSwinBlock(nn.Module):
         x = window_reverse(attn_out, self.window_size, H_pad, W_pad)
         if pad_h or pad_w:
             x = x[:, :H, :W, :]
-        x = x.view(B, H * W, C)
+        x = x.reshape(B, H * W, C)
         x = shortcut + self.drop_path1(self.attn_drop(x))
 
         x = x + self.drop_path2(self.ffn(self.norm2(x), use_ste=use_ste))
@@ -251,11 +251,11 @@ class TMSwinStage(nn.Module):
             else:
                 x, H, W = block(x, H, W, use_ste=use_ste)
         if self.downsample is not None:
-            x = x.view(-1, H, W, x.shape[-1])
+            x = x.reshape(-1, H, W, x.shape[-1])
             x = self.downsample(x)
             H //= 2
             W //= 2
-            x = x.view(x.shape[0], -1, x.shape[-1])
+            x = x.reshape(x.shape[0], -1, x.shape[-1])
         return x, H, W
 
 
@@ -395,7 +395,7 @@ class UnifiedTMTransformer(nn.Module):
 
         x = self.patch_embed(x)
         B, H, W, C = x.shape
-        x = x.view(B, H * W, C)
+        x = x.reshape(B, H * W, C)
         for stage in self.stages:
             x, H, W = stage(x, H, W, use_ste=use_ste)
         x = self.norm(x)

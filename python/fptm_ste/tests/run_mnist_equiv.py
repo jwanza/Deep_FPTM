@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
@@ -582,6 +583,47 @@ def profile_block(label: str):
         print(f"[{datetime.now():%H:%M:%S}] ◀ {label} | wall {wall_end - wall_start:5.1f}s | cpu {cpu_end - cpu_start:5.1f}s")
 
 
+def optimizer_lr(optimizer: Optimizer) -> float:
+    if not optimizer.param_groups:
+        return 0.0
+    return float(optimizer.param_groups[0].get("lr", 0.0))
+
+
+def format_epoch_log(
+    label: str,
+    epoch: int,
+    total_epochs: int,
+    *,
+    loss: float,
+    train_acc: Optional[float],
+    test_acc: Optional[float],
+    best_acc: Optional[float],
+    lr: Optional[float],
+    duration: Optional[float],
+    extras: Optional[Dict[str, Union[int, float, str]]] = None,
+) -> str:
+    parts = [
+        f"{label:12s}",
+        f"epoch {epoch:02d}/{total_epochs:02d}",
+        f"loss={loss:.4f}",
+    ]
+    if train_acc is not None:
+        parts.append(f"train_acc={train_acc:.4f}")
+    if test_acc is not None:
+        parts.append(f"test_acc={test_acc:.4f}")
+    if best_acc is not None:
+        parts.append(f"best_acc={best_acc:.4f}")
+    if lr is not None:
+        parts.append(f"lr={lr:.5f}")
+    if duration is not None:
+        parts.append(f"{duration:4.1f}s")
+    if extras:
+        extras_str = ", ".join(f"{key}={value}" if isinstance(value, str) else f"{key}={value:.3f}" for key, value in extras.items())
+        if extras_str:
+            parts.append(extras_str)
+    return " | ".join(parts)
+
+
 def flatten_images(x: torch.Tensor) -> torch.Tensor:
     return x.view(x.size(0), -1)
 
@@ -686,17 +728,19 @@ def train_tm_model(model: nn.Module,
                    epochs: int,
                    report_train_acc: bool,
                    report_epoch_acc: bool,
-                   report_epoch_test: bool) -> Tuple[Optional[float], float, float, List[int]]:
+                   report_epoch_test: bool) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
+    best_test_acc: Optional[float] = None
     for epoch in range(epochs):
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
+        num_batches = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             xb = prepare_fn(x)
@@ -711,12 +755,13 @@ def train_tm_model(model: nn.Module,
             scaler.step(opt)
             scaler.update()
             running_loss += loss.item()
+            num_batches += 1
             if report_train_acc:
                 preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
         dur = time.time() - epoch_start
-        avg_loss = running_loss / batch_idx
+        avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
         epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
@@ -731,16 +776,27 @@ def train_tm_model(model: nn.Module,
                 use_ste=use_ste_eval,
                 collect_preds=False,
             )
-        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
-        if epoch_acc is not None and report_epoch_acc:
-            log_msg += f" | train_acc={epoch_acc:.4f}"
-        if epoch_test_acc is not None:
-            log_msg += f" | test_acc={epoch_test_acc:.4f}"
-        log_msg += f" | {dur:4.1f}s"
-        print(log_msg)
+            if epoch_test_acc is not None:
+                best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+        current_lr = optimizer_lr(opt)
+        log_msg = format_epoch_log(
+            label=label,
+            epoch=epoch + 1,
+            total_epochs=epochs,
+            loss=avg_loss,
+            train_acc=epoch_acc if report_epoch_acc else None,
+            test_acc=epoch_test_acc,
+            best_acc=best_test_acc,
+            lr=current_lr,
+            duration=dur,
+            extras=None,
+        )
+        print("  " + log_msg)
     train_time = time.time() - start
     test_acc, preds = evaluate_model(model, prepare_fn, test_loader, device, use_ste=use_ste_eval)
-    return last_train_acc, test_acc, train_time, preds
+    if best_test_acc is None or test_acc > best_test_acc:
+        best_test_acc = test_acc
+    return last_train_acc, test_acc, train_time, preds, best_test_acc
 
 
 class CNNHybrid(nn.Module):
@@ -826,7 +882,7 @@ def run_variant_tm(train_loader,
         use_ste_train = False
         label = "STE-TM"
 
-    train_acc, test_acc, ttrain, preds = train_tm_model(
+    train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
         prepare_fn,
         train_loader,
@@ -841,7 +897,7 @@ def run_variant_tm(train_loader,
         report_epoch_test=report_epoch_test,
     )
     bundle = model.discretize(threshold=0.5)
-    return label, train_acc, test_acc, ttrain, preds, bundle
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
 
 
 def run_variant_deeptm(train_loader,
@@ -874,7 +930,7 @@ def run_variant_deeptm(train_loader,
         allow_channel_reduce=allow_channel_reduce,
     ).to(device)
     label = "Deep-TM"
-    train_acc, test_acc, ttrain, preds = train_tm_model(
+    train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
         prepare_fn,
         train_loader,
@@ -889,7 +945,7 @@ def run_variant_deeptm(train_loader,
         report_epoch_test=report_epoch_test,
     )
     bundle = model.classifier.discretize(threshold=0.5)
-    return label, train_acc, test_acc, ttrain, preds, bundle
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
 
 
 def run_variant_hybrid(train_loader,
@@ -916,6 +972,7 @@ def run_variant_hybrid(train_loader,
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
+    best_test_acc: Optional[float] = None
     label = "Hybrid"
     for epoch in range(epochs):
         model.train()
@@ -923,6 +980,7 @@ def run_variant_hybrid(train_loader,
         running_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
+        num_batches = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
@@ -935,12 +993,13 @@ def run_variant_hybrid(train_loader,
             scaler.step(opt)
             scaler.update()
             running_loss += loss.item()
+            num_batches += 1
             if report_train_acc:
                 preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
         dur = time.time() - epoch_start
-        avg_loss = running_loss / batch_idx
+        avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
         epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
@@ -955,17 +1014,28 @@ def run_variant_hybrid(train_loader,
                 use_ste=True,
                 collect_preds=False,
             )
-        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
-        if epoch_acc is not None and report_epoch_acc:
-            log_msg += f" | train_acc={epoch_acc:.4f}"
-        if epoch_test_acc is not None:
-            log_msg += f" | test_acc={epoch_test_acc:.4f}"
-        log_msg += f" | {dur:4.1f}s"
-        print(log_msg)
+            if epoch_test_acc is not None:
+                best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+        current_lr = optimizer_lr(opt)
+        log_msg = format_epoch_log(
+            label=label,
+            epoch=epoch + 1,
+            total_epochs=epochs,
+            loss=avg_loss,
+            train_acc=epoch_acc if report_epoch_acc else None,
+            test_acc=epoch_test_acc,
+            best_acc=best_test_acc,
+            lr=current_lr,
+            duration=dur,
+            extras=None,
+        )
+        print("  " + log_msg)
     train_time = time.time() - start
     test_acc, preds = evaluate_model(model, lambda t: t, test_loader, device, use_ste=True)
+    if best_test_acc is None or test_acc > best_test_acc:
+        best_test_acc = test_acc
     bundle = model.tm.discretize(threshold=0.5)
-    return label, last_train_acc, test_acc, train_time, preds, bundle
+    return label, last_train_acc, test_acc, train_time, preds, bundle, best_test_acc
 
 
 def run_variant_transformer(train_loader,
@@ -1024,6 +1094,7 @@ def run_variant_transformer(train_loader,
     ema_model = copy.deepcopy(model) if ema_decay > 0 else None
     start = time.time()
     last_train_acc: Optional[float] = None
+    best_test_acc: Optional[float] = None
     label = f"Transformer-{architecture.upper()}"
     for epoch in range(epochs):
         model.train()
@@ -1031,6 +1102,7 @@ def run_variant_transformer(train_loader,
         running_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
+        num_batches = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_alpha, cutmix_alpha)
@@ -1051,12 +1123,13 @@ def run_variant_transformer(train_loader,
                     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
                         ema_param.data.mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
             running_loss += loss.item()
+            num_batches += 1
             if report_train_acc:
                 preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
         dur = time.time() - epoch_start
-        avg_loss = running_loss / batch_idx
+        avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
         epoch_test_acc = None
         if report_train_acc and epoch_total > 0:
@@ -1074,17 +1147,28 @@ def run_variant_transformer(train_loader,
                 collect_preds=False,
             )
             eval_model.train()
-        log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
-        if epoch_acc is not None and report_epoch_acc:
-            log_msg += f" | train_acc={epoch_acc:.4f}"
-        if epoch_test_acc is not None:
-            log_msg += f" | test_acc={epoch_test_acc:.4f}"
-        log_msg += f" | {dur:4.1f}s"
-        print(log_msg)
+            if epoch_test_acc is not None:
+                best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+        current_lr = optimizer_lr(opt)
+        log_msg = format_epoch_log(
+            label=label,
+            epoch=epoch + 1,
+            total_epochs=epochs,
+            loss=avg_loss,
+            train_acc=epoch_acc if report_epoch_acc else None,
+            test_acc=epoch_test_acc,
+            best_acc=best_test_acc,
+            lr=current_lr,
+            duration=dur,
+            extras=None,
+        )
+        print("  " + log_msg)
     train_time = time.time() - start
     eval_model = ema_model if ema_model is not None else model
     test_acc, preds = evaluate_model(eval_model, lambda t: t, test_loader, device, use_ste=True)
-    return label, last_train_acc, test_acc, train_time, preds, None
+    if best_test_acc is None or test_acc > best_test_acc:
+        best_test_acc = test_acc
+    return label, last_train_acc, test_acc, train_time, preds, None, best_test_acc
 
 
 def main(argv: Optional[List[str]] = None):
@@ -1294,7 +1378,7 @@ def main(argv: Optional[List[str]] = None):
     for model_key in selected_models:
         with profile_block(f"variant-{model_key}"):
             if model_key == "tm":
-                label, train_acc, test_acc, train_time, preds, bundle = run_variant_tm(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_tm(
                     tm_train_loader,
                     tm_test_loader,
                     device,
@@ -1317,7 +1401,7 @@ def main(argv: Optional[List[str]] = None):
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
-                label, train_acc, test_acc, train_time, preds, bundle = run_variant_deeptm(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_deeptm(
                     deeptm_train_loader,
                     deeptm_test_loader,
                     device,
@@ -1339,7 +1423,7 @@ def main(argv: Optional[List[str]] = None):
                 variant_classes = args.num_classes
             elif model_key == "hybrid":
                 hybrid_classes = args.hybrid_classes if args.hybrid_classes is not None else args.num_classes
-                label, train_acc, test_acc, train_time, preds, bundle = run_variant_hybrid(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_hybrid(
                     train_loader,
                     test_loader,
                     device,
@@ -1355,7 +1439,7 @@ def main(argv: Optional[List[str]] = None):
                 )
                 variant_classes = hybrid_classes
             elif model_key == "transformer":
-                label, train_acc, test_acc, train_time, preds, bundle = run_variant_transformer(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_transformer(
                     train_loader,
                     test_loader,
                     device,
@@ -1412,6 +1496,7 @@ def main(argv: Optional[List[str]] = None):
             "train_time_s": train_time,
             "json": export_path,
             "preds": preds,
+            "best_epoch_test_accuracy": best_epoch_test_acc,
         }
         if model_key == "tm":
             results[model_key]["feature_mode"] = tm_feature_mode
