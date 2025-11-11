@@ -1,21 +1,59 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .tm import FuzzyPatternTM_STE
+from typing import Optional, Sequence, Tuple
+from .tm import FuzzyPatternTM_STE, prepare_tm_input
 
 
 class DeepTMNetwork(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list[int], n_classes: int,
-                 n_clauses: int = 100, dropout: float = 0.1, tau: float = 0.5, noise_std: float = 0.0):
+    def __init__(
+        self,
+        input_dim: Optional[int],
+        hidden_dims: Sequence[int],
+        n_classes: int,
+        n_clauses: int = 100,
+        dropout: float = 0.1,
+        tau: float = 0.5,
+        noise_std: float = 0.0,
+        *,
+        input_shape: Optional[Tuple[int, int, int]] = None,
+        auto_expand_grayscale: bool = False,
+        allow_channel_reduce: bool = True,
+    ):
         super().__init__()
+        self.input_shape = tuple(input_shape) if input_shape is not None else None
+        self.auto_expand_grayscale = auto_expand_grayscale
+        self.allow_channel_reduce = allow_channel_reduce
+
+        if self.input_shape is not None:
+            expected_dim = self.input_shape[0] * self.input_shape[1] * self.input_shape[2]
+            if input_dim is not None and input_dim not in (expected_dim, -1):
+                raise ValueError(
+                    "input_dim does not match input_shape: "
+                    f"{input_dim} vs {expected_dim}. Use input_dim=None or -1 to infer automatically."
+                )
+            input_dim = expected_dim
+        if input_dim is None or input_dim <= 0:
+            raise ValueError("input_dim must be positive or inferred via input_shape.")
+
+        self.input_dim = input_dim
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.residuals = nn.ModuleList()
         self.noise_std = noise_std
 
         prev = input_dim
-        for h in hidden_dims:
-            self.layers.append(FuzzyPatternTM_STE(prev, n_clauses, h, tau=tau))
+        for idx, h in enumerate(hidden_dims):
+            layer_kwargs = {}
+            if idx == 0:
+                layer_kwargs = dict(
+                    input_shape=self.input_shape,
+                    auto_expand_grayscale=self.auto_expand_grayscale,
+                    allow_channel_reduce=self.allow_channel_reduce,
+                )
+            self.layers.append(
+                FuzzyPatternTM_STE(prev, n_clauses, h, tau=tau, **layer_kwargs)
+            )
             self.norms.append(nn.LayerNorm(h))
             self.residuals.append(nn.Linear(prev, h, bias=False) if prev != h else nn.Identity())
             prev = h
@@ -23,13 +61,22 @@ class DeepTMNetwork(nn.Module):
         self.classifier = FuzzyPatternTM_STE(prev, n_clauses * 2, n_classes, tau=tau)
         self.dropout = nn.Dropout(dropout)
 
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        return prepare_tm_input(
+            x,
+            n_features=self.input_dim,
+            input_shape=self.input_shape,
+            auto_expand_grayscale=self.auto_expand_grayscale,
+            allow_channel_reduce=self.allow_channel_reduce,
+        )
+
     def forward(self, x: torch.Tensor, use_ste: bool = True):
-        # x in [0,1]
+        x = self._normalize_input(x)
         if self.training and self.noise_std > 0:
             x = x + torch.randn_like(x) * self.noise_std
         for layer, norm, res in zip(self.layers, self.norms, self.residuals):
             identity = res(x)
-            logits, _ = layer(x, use_ste=use_ste)   # [B, h]
+            logits, _ = layer(x, use_ste=use_ste)
             x = norm(self.dropout(torch.sigmoid(logits)) + identity)
         logits, clauses = self.classifier(x, use_ste=use_ste)
         return logits, clauses

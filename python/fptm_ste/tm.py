@@ -1,8 +1,110 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _adjust_channels_batch(
+    x: torch.Tensor,
+    expected_channels: int,
+    auto_expand_grayscale: bool,
+    allow_channel_reduce: bool,
+) -> torch.Tensor:
+    actual_channels = x.shape[1]
+    if actual_channels == expected_channels:
+        return x
+    if actual_channels == 1 and expected_channels > 1 and auto_expand_grayscale:
+        return x.repeat(1, expected_channels, 1, 1)
+    if actual_channels > 1 and expected_channels == 1 and allow_channel_reduce:
+        return x.mean(dim=1, keepdim=True)
+    raise ValueError(
+        "Cannot adjust channel count from "
+        f"{actual_channels} to {expected_channels}. Enable auto expansion for grayscale"
+        " or allow channel reduction if appropriate."
+    )
+
+
+def _resize_spatial(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    current_h, current_w = x.shape[2:]
+    if current_h == height and current_w == width:
+        return x
+    mode = "bilinear" if x.shape[1] > 1 else "nearest"
+    return F.interpolate(x, size=(height, width), mode=mode, align_corners=False)
+
+
+def prepare_tm_input(
+    x: torch.Tensor,
+    *,
+    n_features: int,
+    input_shape: Optional[Tuple[int, int, int]] = None,
+    auto_expand_grayscale: bool = False,
+    allow_channel_reduce: bool = True,
+) -> torch.Tensor:
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"Expected input tensor, received {type(x).__name__}.")
+
+    if input_shape is None:
+        if x.dim() == 2:
+            if x.shape[1] != n_features:
+                raise ValueError(
+                    f"Expected feature dimension {n_features}, got {x.shape[1]}."
+                )
+            return x
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        if x.dim() == 4:
+            flat = x.reshape(x.shape[0], -1)
+            if flat.shape[1] != n_features:
+                raise ValueError(
+                    "Input tensor does not match the expected flattened dimension "
+                    f"({flat.shape[1]} vs {n_features})."
+                )
+            return flat
+        if x.dim() == 1:
+            if x.numel() != n_features:
+                raise ValueError(
+                    f"Expected {n_features} features, received tensor with {x.numel()} elements."
+                )
+            return x.unsqueeze(0)
+        raise ValueError(
+            "Unsupported input shape. Provide a flattened tensor or specify input_shape for image data."
+        )
+
+    expected_c, expected_h, expected_w = input_shape
+    total_expected = expected_c * expected_h * expected_w
+    if total_expected != n_features:
+        raise ValueError(
+            "input_shape product does not match n_features: "
+            f"{total_expected} (from {input_shape}) vs {n_features}."
+        )
+
+    original_dim = x.dim()
+    if original_dim == 1:
+        x = x.unsqueeze(0)
+    if x.dim() == 3:
+        x = x.unsqueeze(0)
+    if x.dim() != 4 and x.dim() != 2:
+        raise ValueError(
+            "Unsupported input tensor shape. Expected flattenable tensor or 3/4D image tensor."
+        )
+
+    if x.dim() == 2:
+        if x.shape[1] != n_features:
+            raise ValueError(
+                f"Expected flattened tensor with {n_features} features, got {x.shape[1]}."
+            )
+        return x
+
+    x = _adjust_channels_batch(x, expected_c, auto_expand_grayscale, allow_channel_reduce)
+    x = _resize_spatial(x, expected_h, expected_w)
+    flat = x.reshape(x.shape[0], -1)
+    if flat.shape[1] != n_features:
+        raise ValueError(
+            "Flattened tensor does not match expected feature dimension "
+            f"({flat.shape[1]} vs {n_features})."
+        )
+    return flat
 
 
 class FuzzyPatternTM_STE(nn.Module):
@@ -15,12 +117,32 @@ class FuzzyPatternTM_STE(nn.Module):
     - ta_include_neg_inv: [clauses_half, features]
     """
 
-    def __init__(self, n_features: int, n_clauses: int, n_classes: int, tau: float = 0.5):
+    def __init__(
+        self,
+        n_features: int,
+        n_clauses: int,
+        n_classes: int,
+        tau: float = 0.5,
+        *,
+        input_shape: Optional[Tuple[int, int, int]] = None,
+        auto_expand_grayscale: bool = False,
+        allow_channel_reduce: bool = True,
+    ):
         super().__init__()
         self.n_features = n_features
         self.n_clauses = n_clauses
         self.n_classes = n_classes
         self.tau = tau
+        self.input_shape = tuple(input_shape) if input_shape is not None else None
+        self.auto_expand_grayscale = auto_expand_grayscale
+        self.allow_channel_reduce = allow_channel_reduce
+        if self.input_shape is not None:
+            product = self.input_shape[0] * self.input_shape[1] * self.input_shape[2]
+            if product != self.n_features:
+                raise ValueError(
+                    "input_shape product does not equal n_features: "
+                    f"{product} vs {self.n_features}."
+                )
 
         half = n_clauses // 2
         # Parameters as logits -> probabilities via sigmoid
@@ -39,14 +161,21 @@ class FuzzyPatternTM_STE(nn.Module):
         # Straight-through
         return hard + (torch.sigmoid(p) - hard).detach()
 
-    def _clause_products(self, x: torch.Tensor, use_ste: bool = True):
-        """
-        x: [batch, features] in [0,1]
-        Returns:
-            pos_prod: [batch, clauses_half]
-            neg_prod: [batch, clauses_half]
-            clause_outputs: [batch, n_clauses]
-        """
+    def _clause_products(
+        self,
+        x: torch.Tensor,
+        use_ste: bool = True,
+        *,
+        already_flat: bool = False,
+    ):
+        if not already_flat:
+            x = prepare_tm_input(
+                x,
+                n_features=self.n_features,
+                input_shape=self.input_shape,
+                auto_expand_grayscale=self.auto_expand_grayscale,
+                allow_channel_reduce=self.allow_channel_reduce,
+            )
         B, F_ = x.shape
         assert F_ == self.n_features
 
@@ -81,12 +210,19 @@ class FuzzyPatternTM_STE(nn.Module):
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
         """
-        x: [batch, features] in [0,1]
+        x: [batch, features] in [0,1] or image tensor convertible to flattened form.
         Returns:
             logits: [batch, n_classes]
             clause_outputs: [batch, n_clauses]
         """
-        _, _, clause_outputs = self._clause_products(x, use_ste=use_ste)
+        flat_x = prepare_tm_input(
+            x,
+            n_features=self.n_features,
+            input_shape=self.input_shape,
+            auto_expand_grayscale=self.auto_expand_grayscale,
+            allow_channel_reduce=self.allow_channel_reduce,
+        )
+        _, _, clause_outputs = self._clause_products(flat_x, use_ste=use_ste, already_flat=True)
         logits = clause_outputs @ self.voting
         return logits, clause_outputs
 
@@ -135,6 +271,10 @@ class FuzzyPatternTMFPTM(nn.Module):
         n_clauses: int,
         n_classes: int,
         tau: float = 0.5,
+        *,
+        input_shape: Optional[Tuple[int, int, int]] = None,
+        auto_expand_grayscale: bool = False,
+        allow_channel_reduce: bool = True,
         lf: int = 4,
         literal_budget: Optional[int] = None,
         vote_clamp: Optional[float] = None,
@@ -144,6 +284,16 @@ class FuzzyPatternTMFPTM(nn.Module):
         self.n_clauses = n_clauses
         self.n_classes = n_classes
         self.tau = tau
+        self.input_shape = tuple(input_shape) if input_shape is not None else None
+        self.auto_expand_grayscale = auto_expand_grayscale
+        self.allow_channel_reduce = allow_channel_reduce
+        if self.input_shape is not None:
+            product = self.input_shape[0] * self.input_shape[1] * self.input_shape[2]
+            if product != self.n_features:
+                raise ValueError(
+                    "input_shape product does not equal n_features: "
+                    f"{product} vs {self.n_features}."
+                )
         self.lf = lf
         self.literal_budget = literal_budget
         self.vote_clamp = vote_clamp
@@ -184,6 +334,13 @@ class FuzzyPatternTMFPTM(nn.Module):
         return self._straight_relu(raw)
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
+        x = prepare_tm_input(
+            x,
+            n_features=self.n_features,
+            input_shape=self.input_shape,
+            auto_expand_grayscale=self.auto_expand_grayscale,
+            allow_channel_reduce=self.allow_channel_reduce,
+        )
         mask_pos = self._ste_mask(self.ta_pos, self.tau, use_ste)
         mask_neg = self._ste_mask(self.ta_neg, self.tau, use_ste)
         mask_pos_inv = self._ste_mask(self.ta_pos_inv, self.tau, use_ste)

@@ -1,4 +1,4 @@
-from .tm import FuzzyPatternTM_STE, FuzzyPatternTMFPTM
+from .tm import FuzzyPatternTM_STE, FuzzyPatternTMFPTM, prepare_tm_input
 from .deep_tm import DeepTMNetwork
 from .swin_tm import (
     SwinTM,
