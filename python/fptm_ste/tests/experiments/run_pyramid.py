@@ -6,10 +6,24 @@ import argparse
 import json
 import os
 import socket
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable
+
+
+FILE_PATH = Path(__file__).resolve()
+PYTHON_ROOT = FILE_PATH.parents[3]
+if str(PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(PYTHON_ROOT))
+
+
+def canonical_input_size(tm_variant: str) -> Optional[Tuple[int, int]]:
+    variant = tm_variant.lower()
+    if variant in {"swin", "swin_tm", "resnet_tm"}:
+        return (224, 224)
+    return None
 
 import torch
 import torch.distributed as dist
