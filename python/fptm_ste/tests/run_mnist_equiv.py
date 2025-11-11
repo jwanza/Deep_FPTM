@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
 
 from fptm_ste import FuzzyPatternTM_STE, FuzzyPatternTMFPTM
 from fptm_ste.binarizers import CNNSingleBinarizer
@@ -292,6 +293,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional vote clamp for FPTM (set to 'none' to disable).",
     )
     parser.add_argument("--tm-n-clauses", type=int, default=256, help="Number of clauses for TM variants.")
+    parser.add_argument(
+        "--tm-target-channels",
+        type=optional_int_arg,
+        default=None,
+        help="Override the logical TM input channel count (default: dataset channels).",
+    )
+    parser.add_argument(
+        "--tm-target-size",
+        nargs=2,
+        type=int,
+        metavar=("HEIGHT", "WIDTH"),
+        default=None,
+        help="Override the logical TM input spatial size (default: dataset image size).",
+    )
+    parser.add_argument(
+        "--tm-auto-expand-grayscale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically expand single-channel inputs to the requested channel count.",
+    )
+    parser.add_argument(
+        "--tm-allow-channel-reduce",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow collapsing multi-channel inputs to single-channel if requested.",
+    )
 
     # Deep TM options
     parser.add_argument(
@@ -529,6 +556,9 @@ def run_variant_tm(train_loader,
                    tm_literal_budget: Optional[int],
                    tm_vote_clamp: Optional[float],
                    tm_n_clauses: int,
+                   input_shape: Tuple[int, int, int],
+                   auto_expand_grayscale: bool,
+                   allow_channel_reduce: bool,
                    n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
     if tm_impl == "fptm":
@@ -537,6 +567,9 @@ def run_variant_tm(train_loader,
             n_clauses=tm_n_clauses,
             n_classes=n_classes,
             tau=tm_tau,
+            input_shape=input_shape,
+            auto_expand_grayscale=auto_expand_grayscale,
+            allow_channel_reduce=allow_channel_reduce,
             lf=tm_lf,
             literal_budget=tm_literal_budget,
             vote_clamp=tm_vote_clamp,
@@ -549,13 +582,16 @@ def run_variant_tm(train_loader,
             n_clauses=tm_n_clauses,
             n_classes=n_classes,
             tau=tm_tau,
+            input_shape=input_shape,
+            auto_expand_grayscale=auto_expand_grayscale,
+            allow_channel_reduce=allow_channel_reduce,
         ).to(device)
         use_ste_train = False
         label = "STE-TM"
 
     train_acc, test_acc, ttrain, preds = train_tm_model(
         model,
-        flatten_images,
+        lambda t: t,
         train_loader,
         test_loader,
         device,
@@ -584,6 +620,9 @@ def run_variant_deeptm(train_loader,
                        n_clauses: int,
                        dropout: float,
                        tau: float,
+                       input_shape: Tuple[int, int, int],
+                       auto_expand_grayscale: bool,
+                       allow_channel_reduce: bool,
                        n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = DeepTMNetwork(
         input_dim=input_dim,
@@ -592,11 +631,14 @@ def run_variant_deeptm(train_loader,
         n_clauses=n_clauses,
         dropout=dropout,
         tau=tau,
+        input_shape=input_shape,
+        auto_expand_grayscale=auto_expand_grayscale,
+        allow_channel_reduce=allow_channel_reduce,
     ).to(device)
     label = "Deep-TM"
     train_acc, test_acc, ttrain, preds = train_tm_model(
         model,
-        flatten_images,
+        lambda t: t,
         train_loader,
         test_loader,
         device,
@@ -819,6 +861,20 @@ def main(argv: Optional[List[str]] = None):
         persistent_workers = False
 
     transform = dataset_cfg["transform"]
+    target_channels = args.tm_target_channels if args.tm_target_channels is not None else dataset_cfg["input_channels"]
+    target_size = tuple(args.tm_target_size) if args.tm_target_size is not None else tuple(dataset_cfg["image_size"])
+    if transform is None:
+        transform_steps: List[Any] = []
+    elif isinstance(transform, transforms.Compose):
+        transform_steps = list(transform.transforms)
+    else:
+        transform_steps = [transform]
+    if tuple(dataset_cfg["image_size"]) != target_size:
+        transform_steps.insert(0, transforms.Resize(target_size, interpolation=InterpolationMode.BICUBIC, antialias=True))
+    if not transform_steps:
+        transform_steps.append(transforms.ToTensor())
+    transform = transforms.Compose(transform_steps)
+
     with profile_block("load-dataset"):
         train_ds = dataset_cfg["train_class"](
             root=args.dataset_root,
@@ -863,9 +919,12 @@ def main(argv: Optional[List[str]] = None):
     if not selected_models:
         raise ValueError("No model variants selected.")
 
-    input_channels = dataset_cfg["input_channels"]
-    image_h, image_w = dataset_cfg["image_size"]
+    input_channels = target_channels
+    image_h, image_w = target_size
     flat_dim = input_channels * image_h * image_w
+    tm_input_shape = (input_channels, image_h, image_w)
+    tm_auto_expand = args.tm_auto_expand_grayscale
+    tm_allow_reduce = args.tm_allow_channel_reduce
 
     hidden_dims = parse_int_list(args.deeptm_hidden_dims)
     if not hidden_dims:
@@ -891,6 +950,9 @@ def main(argv: Optional[List[str]] = None):
                     tm_literal_budget=args.tm_literal_budget,
                     tm_vote_clamp=args.tm_vote_clamp,
                     tm_n_clauses=args.tm_n_clauses,
+                    input_shape=tm_input_shape,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
                 )
                 variant_classes = args.num_classes
@@ -908,6 +970,9 @@ def main(argv: Optional[List[str]] = None):
                     n_clauses=args.deeptm_n_clauses,
                     dropout=args.deeptm_dropout,
                     tau=args.deeptm_tau,
+                    input_shape=tm_input_shape,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
                 )
                 variant_classes = args.num_classes
