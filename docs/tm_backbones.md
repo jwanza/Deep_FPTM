@@ -39,6 +39,12 @@
 - ResNetTM: Sigmoid-projected TM outputs combined with linear projectors ensure smooth gradients; residual paths remain contiguous to avoid version skew.
 - Both backbones share the STE annealing utilities (`anneal_ste_factor`) so τ schedules impact every TM layer uniformly.
 
+## TM Transformer Upgrades
+- `UnifiedTMTransformer` now operates on images with configurable ViT or Swin-style scaffolds, patch embedding, and drop-path schedules.
+- Feed-forward TM blocks can switch between STE and DeepTM backends (`backend={ste,deeptm}`) while keeping clause budgets per stage.
+- Runner CLI exposes knobs such as `--transformer-arch`, `--transformer-patch`, `--transformer-depths`, `--transformer-drop-path`, and backend selection.
+- Training hooks add RandAugment, Mixup/CutMix, gradient checkpointing, and optional EMA updates for stability.
+
 ## Current Status
 - Unit tests (`test_tm_backbones.py`) validate forward/backward consistency for minimal SwinTM and ResNetTM instances.
 - Smoke runs (`run_pyramid.py`) confirm training loop compatibility; stage accuracy and attention metrics logged for SwinTM and ResNetTM variants.

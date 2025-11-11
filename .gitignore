@@ -27,8 +27,8 @@ tmp/
 *.log
 
 # Datasets and large artefacts
-datasets/
-data/
+./datasets/
+./data/
 
 # Local automation / runners
 actions-runner/

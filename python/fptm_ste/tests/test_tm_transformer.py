@@ -9,10 +9,44 @@ def test_tm_transformer_block():
     assert y.shape == x.shape
 
 
-def test_unified_tm_transformer():
-    model = UnifiedTMTransformer(vocab_size=100, d_model=64, n_heads=4, num_layers=2, max_len=32, n_clauses=50)
-    x = torch.randint(0, 100, (2, 16))
-    y = model(x, use_ste=True)
-    assert y.shape == (2, 16, 100)
+def test_unified_tm_transformer_vit():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=64,
+        depths=2,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=64,
+    )
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+    logits.sum().backward()
+
+
+def test_unified_tm_transformer_swin_deeptm():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="swin",
+        backend="deeptm",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=(32, 64),
+        depths=(1, 1),
+        num_heads=(2, 4),
+        mlp_ratio=(2.0, 2.0),
+        tm_clauses=(32, 32),
+        window_size=4,
+    )
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+    logits.sum().backward()
 
 

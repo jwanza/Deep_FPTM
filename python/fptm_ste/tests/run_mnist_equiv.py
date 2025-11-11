@@ -12,10 +12,13 @@ import json
 import os
 import resource
 import time
+import math
+import copy
+from dataclasses import replace
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -29,7 +32,12 @@ from fptm_ste.binarizers import CNNSingleBinarizer
 from fptm_ste.deep_tm import DeepTMNetwork
 from fptm_ste.export import export_compiled_to_json
 from fptm_ste.tm_transformer import UnifiedTMTransformer
-from fptm_ste.datasets import prepare_fashion_augmented_bundle
+from fptm_ste.datasets import (
+    DEFAULT_PREPROCESS_CONFIGS,
+    PreprocessConfig,
+    prepare_boolean_feature_bundle,
+    prepare_fashion_augmented_bundle,
+)
 
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
@@ -128,6 +136,11 @@ def optional_float_arg(value: str) -> Optional[float]:
 def parse_int_list(value: str) -> List[int]:
     parts = [p.strip() for p in value.split(",")]
     return [int(p) for p in parts if p]
+
+
+def parse_float_list(value: str) -> List[float]:
+    parts = [p.strip() for p in value.split(",")]
+    return [float(p) for p in parts if p]
 
 
 def maybe_set_seed(seed: Optional[int]):
@@ -272,7 +285,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tm-feature-mode",
-        choices=["raw", "fashion_aug"],
+        choices=["raw", "fashion_aug", "conv"],
         default=os.environ.get("TM_MNIST_FEATURE_MODE", "raw"),
         help="Feature preprocessing pipeline for TM variants.",
     )
@@ -280,6 +293,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tm-feature-cache",
         default=os.environ.get("TM_FEATURE_CACHE_DIR", "/tmp/fptm_features"),
         help="Directory used to cache booleanised TM feature datasets.",
+    )
+    parser.add_argument(
+        "--tm-feature-config",
+        default=None,
+        help="Name of predefined TM feature preprocessing config (defaults to dataset).",
+    )
+    parser.add_argument(
+        "--tm-feature-size",
+        nargs=2,
+        type=int,
+        metavar=("HEIGHT", "WIDTH"),
+        default=None,
+        help="Override TM feature preprocessing target size.",
+    )
+    parser.add_argument(
+        "--tm-feature-grayscale",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force grayscale conversion in TM feature preprocessing.",
     )
     parser.add_argument(
         "--tm-feature-batch",
@@ -395,6 +427,62 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of clauses used in transformer TM heads.",
     )
     parser.add_argument(
+        "--transformer-arch",
+        choices=["vit", "swin"],
+        default="vit",
+        help="Top-level transformer architecture to instantiate.",
+    )
+    parser.add_argument(
+        "--transformer-patch",
+        type=int,
+        default=4,
+        help="Patch size for vision transformer variants.",
+    )
+    parser.add_argument(
+        "--transformer-depths",
+        default=None,
+        help="Comma separated stage depths (Swin) or integer for ViT.",
+    )
+    parser.add_argument(
+        "--transformer-stage-heads",
+        default=None,
+        help="Comma separated attention heads per stage (Swin only).",
+    )
+    parser.add_argument(
+        "--transformer-embed-dims",
+        default=None,
+        help="Comma separated embed dimensions per stage (Swin only).",
+    )
+    parser.add_argument(
+        "--transformer-mlp-ratio",
+        default="4.0",
+        help="MLP ratio (float or comma separated per stage).",
+    )
+    parser.add_argument(
+        "--transformer-window",
+        type=int,
+        default=7,
+        help="Window size for Swin-style attention.",
+    )
+    parser.add_argument(
+        "--transformer-drop-path",
+        type=float,
+        default=0.1,
+        help="Maximum drop-path rate across transformer layers.",
+    )
+    parser.add_argument(
+        "--transformer-use-cls",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use CLS token for ViT pooling.",
+    )
+    parser.add_argument(
+        "--transformer-pool",
+        choices=["cls", "mean"],
+        default="cls",
+        help="Pooling strategy for ViT outputs.",
+    )
+    parser.add_argument(
         "--transformer-backend",
         choices=["ste", "deeptm"],
         default="ste",
@@ -411,6 +499,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Dropout probability for transformer attention and TM replacements.",
+    )
+    parser.add_argument(
+        "--transformer-ema-decay",
+        type=float,
+        default=0.0,
+        help="EMA decay for transformer weights (0 disables EMA).",
+    )
+    parser.add_argument(
+        "--transformer-grad-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable gradient checkpointing inside transformer blocks.",
+    )
+    parser.add_argument(
+        "--randaugment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply RandAugment to training images.",
+    )
+    parser.add_argument(
+        "--randaugment-n",
+        type=int,
+        default=2,
+        help="RandAugment number of transformations per image.",
+    )
+    parser.add_argument(
+        "--randaugment-m",
+        type=int,
+        default=9,
+        help="RandAugment magnitude (severity).",
+    )
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=0.0,
+        help="Mixup alpha value (0 disables Mixup).",
+    )
+    parser.add_argument(
+        "--cutmix-alpha",
+        type=float,
+        default=0.0,
+        help="CutMix alpha value (0 disables CutMix).",
     )
 
     return parser
@@ -456,6 +586,49 @@ def flatten_images(x: torch.Tensor) -> torch.Tensor:
     return x.view(x.size(0), -1)
 
 
+def rand_bbox(size: torch.Size, lam: float, device: torch.device) -> Tuple[int, int, int, int]:
+    B, C, H, W = size
+    cut_rat = math.sqrt(1.0 - lam)
+    cut_h = int(H * cut_rat)
+    cut_w = int(W * cut_rat)
+    cy = torch.randint(0, H, (1,), device=device).item()
+    cx = torch.randint(0, W, (1,), device=device).item()
+    y1 = max(0, cy - cut_h // 2)
+    y2 = min(H, cy + cut_h // 2)
+    x1 = max(0, cx - cut_w // 2)
+    x2 = min(W, cx + cut_w // 2)
+    return y1, y2, x1, x2
+
+
+def apply_mixup_cutmix(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[float], str]:
+    if mixup_alpha <= 0 and cutmix_alpha <= 0:
+        return inputs, targets, targets, None, "none"
+
+    use_cuda = inputs.is_cuda
+    if mixup_alpha > 0 and cutmix_alpha > 0:
+        choose_mixup = torch.rand(1, device=inputs.device if use_cuda else None).item() < 0.5
+    else:
+        choose_mixup = mixup_alpha > 0
+
+    perm = torch.randperm(inputs.size(0), device=inputs.device if use_cuda else None)
+    if choose_mixup:
+        lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
+        mixed = lam * inputs + (1 - lam) * inputs[perm]
+        return mixed, targets, targets[perm], lam, "mixup"
+
+    lam = torch.distributions.Beta(cutmix_alpha, cutmix_alpha).sample().item()
+    y1, y2, x1, x2 = rand_bbox(inputs.size(), lam, inputs.device)
+    inputs_clone = inputs.clone()
+    inputs_clone[:, :, y1:y2, x1:x2] = inputs[perm, :, y1:y2, x1:x2]
+    lam = 1 - ((y2 - y1) * (x2 - x1) / (inputs.size(-1) * inputs.size(-2)))
+    return inputs_clone, targets, targets[perm], lam, "cutmix"
+
+
 def save_bool_dataset(train_loader, test_loader, train_path: str, test_path: str, thr: float = 0.5):
     if os.path.exists(train_path) and os.path.exists(test_path):
         print(f"  boolean datasets cached: {train_path}, {test_path}")
@@ -489,7 +662,8 @@ def evaluate_model(model: nn.Module,
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             xb = prepare_fn(x)
-            logits, _ = model(xb, use_ste=use_ste)
+            outputs = model(xb, use_ste=use_ste)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
             pred = logits.argmax(dim=1)
             if collect_preds:
                 preds.extend(pred.cpu().tolist())
@@ -528,7 +702,8 @@ def train_tm_model(model: nn.Module,
             xb = prepare_fn(x)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                logits, _ = model(xb, use_ste=use_ste_train)
+                outputs = model(xb, use_ste=use_ste_train)
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
                 loss = F.cross_entropy(logits, y)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -801,58 +976,55 @@ def run_variant_transformer(train_loader,
                             report_train_acc: bool,
                             report_epoch_acc: bool,
                             report_epoch_test: bool,
-                            vocab_size: int,
-                            d_model: int,
-                            n_heads: int,
-                            num_layers: int,
-                            n_clauses: int,
-                            max_len: int,
+                            num_classes: int,
+                            architecture: str,
                             backend: str,
-                            dim_feedforward: int,
+                            image_size: Tuple[int, int],
+                            in_channels: int,
+                            patch_size: int,
+                            depths: Union[int, Sequence[int]],
+                            embed_dims: Union[int, Sequence[int]],
+                            num_heads: Union[int, Sequence[int]],
+                            mlp_ratio: Union[float, Sequence[float]],
+                            window_size: int,
+                            drop_path: float,
                             dropout: float,
+                            tm_clauses: Union[int, Sequence[int]],
                             tm_tau: float,
+                            use_cls_token: bool,
+                            pool: str,
+                            grad_checkpoint: bool,
+                            ema_decay: float,
+                            mixup_alpha: float,
+                            cutmix_alpha: float,
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
-    def eval_transformer(model: nn.Module,
-                         loader: DataLoader,
-                         device: torch.device,
-                         *,
-                         collect_preds: bool) -> Tuple[float, List[int]]:
-        was_training = model.training
-        model.eval()
-        preds: List[int] = [] if collect_preds else []
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for x, y in loader:
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                tokens = (x.view(x.size(0), -1) * 255).long()
-                logits = model(tokens, use_ste=True)
-                pred = logits[:, -1, :].argmax(dim=1)
-                if collect_preds:
-                    preds.extend(pred.cpu().tolist())
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-        acc = correct / total
-        if was_training:
-            model.train()
-        return acc, preds
     model = UnifiedTMTransformer(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        n_heads=n_heads,
-        num_layers=num_layers,
-        max_len=max_len,
-        n_clauses=n_clauses,
+        num_classes=num_classes,
+        architecture=architecture,
         backend=backend,
-        dim_feedforward=dim_feedforward,
-        dropout=dropout,
+        image_size=image_size,
+        in_channels=in_channels,
+        patch_size=patch_size,
+        embed_dim=embed_dims,
+        depths=depths,
+        num_heads=num_heads,
+        mlp_ratio=mlp_ratio,
+        tm_clauses=tm_clauses,
         tm_tau=tm_tau,
+        drop_rate=dropout,
+        attn_drop_rate=dropout,
+        drop_path_rate=drop_path,
+        window_size=window_size,
+        use_cls_token=use_cls_token,
+        pool=pool,
+        grad_checkpoint=grad_checkpoint,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=7e-4, weight_decay=1e-5)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    ema_model = copy.deepcopy(model) if ema_decay > 0 else None
     start = time.time()
     last_train_acc: Optional[float] = None
-    label = "Transformer"
+    label = f"Transformer-{architecture.upper()}"
     for epoch in range(epochs):
         model.train()
         epoch_start = time.time()
@@ -861,19 +1033,26 @@ def run_variant_transformer(train_loader,
         epoch_total = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            tokens = (x.view(x.size(0), -1) * 255).long()
+            x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_alpha, cutmix_alpha)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                logits = model(tokens, use_ste=True)
-                loss = F.cross_entropy(logits[:, -1, :], y)
+                logits = model(x_aug, use_ste=True)
+                if lam is not None:
+                    loss = lam * F.cross_entropy(logits, targets_a) + (1 - lam) * F.cross_entropy(logits, targets_b)
+                else:
+                    loss = F.cross_entropy(logits, y)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(opt)
             scaler.update()
+            if ema_model is not None:
+                with torch.no_grad():
+                    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+                        ema_param.data.mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
             running_loss += loss.item()
             if report_train_acc:
-                preds = logits[:, -1, :].argmax(dim=1)
+                preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
         dur = time.time() - epoch_start
@@ -884,7 +1063,17 @@ def run_variant_transformer(train_loader,
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
         if report_epoch_test:
-            epoch_test_acc, _ = eval_transformer(model, test_loader, device, collect_preds=False)
+            eval_model = ema_model if ema_model is not None else model
+            eval_model.eval()
+            epoch_test_acc, _ = evaluate_model(
+                eval_model,
+                lambda t: t,
+                test_loader,
+                device,
+                use_ste=True,
+                collect_preds=False,
+            )
+            eval_model.train()
         log_msg = f"  {label:12s} epoch {epoch + 1:02d}/{epochs:02d} | loss={avg_loss:.4f}"
         if epoch_acc is not None and report_epoch_acc:
             log_msg += f" | train_acc={epoch_acc:.4f}"
@@ -893,7 +1082,8 @@ def run_variant_transformer(train_loader,
         log_msg += f" | {dur:4.1f}s"
         print(log_msg)
     train_time = time.time() - start
-    test_acc, preds = eval_transformer(model, test_loader, device, collect_preds=True)
+    eval_model = ema_model if ema_model is not None else model
+    test_acc, preds = evaluate_model(eval_model, lambda t: t, test_loader, device, use_ste=True)
     return label, last_train_acc, test_acc, train_time, preds, None
 
 
@@ -948,7 +1138,10 @@ def main(argv: Optional[List[str]] = None):
         transform_steps = [transform]
     if tuple(dataset_cfg["image_size"]) != target_size:
         transform_steps.insert(0, transforms.Resize(target_size, interpolation=InterpolationMode.BICUBIC, antialias=True))
-    if not transform_steps:
+    if args.randaugment:
+        transform_steps.insert(0, transforms.RandAugment(num_ops=args.randaugment_n, magnitude=args.randaugment_m))
+    has_tensor = any(isinstance(t, transforms.ToTensor) for t in transform_steps)
+    if not has_tensor:
         transform_steps.append(transforms.ToTensor())
     transform = transforms.Compose(transform_steps)
 
@@ -996,7 +1189,7 @@ def main(argv: Optional[List[str]] = None):
     tm_bundle = None
     tm_train_loader = train_loader
     tm_test_loader = test_loader
-    tm_prepare_fn: Callable[[torch.Tensor], torch.Tensor] = flatten_images
+    tm_prepare_fn: Callable[[torch.Tensor], torch.Tensor] = lambda t: t
 
     selected_models = tuple(args.models or DEFAULT_MODELS)
     if not selected_models:
@@ -1011,15 +1204,26 @@ def main(argv: Optional[List[str]] = None):
     tm_allow_reduce = args.tm_allow_channel_reduce
     tm_n_features = flat_dim
 
-    if tm_feature_mode == "fashion_aug":
-        if dataset_key != "fashionmnist":
-            raise ValueError("--tm-feature-mode=fashion_aug is only supported for Fashion-MNIST.")
+    feature_mode = "conv" if tm_feature_mode == "fashion_aug" else tm_feature_mode
+
+    if feature_mode == "conv":
+        config_name = args.tm_feature_config or dataset_key
+        if config_name not in DEFAULT_PREPROCESS_CONFIGS:
+            raise ValueError(
+                f"No TM preprocessing config named '{config_name}'. Available: {', '.join(DEFAULT_PREPROCESS_CONFIGS)}."
+            )
+        base_config = DEFAULT_PREPROCESS_CONFIGS[config_name]
+        if args.tm_feature_size is not None:
+            base_config = replace(base_config, image_size=tuple(args.tm_feature_size))
+        if args.tm_feature_grayscale is not None:
+            base_config = replace(base_config, to_grayscale=args.tm_feature_grayscale)
         cache_dir = Path(args.tm_feature_cache)
         with profile_block("prepare-fashion-augmented-features"):
-            tm_bundle = prepare_fashion_augmented_bundle(
+            tm_bundle = prepare_boolean_feature_bundle(
                 train_ds,
                 test_ds,
                 cache_dir,
+                config=base_config,
                 batch_size=args.tm_feature_batch,
                 force=args.tm_feature_force,
                 apply_augmentations=args.tm_augment,
@@ -1043,7 +1247,7 @@ def main(argv: Optional[List[str]] = None):
         tm_prepare_fn = lambda t: t
         tm_n_features = tm_bundle.num_bits
         tm_input_shape_active = None
-    elif tm_feature_mode == "raw":
+    elif feature_mode == "raw":
         tm_input_shape_active = tm_input_shape
         tm_prepare_fn = flatten_images
     else:
@@ -1054,6 +1258,32 @@ def main(argv: Optional[List[str]] = None):
     deeptm_prepare_fn = tm_prepare_fn
     deeptm_input_dim = tm_n_features
     deeptm_input_shape_active = tm_input_shape_active
+
+    if args.transformer_arch == "vit":
+        mlp_vals = parse_float_list(args.transformer_mlp_ratio)
+        transformer_mlp_cfg: Union[float, Tuple[float, ...]] = mlp_vals[0] if mlp_vals else float(args.transformer_mlp_ratio)
+        transformer_depths_cfg: Union[int, Tuple[int, ...]] = args.transformer_layers
+        transformer_heads_cfg: Union[int, Tuple[int, ...]] = args.transformer_heads
+        transformer_embed_cfg: Union[int, Tuple[int, ...]] = int(args.transformer_d_model)
+        transformer_tm_clauses_cfg: Union[int, Tuple[int, ...]] = args.transformer_clauses
+    else:
+        depth_list = parse_int_list(args.transformer_depths) if args.transformer_depths else [2, 2, 6, 2]
+        head_list = parse_int_list(args.transformer_stage_heads) if args.transformer_stage_heads else [3, 6, 12, 24][: len(depth_list)]
+        embed_list = (
+            parse_int_list(args.transformer_embed_dims)
+            if args.transformer_embed_dims
+            else [int(args.transformer_d_model) * (2 ** i) for i in range(len(depth_list))]
+        )
+        mlp_list = parse_float_list(args.transformer_mlp_ratio)
+        if not mlp_list:
+            mlp_list = [4.0] * len(depth_list)
+        while len(mlp_list) < len(depth_list):
+            mlp_list.append(mlp_list[-1])
+        transformer_depths_cfg = tuple(depth_list)
+        transformer_heads_cfg = tuple(head_list)
+        transformer_embed_cfg = tuple(embed_list)
+        transformer_mlp_cfg = tuple(mlp_list)
+        transformer_tm_clauses_cfg = tuple([int(args.transformer_clauses)] * len(depth_list))
 
     hidden_dims = parse_int_list(args.deeptm_hidden_dims)
     if not hidden_dims:
@@ -1133,16 +1363,27 @@ def main(argv: Optional[List[str]] = None):
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
                     report_epoch_test=args.report_epoch_test,
-                    vocab_size=args.transformer_vocab,
-                    d_model=args.transformer_d_model,
-                    n_heads=args.transformer_heads,
-                    num_layers=args.transformer_layers,
-                    n_clauses=args.transformer_clauses,
-                    max_len=flat_dim,
+                    num_classes=args.num_classes,
+                    architecture=args.transformer_arch,
                     backend=args.transformer_backend,
-                    dim_feedforward=args.transformer_ff,
+                    image_size=target_size,
+                    in_channels=input_channels,
+                    patch_size=args.transformer_patch,
+                    depths=transformer_depths_cfg,
+                    embed_dims=transformer_embed_cfg,
+                    num_heads=transformer_heads_cfg,
+                    mlp_ratio=transformer_mlp_cfg,
+                    window_size=args.transformer_window,
+                    drop_path=args.transformer_drop_path,
                     dropout=args.transformer_dropout,
+                    tm_clauses=transformer_tm_clauses_cfg,
                     tm_tau=args.tm_tau,
+                    use_cls_token=args.transformer_use_cls,
+                    pool=args.transformer_pool,
+                    grad_checkpoint=args.transformer_grad_checkpoint,
+                    ema_decay=args.transformer_ema_decay,
+                    mixup_alpha=args.mixup_alpha,
+                    cutmix_alpha=args.cutmix_alpha,
                 )
                 variant_classes = args.num_classes
             else:
@@ -1181,6 +1422,7 @@ def main(argv: Optional[List[str]] = None):
                     "test_path": str(tm_bundle.test_dataset.data_path),
                     "num_bits": tm_bundle.num_bits,
                     "augmentations": tm_bundle.augmentation_names,
+                    "config": tm_bundle.config_name,
                 }
 
     output_dir = os.path.dirname(args.output_json)
