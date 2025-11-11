@@ -677,12 +677,13 @@ def run_variant_deeptm(train_loader,
                        report_train_acc: bool,
                        report_epoch_acc: bool,
                        report_epoch_test: bool,
+                       prepare_fn: Callable[[torch.Tensor], torch.Tensor],
                        input_dim: int,
                        hidden_dims: List[int],
                        n_clauses: int,
                        dropout: float,
                        tau: float,
-                       input_shape: Tuple[int, int, int],
+                       input_shape: Optional[Tuple[int, int, int]],
                        auto_expand_grayscale: bool,
                        allow_channel_reduce: bool,
                        n_classes: int = 10) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
@@ -700,7 +701,7 @@ def run_variant_deeptm(train_loader,
     label = "Deep-TM"
     train_acc, test_acc, ttrain, preds = train_tm_model(
         model,
-        lambda t: t,
+        prepare_fn,
         train_loader,
         test_loader,
         device,
@@ -1044,9 +1045,15 @@ def main(argv: Optional[List[str]] = None):
         tm_input_shape_active = None
     elif tm_feature_mode == "raw":
         tm_input_shape_active = tm_input_shape
-        tm_prepare_fn = lambda t: t
+        tm_prepare_fn = flatten_images
     else:
         raise ValueError(f"Unknown tm feature mode '{tm_feature_mode}'.")
+
+    deeptm_train_loader = tm_train_loader
+    deeptm_test_loader = tm_test_loader
+    deeptm_prepare_fn = tm_prepare_fn
+    deeptm_input_dim = tm_n_features
+    deeptm_input_shape_active = tm_input_shape_active
 
     hidden_dims = parse_int_list(args.deeptm_hidden_dims)
     if not hidden_dims:
@@ -1081,19 +1088,20 @@ def main(argv: Optional[List[str]] = None):
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
                 label, train_acc, test_acc, train_time, preds, bundle = run_variant_deeptm(
-                    train_loader,
-                    test_loader,
+                    deeptm_train_loader,
+                    deeptm_test_loader,
                     device,
                     epochs=args.epochs,
                     report_train_acc=args.report_train_acc,
                     report_epoch_acc=args.report_epoch_acc,
                     report_epoch_test=args.report_epoch_test,
-                    input_dim=flat_dim,
+                    prepare_fn=deeptm_prepare_fn,
+                    input_dim=deeptm_input_dim,
                     hidden_dims=hidden_dims,
                     n_clauses=args.deeptm_n_clauses,
                     dropout=args.deeptm_dropout,
                     tau=args.deeptm_tau,
-                    input_shape=tm_input_shape,
+                    input_shape=deeptm_input_shape_active,
                     auto_expand_grayscale=tm_auto_expand,
                     allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
