@@ -27,7 +27,7 @@ This guide shows how to launch the upgraded TM transformers, outlines every conf
 | `--randaugment`, `--mixup-alpha`, `--cutmix-alpha` | augmentation toggles |
 
 Additional data-prep knobs:
-- `--tm-feature-mode {raw,fashion_aug,conv}` plus `--tm-feature-config`, `--tm-feature-size`, `--tm-feature-grayscale` reuse the boolean feature cache utilities from `fptm_ste.datasets`.
+- `--tm-feature-mode` with presets from `fptm_ste.datasets`, plus `--tm-feature-config`, `--tm-feature-size`, `--tm-feature-grayscale`, reuse cached boolean TM features when needed.
 
 ## 3. Example Commands
 
@@ -72,39 +72,39 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 ### 4.1 Architecture & Tokenisation
 - **Mode (`--transformer-arch`)**: ViT for simplicity or Swin for hierarchical attention that scales to higher resolutions.
 - **Patch size (`--transformer-patch`)**: reduces sequence length. 4×4 or 8×8 for CIFAR; consider 16×16 for 224×224 images.
-- **Depth/Heads/Channels**: use `--transformer-depths`, `--transformer-stage-heads`, `--transformer-embed-dims` (Swin) or `--transformer-layers`, `--transformer-heads` (ViT) to match Tiny/Base/Small footprints.
+- **Depth/Heads/Channels**: `--transformer-depths`, `--transformer-stage-heads`, `--transformer-embed-dims` (Swin) or `--transformer-layers`, `--transformer-heads` (ViT) to match Tiny/Base/Small footprints.
 
 ### 4.2 TM Feed-Forward Backend
-- **Backend switch (`--transformer-backend`)**: `ste` is faster, `deeptm` generally hits higher accuracy.
+- **Backend switch (`--transformer-backend`)**: `ste` = faster, `deeptm` = higher accuracy.
 - **Clause counts (`--transformer-clauses`)**: integer or per-stage tuple to scale clause banks with hidden width.
-- **Temperature (`--tm-tau`)**: default 0.5; consider lower tau when clause counts are large to sharpen activations.
+- **Tau (`--tm-tau`)**: default 0.5; adjust when clause budgets grow to keep gradients stable.
 
 ### 4.3 Attention & Normalisation
 - **Dropout (`--transformer-dropout`)**: general regularisation (0.0–0.1 typical).
-- **Drop-path (`--transformer-drop-path`)**: linearly scheduled from 0 to the provided max; use ≥0.1 on deep Swin stacks.
-- **Window size (`--transformer-window`)**: adjust attention coverage (default 7). Larger windows ↔ more compute.
+- **Drop-path (`--transformer-drop-path`)**: linearly scheduled up to provided max; raise beyond 0.1 for deep Swin stacks.
+- **Window size (`--transformer-window`)**: adjust attention coverage, default 7.
 - **CLS token**: `--transformer-use-cls` and `--transformer-pool` choose between CLS pooling and mean pooling.
 
 ### 4.4 Training-Time Tricks
-- **EMA (`--transformer-ema-decay`)**: 0.995–0.999 stabilizes evaluation with heavy augmentations.
+- **EMA (`--transformer-ema-decay`)**: 0.995–0.999 stabilises evaluation under heavy augmentation.
 - **Gradient checkpointing (`--transformer-grad-checkpoint`)**: saves memory for deep Swin models.
-- **RandAugment (`--randaugment[-n/-m]`)**: mimic ImageNet pipelines (n=2, m=9 default). Increase m carefully to avoid over-regularising small datasets.
-- **Mixup/CutMix (`--mixup-alpha`, `--cutmix-alpha`)**: typical values 0.8 / 1.0; disable on tiny datasets.
-- **Batch size & epochs**: raise epochs (e.g., 100) when heavy aug or DeepTM backend is active.
+- **RandAugment (`--randaugment`, `--randaugment-n`, `--randaugment-m`)**: mimic ImageNet pipelines; defaults are n=2, m=9.
+- **Mixup / CutMix (`--mixup-alpha`, `--cutmix-alpha`)**: typical values 0.8 / 1.0; disable on tiny datasets.
+- **Epochs & batch size**: extend training (≥100 epochs) when augmentations and DeepTM backend are active.
 
 ### 4.5 Boolean Feature Pipelines (Optional)
-- Use `--tm-feature-mode` with presets from `fptm_ste.datasets` to precompute boolean features.
-- `--tm-feature-config` selects dataset-specific configs (e.g., `cifar10`).
-- `--tm-feature-size` and `--tm-feature-grayscale` override per-dataset defaults.
+- `--tm-feature-mode {raw,fashion_aug,conv}` selects raw tensors or cached boolean features.
+- `--tm-feature-config` references presets in `fptm_ste.datasets` (e.g., `cifar10`).
+- `--tm-feature-size`, `--tm-feature-grayscale` override preprocessing resolution and channel handling.
 
 ### 4.6 Optimizer & Precision
-- AdamW is default; adjust global `--lr`, warmup, cosine decay via existing runner flags.
-- AMP is auto-enabled; combine with `--transformer-grad-checkpoint` or reduced batch size for memory-constrained GPUs.
+- AdamW (runner default) with LR schedule flags already in the script (`--lr`, `--min-lr`, `--warmup-epochs`).
+- AMP is automatic. Combine with `--transformer-grad-checkpoint` or reduced batch size for 16–24 GB GPUs.
 
 ## 5. Practical Tips
-- Increase patch size before shrinking width/depth when memory is tight.
-- Evaluate both STE and DeepTM backends—DeepTM often yields a few extra points at similar clause counts.
-- Use EMA + Mixup/CutMix + RandAugment together for the full SOTA recipe.
-- Drop-path 0.2 mimics Swin-S; ramp up only when you have enough depth.
-- Rerun `pytest python/fptm_ste/tests/test_tm_transformer.py` after adjusting tm_transformer internals.
-- For quick sweeps, start with ViT + STE, then graduate to Swin + DeepTM once hyper-parameters look promising.
+- Increase patch size before shrinking width/depth if you hit memory limits.
+- Evaluate both STE and DeepTM backends—DeepTM typically adds a few points of accuracy.
+- Combine EMA + Mixup/CutMix + RandAugment for SOTA-like recipes.
+- Drop-path ≈0.2 mirrors Swin-S; keep smaller on shallow networks.
+- Run `pytest python/fptm_ste/tests/test_tm_transformer.py` after modifying `tm_transformer.py`.
+- Start with ViT + STE for fast sweeps; graduate to Swin + DeepTM when you’re ready to chase SOTA accuracy.
