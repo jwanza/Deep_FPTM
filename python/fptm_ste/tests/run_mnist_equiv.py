@@ -34,6 +34,7 @@ from fptm_ste.binarizers import CNNSingleBinarizer
 from fptm_ste.deep_tm import DeepTMNetwork
 from fptm_ste.export import export_compiled_to_json
 from fptm_ste.tm_transformer import UnifiedTMTransformer
+from fptm_ste.tm_priors import apply_tm_prior_template
 from fptm_ste.datasets import (
     DEFAULT_PREPROCESS_CONFIGS,
     PreprocessConfig,
@@ -291,6 +292,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr", type=float, default=None, help="Minimum learning rate for cosine decay.")
     parser.add_argument("--warmup-epochs", type=int, default=0, help="Number of warmup epochs before cosine decay.")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay value for AdamW optimizers.")
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing factor applied to cross-entropy losses.",
+    )
+    parser.add_argument(
+        "--tm-prior-template",
+        default="none",
+        choices=["none", "symmetric", "zero"],
+        help="Optional TM prior template applied to clause initialisation.",
+    )
     parser.add_argument("--lr-layer-decay", type=float, default=1.0, help="Layer-wise LR decay factor (set <1 to scale deeper layers).")
     parser.add_argument("--gradient-centralize", action=argparse.BooleanOptionalAction, default=False, help="Apply gradient centralization before optimizer step.")
     parser.add_argument("--num-classes", type=int, default=None, help="Number of target classes.")
@@ -644,6 +657,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["sigmoid", "tanh", "relu"],
         default="sigmoid",
         help="Activation applied to feed-forward gates when enabled.",
+    )
+    parser.add_argument(
+        "--transformer-auto-clause",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Auto-tune transformer clause counts based on diagnostics before training.",
+    )
+    parser.add_argument(
+        "--transformer-clause-target",
+        type=int,
+        default=0,
+        help="Optional total clause budget to enforce during auto clause tuning (0 keeps scaled totals).",
+    )
+    parser.add_argument(
+        "--transformer-auto-clause-batches",
+        type=int,
+        default=4,
+        help="Number of mini-batches sampled when estimating diagnostics for clause auto-tuning.",
     )
     parser.add_argument(
         "--transformer-layerscale-init",
@@ -1056,6 +1087,7 @@ def evaluate_transformer_components(
     device: torch.device,
     *,
     collect_preds: bool = True,
+    max_batches: Optional[int] = None,
 ) -> Tuple[float, Dict[str, float], List[int]]:
     was_training = model.training
     model.eval()
@@ -1065,7 +1097,7 @@ def evaluate_transformer_components(
     component_total: Dict[str, int] = defaultdict(int)
     preds: List[int] = []
     with torch.no_grad():
-        for x, y in loader:
+        for batch_idx, (x, y) in enumerate(loader, start=1):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             outputs = model(x, use_ste=True, collect_diagnostics=True)
@@ -1082,6 +1114,8 @@ def evaluate_transformer_components(
                 comp_pred = comp_logits.argmax(dim=1)
                 component_correct[name] += (comp_pred == y).sum().item()
                 component_total[name] += y.size(0)
+            if max_batches is not None and batch_idx >= max_batches:
+                break
     if was_training:
         model.train()
     final_acc = total_correct / total if total > 0 else 0.0
@@ -1090,6 +1124,113 @@ def evaluate_transformer_components(
         for name in sorted(component_correct)
     }
     return final_acc, component_acc, preds
+
+
+def _vit_clause_list(tm_clauses: Union[int, Sequence[int]], depth: int) -> List[int]:
+    if isinstance(tm_clauses, Sequence) and not isinstance(tm_clauses, (str, bytes)):
+        clause_list = [int(max(1, c)) for c in tm_clauses]
+        if len(clause_list) != depth:
+            if len(clause_list) == 0:
+                clause_list = [1] * depth
+            else:
+                clause_list = (clause_list + [clause_list[-1]])[:depth]
+    else:
+        clause_list = [int(max(1, tm_clauses))] * depth
+    return clause_list
+
+
+def _format_vit_clause_counts(new_counts: List[int], original: Union[int, Sequence[int]]) -> Union[int, Tuple[int, ...]]:
+    new_counts = [int(max(1, c)) for c in new_counts]
+    if isinstance(original, Sequence) and not isinstance(original, (str, bytes)):
+        return tuple(new_counts)
+    return int(sum(new_counts) / max(1, len(new_counts)))
+
+
+def _collect_stage_accuracies(
+    component_acc: Dict[str, float],
+    architecture: str,
+    depths: Union[int, Sequence[int]],
+) -> List[float]:
+    if architecture == "vit":
+        depth = depths if isinstance(depths, int) else (sum(depths) if depths else 0)
+        return [component_acc.get(f"block_{i + 1}", 0.0) for i in range(depth)]
+    stage_depths = list(depths) if isinstance(depths, Sequence) else [int(depths)]
+    stage_scores: List[float] = []
+    for stage_idx, stage_depth in enumerate(stage_depths):
+        block_scores = [
+            component_acc.get(f"stage{stage_idx + 1}_block{block_idx + 1}", 0.0) for block_idx in range(stage_depth)
+        ]
+        if block_scores:
+            stage_scores.append(sum(block_scores) / len(block_scores))
+        else:
+            stage_scores.append(0.0)
+    return stage_scores
+
+
+def _scale_clause_counts(
+    base_counts: List[int],
+    accuracies: List[float],
+    clause_target: int,
+) -> List[int]:
+    target_acc = 0.75
+    new_counts: List[int] = []
+    for base, acc in zip(base_counts, accuracies):
+        factor = 1.0 + (target_acc - acc)
+        factor = max(0.5, min(1.5, factor))
+        new_counts.append(max(8, int(round(base * factor))))
+    if clause_target > 0:
+        total = sum(new_counts)
+        if total > 0:
+            scale = clause_target / total
+            new_counts = [max(8, int(round(c * scale))) for c in new_counts]
+    return new_counts
+
+
+def auto_tune_transformer_clauses(
+    *,
+    model_kwargs: Dict[str, Any],
+    tm_clauses: Union[int, Sequence[int]],
+    depths: Union[int, Sequence[int]],
+    architecture: str,
+    train_loader: DataLoader,
+    device: torch.device,
+    auto_batches: int,
+    clause_target: int,
+    tm_prior_template: str,
+) -> Union[int, Tuple[int, ...]]:
+    if not auto_batches or auto_batches <= 0:
+        return tm_clauses
+    temp_kwargs = dict(model_kwargs)
+    temp_kwargs["tm_clauses"] = tm_clauses
+    temp_model = UnifiedTMTransformer(**temp_kwargs).to(device)
+    apply_tm_prior_template(temp_model, tm_prior_template)
+    _, component_acc, _ = evaluate_transformer_components(
+        temp_model, train_loader, device, collect_preds=False, max_batches=auto_batches
+    )
+    del temp_model
+    torch.cuda.empty_cache()
+
+    if architecture == "vit":
+        depth = depths if isinstance(depths, int) else (sum(depths) if depths else 0)
+        base_counts = _vit_clause_list(tm_clauses, depth)
+        accuracies = _collect_stage_accuracies(component_acc, architecture, depths)
+        new_counts = _scale_clause_counts(base_counts, accuracies, clause_target)
+        return _format_vit_clause_counts(new_counts, tm_clauses)
+
+    # Swin-style: per-stage clause counts
+    stage_depths = list(depths) if isinstance(depths, Sequence) else [int(depths)]
+    if isinstance(tm_clauses, Sequence) and not isinstance(tm_clauses, (str, bytes)):
+        base_counts = [int(max(1, c)) for c in tm_clauses]
+        if len(base_counts) != len(stage_depths):
+            if len(base_counts) == 0:
+                base_counts = [64] * len(stage_depths)
+            else:
+                base_counts = (base_counts + [base_counts[-1]])[: len(stage_depths)]
+    else:
+        base_counts = [int(max(1, tm_clauses))] * len(stage_depths)
+    accuracies = _collect_stage_accuracies(component_acc, architecture, stage_depths)
+    new_counts = _scale_clause_counts(base_counts, accuracies, clause_target)
+    return tuple(int(max(1, c)) for c in new_counts)
 
 
 def train_tm_model(model: nn.Module,
@@ -1109,7 +1250,8 @@ def train_tm_model(model: nn.Module,
                    min_lr: float,
                    warmup_epochs: int,
                    weight_decay: float,
-                   gradient_centralize: bool = False) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   gradient_centralize: bool = False,
+                   label_smoothing: float = 0.0) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -1130,7 +1272,7 @@ def train_tm_model(model: nn.Module,
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 outputs = model(xb, use_ste=use_ste_train)
                 logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                loss = F.cross_entropy(logits, y)
+                loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -1240,7 +1382,9 @@ def run_variant_tm(train_loader,
                    min_lr: float = 1e-3,
                    warmup_epochs: int = 0,
                    weight_decay: float = 1e-5,
-                   gradient_centralize: bool = False) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                   gradient_centralize: bool = False,
+                   label_smoothing: float = 0.0,
+                   tm_prior_template: str = "none") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
     if tm_impl == "fptm":
         model = FuzzyPatternTMFPTM(
@@ -1270,6 +1414,8 @@ def run_variant_tm(train_loader,
         use_ste_train = False
         label = "STE-TM"
 
+    apply_tm_prior_template(model, tm_prior_template)
+
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
         prepare_fn,
@@ -1288,6 +1434,7 @@ def run_variant_tm(train_loader,
         warmup_epochs=warmup_epochs,
         weight_decay=weight_decay,
         gradient_centralize=gradient_centralize,
+        label_smoothing=label_smoothing,
     )
     bundle = model.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
@@ -1315,7 +1462,9 @@ def run_variant_deeptm(train_loader,
                        min_lr: float = 1e-3,
                        warmup_epochs: int = 0,
                        weight_decay: float = 1e-5,
-                       gradient_centralize: bool = False) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       gradient_centralize: bool = False,
+                       label_smoothing: float = 0.0,
+                       tm_prior_template: str = "none") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = DeepTMNetwork(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -1327,6 +1476,7 @@ def run_variant_deeptm(train_loader,
         auto_expand_grayscale=auto_expand_grayscale,
         allow_channel_reduce=allow_channel_reduce,
     ).to(device)
+    apply_tm_prior_template(model, tm_prior_template)
     label = "Deep-TM"
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
@@ -1346,6 +1496,7 @@ def run_variant_deeptm(train_loader,
         warmup_epochs=warmup_epochs,
         weight_decay=weight_decay,
         gradient_centralize=gradient_centralize,
+        label_smoothing=label_smoothing,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
@@ -1367,7 +1518,10 @@ def run_variant_hybrid(train_loader,
                        base_lr: float = 1e-3,
                        min_lr: float = 1e-3,
                        warmup_epochs: int = 0,
-                       weight_decay: float = 1e-5) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       weight_decay: float = 1e-5,
+                       gradient_centralize: bool = False,
+                       label_smoothing: float = 0.0,
+                       tm_prior_template: str = "none") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = CNNHybrid(
         in_channels=in_channels,
         thresholds=thresholds,
@@ -1375,8 +1529,8 @@ def run_variant_hybrid(train_loader,
         n_classes=n_classes,
         tm_tau=tm_tau,
     ).to(device)
-    param_groups = build_param_groups_with_layer_decay(model, base_lr, weight_decay, layer_decay)
-    opt = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
+    apply_tm_prior_template(model.tm, tm_prior_template)
+    opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
@@ -1395,7 +1549,7 @@ def run_variant_hybrid(train_loader,
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 logits, _ = model(x, use_ste=False)
-                loss = F.cross_entropy(logits, y)
+                loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -1483,6 +1637,10 @@ def run_variant_transformer(train_loader,
                             layer_decay: float = 1.0,
                             gradient_centralize: bool = False,
                             aux_weight: float = 0.0,
+                            label_smoothing: float = 0.0,
+                            auto_clause: bool = False,
+                            clause_target: int = 0,
+                            auto_clause_batches: int = 4,
                             ff_gate: str = "none",
                             ff_gate_activation: str = "sigmoid",
                             layerscale_init: float = 1e-4,
@@ -1502,48 +1660,67 @@ def run_variant_transformer(train_loader,
                             clause_routing: bool = False,
                             continuous_bypass: bool = False,
                             bypass_scale: float = 1.0,
+                            tm_prior_template: str = "none",
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
-    model = UnifiedTMTransformer(
-        num_classes=num_classes,
-        architecture=architecture,
-        backend=backend,
-        image_size=image_size,
-        in_channels=in_channels,
-        patch_size=patch_size,
-        embed_dim=embed_dims,
-        depths=depths,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        tm_clauses=tm_clauses,
-        tm_tau=tm_tau,
-        drop_rate=dropout,
-        attn_drop_rate=dropout,
-        drop_path_rate=drop_path,
-        window_size=window_size,
-        use_cls_token=use_cls_token,
-        pool=pool,
-        grad_checkpoint=grad_checkpoint,
-        ff_gate=ff_gate,
-        ff_gate_activation=ff_gate_activation,
-        layerscale_init=layerscale_init,
-        use_layerscale=use_layerscale,
-        clause_dropout=clause_dropout,
-        literal_dropout=literal_dropout,
-        ff_sparsity_weight=sparsity_weight,
-        clause_bias_init=clause_bias_init,
-        norm_type=norm_type,
-        ff_mix_type=mix_type,
-        ff_bitwise_mix=bitwise_mix,
-        learnable_tau=learnable_tau,
-        tau_min=tau_min,
-        tau_max=tau_max,
-        tau_ema_beta=tau_ema_beta,
-        clause_attention=clause_attention,
-        clause_routing=clause_routing,
-        continuous_bypass=continuous_bypass,
-        bypass_scale=bypass_scale,
-    ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    base_model_kwargs: Dict[str, Any] = {
+        "num_classes": num_classes,
+        "architecture": architecture,
+        "backend": backend,
+        "image_size": image_size,
+        "in_channels": in_channels,
+        "patch_size": patch_size,
+        "embed_dim": embed_dims,
+        "depths": depths,
+        "num_heads": num_heads,
+        "mlp_ratio": mlp_ratio,
+        "tm_tau": tm_tau,
+        "drop_rate": dropout,
+        "attn_drop_rate": dropout,
+        "drop_path_rate": drop_path,
+        "window_size": window_size,
+        "use_cls_token": use_cls_token,
+        "pool": pool,
+        "grad_checkpoint": grad_checkpoint,
+        "ff_gate": ff_gate,
+        "ff_gate_activation": ff_gate_activation,
+        "layerscale_init": layerscale_init,
+        "use_layerscale": use_layerscale,
+        "clause_dropout": clause_dropout,
+        "literal_dropout": literal_dropout,
+        "ff_sparsity_weight": sparsity_weight,
+        "clause_bias_init": clause_bias_init,
+        "norm_type": norm_type,
+        "ff_mix_type": mix_type,
+        "ff_bitwise_mix": bitwise_mix,
+        "learnable_tau": learnable_tau,
+        "tau_min": tau_min,
+        "tau_max": tau_max,
+        "tau_ema_beta": tau_ema_beta,
+        "clause_attention": clause_attention,
+        "clause_routing": clause_routing,
+        "continuous_bypass": continuous_bypass,
+        "bypass_scale": bypass_scale,
+    }
+
+    if auto_clause:
+        tm_clauses = auto_tune_transformer_clauses(
+            model_kwargs=base_model_kwargs,
+            tm_clauses=tm_clauses,
+            depths=depths,
+            architecture=architecture,
+            train_loader=train_loader,
+            device=device,
+            auto_batches=auto_clause_batches,
+            clause_target=clause_target,
+            tm_prior_template=tm_prior_template,
+        )
+        print(f"  Auto-tuned clause counts: {tm_clauses}")
+
+    base_model_kwargs["tm_clauses"] = tm_clauses
+    model = UnifiedTMTransformer(**base_model_kwargs).to(device)
+    apply_tm_prior_template(model, tm_prior_template)
+    param_groups = build_param_groups_with_layer_decay(model, base_lr, weight_decay, layer_decay)
+    opt = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     ema_model = copy.deepcopy(model) if ema_decay > 0 else None
     start = time.time()
@@ -1572,16 +1749,22 @@ def run_variant_transformer(train_loader,
                 else:
                     logits, aux_outputs = outputs, {}
                 if lam is not None:
-                    loss = lam * F.cross_entropy(logits, targets_a) + (1 - lam) * F.cross_entropy(logits, targets_b)
+                    loss = lam * F.cross_entropy(logits, targets_a, label_smoothing=label_smoothing) + (
+                        1 - lam
+                    ) * F.cross_entropy(logits, targets_b, label_smoothing=label_smoothing)
                 else:
-                    loss = F.cross_entropy(logits, y)
+                    loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
                 if collect_aux and aux_outputs:
                     aux_loss = 0.0
                     for aux_logits in aux_outputs.values():
                         if lam is not None:
-                            aux_loss += lam * F.cross_entropy(aux_logits, targets_a) + (1 - lam) * F.cross_entropy(aux_logits, targets_b)
+                            aux_loss += lam * F.cross_entropy(
+                                aux_logits, targets_a, label_smoothing=label_smoothing
+                            ) + (1 - lam) * F.cross_entropy(
+                                aux_logits, targets_b, label_smoothing=label_smoothing
+                            )
                         else:
-                            aux_loss += F.cross_entropy(aux_logits, y)
+                            aux_loss += F.cross_entropy(aux_logits, y, label_smoothing=label_smoothing)
                     aux_loss = aux_loss / max(len(aux_outputs), 1)
                     loss = loss + aux_weight * aux_loss
                 reg_loss = model.pop_regularization_loss()
@@ -1902,6 +2085,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    tm_prior_template=args.tm_prior_template,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
@@ -1928,6 +2113,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    tm_prior_template=args.tm_prior_template,
                 )
                 variant_classes = args.num_classes
             elif model_key == "hybrid":
@@ -1950,6 +2137,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    tm_prior_template=args.tm_prior_template,
                 )
                 variant_classes = hybrid_classes
             elif model_key == "transformer":
@@ -1989,6 +2178,10 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     layer_decay=args.lr_layer_decay,
                     gradient_centralize=args.gradient_centralize,
                     aux_weight=args.transformer_aux_weight,
+                    label_smoothing=args.label_smoothing,
+                    auto_clause=args.transformer_auto_clause,
+                    clause_target=args.transformer_clause_target,
+                    auto_clause_batches=args.transformer_auto_clause_batches,
                     ff_gate=args.transformer_ff_gate,
                     ff_gate_activation=args.transformer_ff_gate_activation,
                     layerscale_init=args.transformer_layerscale_init,
@@ -2008,6 +2201,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     clause_routing=args.transformer_clause_routing,
                     continuous_bypass=args.transformer_bypass,
                     bypass_scale=args.transformer_bypass_scale,
+                    tm_prior_template=args.tm_prior_template,
                 )
                 bundle = None
                 variant_classes = args.num_classes

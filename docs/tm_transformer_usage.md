@@ -24,7 +24,14 @@ This guide shows how to launch the upgraded TM transformers, outlines every conf
 | `--transformer-dropout` | attention / TM dropout |
 | `--transformer-ema-decay` | EMA decay (0 disables) |
 | `--transformer-grad-checkpoint` | gradient checkpointing toggle |
+| `--lr-layer-decay` | per-layer LR scaling factor (1.0 disables) |
+| `--gradient-centralize` | enable gradient centralisation before each step |
 | `--randaugment`, `--mixup-alpha`, `--cutmix-alpha` | augmentation toggles |
+| `--label-smoothing` | label smoothing factor applied to all CE losses |
+| `--tm-prior-template` | initializes TM clauses with optional symmetry priors |
+| `--transformer-auto-clause` | auto-tune clause budgets from diagnostic accuracies |
+| `--transformer-clause-target` | total clause budget when auto tuning (0 keeps sum) |
+| `--transformer-auto-clause-batches` | number of batches sampled during auto tuning |
 
 Additional data-prep knobs:
 - `--tm-feature-mode` with presets from `fptm_ste.datasets`, plus `--tm-feature-config`, `--tm-feature-size`, `--tm-feature-grayscale`, reuse cached boolean TM features when needed.
@@ -90,7 +97,11 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 - **Gradient checkpointing (`--transformer-grad-checkpoint`)**: saves memory for deep Swin models.
 - **RandAugment (`--randaugment`, `--randaugment-n`, `--randaugment-m`)**: mimic ImageNet pipelines; defaults are n=2, m=9.
 - **Mixup / CutMix (`--mixup-alpha`, `--cutmix-alpha`)**: typical values 0.8 / 1.0; disable on tiny datasets.
+- **Label smoothing (`--label-smoothing`)**: 0.05–0.1 reduces overconfidence when Mixup is off.
 - **Epochs & batch size**: extend training (≥100 epochs) when augmentations and DeepTM backend are active.
+- **TM priors (`--tm-prior-template`)**: `symmetric` seeds complementary clause masks (helpful on symmetric datasets like MNIST).
+- **Clause auto-tuning (`--transformer-auto-clause`)**: reallocates clause budgets from diagnostic accuracies—great for Swin when some stages underperform.
+- **Layer-wise LR decay (`--lr-layer-decay`)**: set ~0.85 to stabilise deep Swin stacks; pair with `--gradient-centralize`.
 
 ### 4.5 Boolean Feature Pipelines (Optional)
 - `--tm-feature-mode {raw,fashion_aug,conv}` selects raw tensors or cached boolean features.
@@ -145,3 +156,12 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 *Latencies/energy for TM rows are order-of-magnitude estimates extrapolated from clause counts, activation footprints, and V100-class measurements (assume 350 W TDP; energy ≈ latency × 350 mJ/ms). Published latencies for standard CNN/transformer models come from NVIDIA V100 single-image benchmarks; throughput = 1000 / latency (ms). Actual numbers depend on hardware, precision, batch size, and kernel implementations.
 
 **ResNet/Swin/ViT baselines report ImageNet-scale statistics (224×224 inputs, fp32). When comparing directly with CIFAR-scale TM models, adjust expectations for resolution-dependent FLOP/latency scaling.
+
+## 7. Decision Log & Accuracy Snapshot
+- **Baseline ViT + STE (3 epochs, MNIST, no new tricks)**  
+  Command: `python python/fptm_ste/tests/run_mnist_equiv.py --dataset mnist --models transformer --transformer-arch vit --transformer-backend ste --transformer-patch 4 --epochs 3 --batch-size 64 --test-batch-size 128`  
+  Result: test accuracy **94.84 %**, train accuracy 92.48 %, runtime ~103 s.
+- **Enhanced ViT recipe (label smoothing, priors, auto clause, mixup/cutmix, EMA, layer decay)**  
+  Command: `python python/fptm_ste/tests/run_mnist_equiv.py --dataset mnist --models transformer --transformer-arch vit --transformer-backend ste --transformer-patch 4 --epochs 3 --batch-size 64 --test-batch-size 128 --label-smoothing 0.1 --tm-prior-template symmetric --transformer-ff-gate geglu --transformer-ff-mix linear_depthwise --transformer-bitwise-mix --transformer-learnable-tau --transformer-tau-ema 0.9 --transformer-clause-attention --transformer-clause-routing --transformer-bypass --transformer-bypass-scale 0.5 --transformer-clause-drop 0.1 --transformer-literal-drop 0.05 --transformer-sparsity-weight 0.01 --transformer-clause-bias 0.05 --transformer-norm rmsnorm --transformer-aux-weight 0.05 --mixup-alpha 0.2 --cutmix-alpha 0.2 --lr 7e-4 --min-lr 1e-5 --warmup-epochs 1 --lr-layer-decay 0.85 --gradient-centralize --transformer-ema-decay 0.995 --transformer-auto-clause --transformer-auto-clause-batches 4 --report-epoch-test`  
+  Result: test accuracy **95.50 %**, component accuracies substantially higher, runtime ~169 s.
+- Auto-clause tuning logs the adjusted clause budgets (e.g., `Auto-tuned clause counts: 256`) before training begins to facilitate reproducibility.

@@ -19,6 +19,19 @@ def _to_sequence(value: Union[int, float, Sequence[Union[int, float]]], length: 
         return tuple(value)
     return tuple(value for _ in range(length))
 
+
+def _expand_vit_clauses(tm_clauses: Union[int, Sequence[int]], depth: int) -> List[int]:
+    if isinstance(tm_clauses, Sequence) and not isinstance(tm_clauses, (str, bytes)):
+        clause_list = [int(max(1, c)) for c in tm_clauses]
+        if len(clause_list) != depth:
+            if len(clause_list) == 0:
+                clause_list = [64] * depth
+            else:
+                clause_list = (clause_list + [clause_list[-1]])[:depth]
+    else:
+        clause_list = [int(max(1, tm_clauses))] * depth
+    return clause_list
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -767,7 +780,7 @@ class UnifiedTMTransformer(nn.Module):
             depth = depths if isinstance(depths, int) else sum(depths)
             head = num_heads if isinstance(num_heads, int) else num_heads[0]
             mlp = mlp_ratio if isinstance(mlp_ratio, (int, float)) else mlp_ratio[0]
-            clauses = tm_clauses if isinstance(tm_clauses, int) else tm_clauses[0]
+            clause_list = _expand_vit_clauses(tm_clauses, depth)
             drop_path = torch.linspace(0, drop_path_rate, depth).tolist()
             self.blocks = nn.ModuleList(
                 [
@@ -776,7 +789,7 @@ class UnifiedTMTransformer(nn.Module):
                         head,
                         mlp_ratio=mlp,
                         backend=self.backend,
-                        n_clauses=int(clauses),
+                        n_clauses=int(clause_list[i]),
                         tm_tau=tm_tau,
                         drop=drop_rate,
                         attn_drop=attn_drop_rate,
