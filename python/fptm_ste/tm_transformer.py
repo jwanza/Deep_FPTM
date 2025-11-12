@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,47 @@ def _to_sequence(value: Union[int, float, Sequence[Union[int, float]]], length: 
         return tuple(value)
     return tuple(value for _ in range(length))
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.mean(x.pow(2), dim=-1, keepdim=True)
+        denom = torch.sqrt(norm + self.eps)
+        shape = [1] * (x.dim() - 1) + [-1]
+        return x * self.weight.view(*shape) / denom
+
+
+class ScaleNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = x.norm(dim=-1, keepdim=True)
+        return self.scale * x / (norm + self.eps)
+
+
+def build_norm(norm_type: str, dim: int) -> nn.Module:
+    key = norm_type.lower()
+    if key in {"layer", "layernorm", "ln"}:
+        return nn.LayerNorm(dim)
+    if key in {"rms", "rmsnorm"}:
+        return RMSNorm(dim)
+    if key in {"scale", "scalenorm"}:
+        return ScaleNorm(dim)
+    raise ValueError(f"Unsupported norm type '{norm_type}'.")
+
+
+def _init_linear(layer: nn.Linear, *, gain: float = 1.0) -> None:
+    nn.init.xavier_uniform_(layer.weight, gain=gain)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
 
 class PatchEmbed(nn.Module):
     """Image to patch embedding."""
@@ -29,6 +70,9 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.norm = nn.LayerNorm(embed_dim)
+        nn.init.kaiming_normal_(self.proj.weight, mode='fan_out', nonlinearity='relu')
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
@@ -41,7 +85,7 @@ class PatchEmbed(nn.Module):
 
 
 class TMFeedForward(nn.Module):
-    """Feed-forward module backed by TM / DeepTM."""
+    """Feed-forward module backed by TM / DeepTM with advanced gating."""
 
     def __init__(
         self,
@@ -52,14 +96,117 @@ class TMFeedForward(nn.Module):
         n_clauses: int,
         tm_tau: float,
         dropout: float,
+        gate_type: str = "none",
+        gate_activation: str = "sigmoid",
+        norm_type: str = "layernorm",
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        sparsity_weight: float = 0.0,
+        clause_bias_init: float = 0.0,
+        mix_type: str = "none",
+        bitwise_mix: bool = False,
+        learnable_tau: bool = False,
+        tau_min: float = 0.05,
+        tau_max: float = 0.95,
+        tau_ema_beta: Optional[float] = None,
+        clause_attention: bool = False,
+        clause_routing: bool = False,
+        continuous_bypass: bool = False,
+        bypass_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.backend = backend.lower()
-        self.norm = nn.LayerNorm(dim)
-        self.proj_in = nn.Linear(dim, hidden_dim)
-        self.act = nn.Sigmoid()
+        self.hidden_dim = hidden_dim
+        self.output_dim = dim
+        self.gate_type = gate_type.lower()
+        self.gate_activation = gate_activation.lower()
+        self.mix_type = mix_type.lower()
+        self.bitwise_mix = bitwise_mix
+        self.learnable_tau = learnable_tau
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.tau_ema_beta = tau_ema_beta
+        self.clause_attention = clause_attention
+        self.clause_routing = clause_routing
+        self.continuous_bypass = continuous_bypass
+        self.norm = build_norm(norm_type, dim)
+        self._requires_split_gate = self.gate_type in {"linear", "geglu", "swiglu"}
+        proj_dim = hidden_dim * 2 if self._requires_split_gate else hidden_dim
+        self.proj_in = nn.Linear(dim, proj_dim)
+        _init_linear(self.proj_in)
+        self.activation = nn.GELU()
+        self.clause_dropout = clause_dropout
+        self.literal_dropout = literal_dropout
+        self.sparsity_weight = sparsity_weight
+        self._sparsity_penalty: Optional[torch.Tensor] = None
+        self.pre_linear: Optional[nn.Linear] = None
+        self.post_linear: Optional[nn.Linear] = None
+        if "linear" in self.mix_type:
+            self.pre_linear = nn.Linear(dim, dim)
+            self.post_linear = nn.Linear(dim, dim)
+            _init_linear(self.pre_linear)
+            _init_linear(self.post_linear)
+        self.depthwise: Optional[nn.Conv1d] = None
+        if "depthwise" in self.mix_type:
+            self.depthwise = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.bitwise_linear: Optional[nn.Linear] = None
+        if self.bitwise_mix:
+            self.bitwise_linear = nn.Linear(hidden_dim * 2, hidden_dim)
+            _init_linear(self.bitwise_linear)
+        if self.learnable_tau:
+            init_tau = float(max(min(tm_tau, tau_max), tau_min))
+            init = torch.log(torch.tensor(init_tau) / (1 - torch.tensor(init_tau)))
+            self.tau_param = nn.Parameter(init)
+        else:
+            self.register_parameter("tau_param", None)
+        if self.tau_ema_beta is not None:
+            self.register_buffer("tau_ema", torch.tensor(tm_tau))
+        else:
+            self.register_buffer("tau_ema", None)
+        self.clause_attn_proj: Optional[nn.Module] = None
+        if self.clause_attention:
+            self.clause_attn_proj = nn.Sequential(
+                nn.LayerNorm(n_clauses),
+                nn.Linear(n_clauses, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, dim),
+            )
+            for layer in self.clause_attn_proj:
+                if isinstance(layer, nn.Linear):
+                    _init_linear(layer)
+        self.clause_gate: Optional[nn.Module] = None
+        if self.clause_routing:
+            self.clause_gate = nn.Sequential(
+                nn.LayerNorm(n_clauses),
+                nn.Linear(n_clauses, dim),
+                nn.Sigmoid(),
+            )
+            for layer in self.clause_gate:
+                if isinstance(layer, nn.Linear):
+                    _init_linear(layer)
+        self.bypass: Optional[nn.Module] = None
+        if self.continuous_bypass:
+            self.bypass = nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, dim),
+            )
+            for layer in self.bypass:
+                if isinstance(layer, nn.Linear):
+                    _init_linear(layer)
+            self.bypass_gain = nn.Parameter(torch.tensor(bypass_scale))
+        else:
+            self.register_parameter("bypass_gain", None)
         if self.backend == "ste":
-            self.core = FuzzyPatternTM_STE(hidden_dim, n_clauses, dim, tau=tm_tau)
+            self.core = FuzzyPatternTM_STE(
+                hidden_dim,
+                n_clauses,
+                dim,
+                tau=tm_tau,
+                clause_dropout=clause_dropout,
+                literal_dropout=literal_dropout,
+                clause_bias_init=clause_bias_init,
+            )
         elif self.backend in {"deep", "deeptm"}:
             self.core = DeepTMNetwork(
                 input_dim=hidden_dim,
@@ -71,23 +218,129 @@ class TMFeedForward(nn.Module):
                 input_shape=None,
                 auto_expand_grayscale=False,
                 allow_channel_reduce=False,
+                clause_dropout=clause_dropout,
+                literal_dropout=literal_dropout,
+                clause_bias_init=clause_bias_init,
             )
         else:
             raise ValueError(f"Unsupported TM backend '{backend}'.")
+        self.gate_core: Optional[nn.Module] = None
+        if self.gate_type == "tm":
+            self.gate_core = FuzzyPatternTM_STE(
+                hidden_dim,
+                n_clauses,
+                hidden_dim,
+                tau=tm_tau,
+                clause_dropout=0.0,
+                literal_dropout=0.0,
+                clause_bias_init=0.0,
+            )
+        elif self.gate_type == "deeptm":
+            self.gate_core = DeepTMNetwork(
+                input_dim=hidden_dim,
+                hidden_dims=[hidden_dim],
+                n_classes=hidden_dim,
+                n_clauses=n_clauses,
+                dropout=dropout,
+                tau=tm_tau,
+                input_shape=None,
+                auto_expand_grayscale=False,
+                allow_channel_reduce=False,
+                clause_dropout=0.0,
+                literal_dropout=0.0,
+                clause_bias_init=0.0,
+            )
         self.dropout = nn.Dropout(dropout)
-        self.gate = nn.Parameter(torch.tensor(0.5))
+
+    def _apply_gate_activation(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.gate_activation == "sigmoid":
+            return torch.sigmoid(tensor)
+        if self.gate_activation == "tanh":
+            return torch.tanh(tensor)
+        if self.gate_activation == "relu":
+            return F.relu(tensor)
+        raise ValueError(f"Unsupported gate activation '{self.gate_activation}'.")
+
+    def _update_tau(self, tau: float) -> None:
+        if hasattr(self.core, "set_tau"):
+            self.core.set_tau(tau)
+        elif hasattr(self.core, "tau"):
+            self.core.tau = tau
+        if self.gate_core is not None:
+            if hasattr(self.gate_core, "set_tau"):
+                self.gate_core.set_tau(tau)
+            elif hasattr(self.gate_core, "tau"):
+                self.gate_core.tau = tau
 
     def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
         B, T, C = x.shape
         y = self.norm(x)
-        y = self.act(self.proj_in(y))
-        flat = y.reshape(B * T, -1)
-        logits, _ = self.core(flat, use_ste=use_ste)
+        if self.pre_linear is not None:
+            y = self.pre_linear(y)
+        if self.depthwise is not None:
+            y = self.depthwise(y.transpose(1, 2)).transpose(1, 2)
+        proj = self.proj_in(y)
+        if self._requires_split_gate:
+            value, gate = proj.chunk(2, dim=-1)
+            if self.gate_type == "swiglu":
+                value = F.silu(value)
+                gate = torch.sigmoid(gate)
+            elif self.gate_type == "geglu":
+                value = F.gelu(value)
+                gate = torch.sigmoid(gate)
+            else:
+                value = self.activation(value)
+                gate = self._apply_gate_activation(gate)
+            fused = value * gate
+        else:
+            fused = self.activation(proj)
+            if self.gate_type in {"tm", "deeptm"}:
+                if self.gate_core is None:
+                    raise RuntimeError("TM-based gate requested but gate_core is uninitialized.")
+                gate_input = torch.sigmoid(fused.reshape(B * T, -1))
+                gate_logits, _ = self.gate_core(gate_input, use_ste=use_ste)
+                gate = self._apply_gate_activation(gate_logits.view(B, T, -1))
+                fused = fused * gate
+        if self.bitwise_linear is not None:
+            concat = torch.cat([fused, 1.0 - fused], dim=-1)
+            fused = self.bitwise_linear(concat)
+        if self.learnable_tau or self.tau_ema_beta is not None:
+            tau_val = None
+            if self.learnable_tau:
+                tau_val = torch.sigmoid(self.tau_param)
+                tau_val = self.tau_min + (self.tau_max - self.tau_min) * tau_val
+            if self.tau_ema_beta is not None:
+                source = tau_val if tau_val is not None else torch.tensor(getattr(self.core, 'tau', 0.5), device=fused.device)
+                self.tau_ema = self.tau_ema * self.tau_ema_beta + source.detach() * (1 - self.tau_ema_beta)
+                tau_val = self.tau_ema
+            if tau_val is not None:
+                self._update_tau(float(tau_val.detach().item()))
+        bypass_out = None
+        if self.bypass is not None:
+            bypass_out = self.bypass(y)
+        flat = fused.reshape(B * T, -1)
+        logits, clause_outputs = self.core(flat, use_ste=use_ste)
+        if self.sparsity_weight > 0.0:
+            self._sparsity_penalty = clause_outputs.abs().mean() * self.sparsity_weight
+        else:
+            self._sparsity_penalty = None
         logits = logits.view(B, T, C)
-        gate = torch.sigmoid(self.gate)
-        logits = gate * logits + (1 - gate) * torch.sigmoid(logits)
+        if self.clause_attn_proj is not None:
+            clause_ctx = self.clause_attn_proj(clause_outputs).view(B, T, C)
+            logits = logits + clause_ctx
+        if self.clause_gate is not None:
+            gate = self.clause_gate(clause_outputs).view(B, T, C)
+            logits = logits * gate
+        if bypass_out is not None:
+            gain = torch.tanh(self.bypass_gain) if self.bypass_gain is not None else 1.0
+            logits = logits + gain * bypass_out
+        if self.post_linear is not None:
+            logits = self.post_linear(logits)
         return self.dropout(logits)
 
+    @property
+    def sparsity_penalty(self) -> Optional[torch.Tensor]:
+        return self._sparsity_penalty
 
 class TMEncoderBlock(nn.Module):
     """ViT-style encoder block with TM/DeepTM feed-forward."""
@@ -104,9 +357,28 @@ class TMEncoderBlock(nn.Module):
         drop: float,
         attn_drop: float,
         drop_path: float,
+        gate_type: str = "none",
+        gate_activation: str = "sigmoid",
+        norm_type: str = "layernorm",
+        layerscale_init: float = 1e-4,
+        enable_layerscale: bool = True,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        sparsity_weight: float = 0.0,
+        clause_bias_init: float = 0.0,
+        mix_type: str = "none",
+        bitwise_mix: bool = False,
+        learnable_tau: bool = False,
+        tau_min: float = 0.05,
+        tau_max: float = 0.95,
+        tau_ema_beta: Optional[float] = None,
+        clause_attention: bool = False,
+        clause_routing: bool = False,
+        continuous_bypass: bool = False,
+        bypass_scale: float = 1.0,
     ) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = build_norm(norm_type, dim)
         self.attn = InstrumentedMultiheadAttention(dim, num_heads, attn_drop)
         self.attn_drop = nn.Dropout(drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
@@ -118,9 +390,33 @@ class TMEncoderBlock(nn.Module):
             n_clauses=n_clauses,
             tm_tau=tm_tau,
             dropout=drop,
+            gate_type=gate_type,
+            gate_activation=gate_activation,
+            norm_type=norm_type,
+            clause_dropout=clause_dropout,
+            literal_dropout=literal_dropout,
+            sparsity_weight=sparsity_weight,
+            clause_bias_init=clause_bias_init,
+            mix_type=mix_type,
+            bitwise_mix=bitwise_mix,
+            learnable_tau=learnable_tau,
+            tau_min=tau_min,
+            tau_max=tau_max,
+            tau_ema_beta=tau_ema_beta,
+            clause_attention=clause_attention,
+            clause_routing=clause_routing,
+            continuous_bypass=continuous_bypass,
+            bypass_scale=bypass_scale,
         )
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = build_norm(norm_type, dim)
         self.num_heads = num_heads
+        self.enable_layerscale = enable_layerscale
+        if enable_layerscale:
+            self.attn_scale = nn.Parameter(torch.ones(dim))
+            self.tm_scale = nn.Parameter(torch.ones(dim) * layerscale_init)
+        else:
+            self.register_buffer('attn_scale', None)
+            self.register_buffer('tm_scale', None)
 
     def forward(
         self,
@@ -131,12 +427,18 @@ class TMEncoderBlock(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_in = self.norm1(x)
         attn_out, head_context, _ = self.attn(attn_in)
-        x = x + self.drop_path(self.attn_drop(attn_out))
-        x = x + self.drop_path(self.ffn(self.norm2(x), use_ste=use_ste))
+        attn_out = self.attn_drop(attn_out)
+        if self.enable_layerscale and self.attn_scale is not None:
+            attn_out = attn_out * self.attn_scale.view(1, 1, -1)
+        x = x + self.drop_path(attn_out)
+        ff_input = self.norm2(x)
+        ff_out = self.ffn(ff_input, use_ste=use_ste)
+        if self.enable_layerscale and self.tm_scale is not None:
+            ff_out = ff_out * self.tm_scale.view(1, 1, -1)
+        x = x + self.drop_path(ff_out)
         if collect_diagnostics:
             return x, head_context
         return x
-
 
 class TMSwinBlock(nn.Module):
     """Windowed attention block with TM feed-forward."""
@@ -155,12 +457,31 @@ class TMSwinBlock(nn.Module):
         drop: float,
         attn_drop: float,
         drop_path: float,
+        gate_type: str = "none",
+        gate_activation: str = "sigmoid",
+        norm_type: str = "layernorm",
+        layerscale_init: float = 1e-4,
+        enable_layerscale: bool = True,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        sparsity_weight: float = 0.0,
+        clause_bias_init: float = 0.0,
+        mix_type: str = "none",
+        bitwise_mix: bool = False,
+        learnable_tau: bool = False,
+        tau_min: float = 0.05,
+        tau_max: float = 0.95,
+        tau_ema_beta: Optional[float] = None,
+        clause_attention: bool = False,
+        clause_routing: bool = False,
+        continuous_bypass: bool = False,
+        bypass_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.window_size = window_size
         self.shift_size = shift_size
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = build_norm(norm_type, dim)
         self.attn = WindowAttention(dim, num_heads, attn_drop)
         self.attn_drop = nn.Dropout(drop)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
@@ -172,9 +493,33 @@ class TMSwinBlock(nn.Module):
             n_clauses=n_clauses,
             tm_tau=tm_tau,
             dropout=drop,
+            gate_type=gate_type,
+            gate_activation=gate_activation,
+            norm_type=norm_type,
+            clause_dropout=clause_dropout,
+            literal_dropout=literal_dropout,
+            sparsity_weight=sparsity_weight,
+            clause_bias_init=clause_bias_init,
+            mix_type=mix_type,
+            bitwise_mix=bitwise_mix,
+            learnable_tau=learnable_tau,
+            tau_min=tau_min,
+            tau_max=tau_max,
+            tau_ema_beta=tau_ema_beta,
+            clause_attention=clause_attention,
+            clause_routing=clause_routing,
+            continuous_bypass=continuous_bypass,
+            bypass_scale=bypass_scale,
         )
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = build_norm(norm_type, dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.enable_layerscale = enable_layerscale
+        if enable_layerscale:
+            self.attn_scale = nn.Parameter(torch.ones(dim))
+            self.tm_scale = nn.Parameter(torch.ones(dim) * layerscale_init)
+        else:
+            self.register_buffer('attn_scale', None)
+            self.register_buffer('tm_scale', None)
 
     def forward(
         self,
@@ -216,11 +561,16 @@ class TMSwinBlock(nn.Module):
             head_context_merged = head_context_merged[:, :H, :W, :, :]
         x = x.reshape(B, H * W, C)
         head_tokens = head_context_merged.reshape(B, H * W, self.attn.attn.num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-        x = shortcut + self.drop_path1(self.attn_drop(x))
+        attn_proj = self.attn_drop(x)
+        if self.enable_layerscale and self.attn_scale is not None:
+            attn_proj = attn_proj * self.attn_scale.view(1, 1, -1)
+        x = shortcut + self.drop_path1(attn_proj)
 
-        x = x + self.drop_path2(self.ffn(self.norm2(x), use_ste=use_ste))
+        ff_out = self.ffn(self.norm2(x), use_ste=use_ste)
+        if self.enable_layerscale and self.tm_scale is not None:
+            ff_out = ff_out * self.tm_scale.view(1, 1, -1)
+        x = x + self.drop_path2(ff_out)
         return x, H, W, head_tokens if collect_diagnostics else None
-
 
 class TMSwinStage(nn.Module):
     """Stack of Swin blocks followed by optional patch merging."""
@@ -241,6 +591,25 @@ class TMSwinStage(nn.Module):
         drop_path: Sequence[float],
         downsample: bool,
         use_checkpoint: bool,
+        gate_type: str = "none",
+        gate_activation: str = "sigmoid",
+        norm_type: str = "layernorm",
+        layerscale_init: float = 1e-4,
+        enable_layerscale: bool = True,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        sparsity_weight: float = 0.0,
+        clause_bias_init: float = 0.0,
+        mix_type: str = "none",
+        bitwise_mix: bool = False,
+        learnable_tau: bool = False,
+        tau_min: float = 0.05,
+        tau_max: float = 0.95,
+        tau_ema_beta: Optional[float] = None,
+        clause_attention: bool = False,
+        clause_routing: bool = False,
+        continuous_bypass: bool = False,
+        bypass_scale: float = 1.0,
     ) -> None:
         super().__init__()
         blocks = []
@@ -259,6 +628,25 @@ class TMSwinStage(nn.Module):
                     drop=drop,
                     attn_drop=attn_drop,
                     drop_path=drop_path[idx],
+                    gate_type=gate_type,
+                    gate_activation=gate_activation,
+                    norm_type=norm_type,
+                    layerscale_init=layerscale_init,
+                    enable_layerscale=enable_layerscale,
+                    clause_dropout=clause_dropout,
+                    literal_dropout=literal_dropout,
+                    sparsity_weight=sparsity_weight,
+                    clause_bias_init=clause_bias_init,
+                    mix_type=mix_type,
+                    bitwise_mix=bitwise_mix,
+                    learnable_tau=learnable_tau,
+                    tau_min=tau_min,
+                    tau_max=tau_max,
+                    tau_ema_beta=tau_ema_beta,
+                    clause_attention=clause_attention,
+                    clause_routing=clause_routing,
+                    continuous_bypass=continuous_bypass,
+                    bypass_scale=bypass_scale,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -290,7 +678,6 @@ class TMSwinStage(nn.Module):
             x = x.reshape(x.shape[0], -1, x.shape[-1])
         return x, H, W
 
-
 class UnifiedTMTransformer(nn.Module):
     """Vision transformer with TM/DeepTM feed-forward options."""
 
@@ -316,6 +703,25 @@ class UnifiedTMTransformer(nn.Module):
         use_cls_token: bool = True,
         pool: str = "cls",
         grad_checkpoint: bool = False,
+        ff_gate: str = "none",
+        ff_gate_activation: str = "sigmoid",
+        layerscale_init: float = 1e-4,
+        use_layerscale: bool = True,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        ff_sparsity_weight: float = 0.0,
+        clause_bias_init: float = 0.0,
+        norm_type: str = "layernorm",
+        ff_mix_type: str = "none",
+        ff_bitwise_mix: bool = False,
+        learnable_tau: bool = False,
+        tau_min: float = 0.05,
+        tau_max: float = 0.95,
+        tau_ema_beta: Optional[float] = None,
+        clause_attention: bool = False,
+        clause_routing: bool = False,
+        continuous_bypass: bool = False,
+        bypass_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.architecture = architecture.lower()
@@ -323,6 +729,26 @@ class UnifiedTMTransformer(nn.Module):
         self.num_classes = num_classes
         self.pool = pool
         self.grad_checkpoint = grad_checkpoint
+        self.ff_gate = ff_gate.lower()
+        self.ff_gate_activation = ff_gate_activation.lower()
+        self.layerscale_init = layerscale_init
+        self.use_layerscale = use_layerscale
+        self.clause_dropout = clause_dropout
+        self.literal_dropout = literal_dropout
+        self.ff_sparsity_weight = ff_sparsity_weight
+        self.clause_bias_init = clause_bias_init
+        self.norm_type = norm_type
+        self.ff_mix_type = ff_mix_type
+        self.ff_bitwise_mix = ff_bitwise_mix
+        self.learnable_tau = learnable_tau
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.tau_ema_beta = tau_ema_beta
+        self.clause_attention = clause_attention
+        self.clause_routing = clause_routing
+        self.continuous_bypass = continuous_bypass
+        self.bypass_scale = bypass_scale
+        self._pending_regularization: Optional[torch.Tensor] = None
 
         self.component_dims: Dict[str, int] = {}
         self.component_order: List[str] = []
@@ -355,12 +781,32 @@ class UnifiedTMTransformer(nn.Module):
                         drop=drop_rate,
                         attn_drop=attn_drop_rate,
                         drop_path=drop_path[i],
+                        gate_type=self.ff_gate,
+                        gate_activation=self.ff_gate_activation,
+                        norm_type=self.norm_type,
+                        layerscale_init=self.layerscale_init,
+                        enable_layerscale=self.use_layerscale,
+                        clause_dropout=self.clause_dropout,
+                        literal_dropout=self.literal_dropout,
+                        sparsity_weight=self.ff_sparsity_weight,
+                        clause_bias_init=self.clause_bias_init,
+                        mix_type=self.ff_mix_type,
+                        bitwise_mix=self.ff_bitwise_mix,
+                        learnable_tau=self.learnable_tau,
+                        tau_min=self.tau_min,
+                        tau_max=self.tau_max,
+                        tau_ema_beta=self.tau_ema_beta,
+                        clause_attention=self.clause_attention,
+                        clause_routing=self.clause_routing,
+                        continuous_bypass=self.continuous_bypass,
+                        bypass_scale=self.bypass_scale,
                     )
                     for i in range(depth)
                 ]
             )
             self.norm = nn.LayerNorm(int(embed_dim))
             self.head = nn.Linear(int(embed_dim), num_classes)
+            _init_linear(self.head)
             nn.init.trunc_normal_(self.pos_embed, std=0.02)
             if self.cls_token is not None:
                 nn.init.trunc_normal_(self.cls_token, std=0.02)
@@ -400,13 +846,15 @@ class UnifiedTMTransformer(nn.Module):
                     window_size=window_size,
                     backend=self.backend,
                     mlp_ratio=stage_mlp[idx],
-                    n_clauses=int(stage_clauses[idx]),
+                    n_clauses=stage_clauses[idx],
                     tm_tau=tm_tau,
                     drop=drop_rate,
                     attn_drop=attn_drop_rate,
                     drop_path=drop_path[dp_offset : dp_offset + depth],
-                    downsample=idx < len(stage_depths) - 1,
+                    downsample=(idx < len(stage_depths) - 1),
                     use_checkpoint=grad_checkpoint,
+                    gate_type=self.ff_gate,
+                    gate_activation=self.ff_gate_activation,
                 )
                 stages.append(stage)
                 dp_offset += depth
@@ -476,6 +924,7 @@ class UnifiedTMTransformer(nn.Module):
 
         diagnostics: Dict[str, torch.Tensor] = {}
         collecting = collect_diagnostics
+        reg_loss: Optional[torch.Tensor] = None
 
         if self.architecture == "vit":
             x = self.patch_embed(x)
@@ -507,11 +956,15 @@ class UnifiedTMTransformer(nn.Module):
                             head_key = f"{component_key}_head{head_idx + 1}"
                             if head_key in self.attn_head_heads:
                                 diagnostics[head_key] = self.attn_head_heads[head_key](head_feats[:, head_idx, :])
+                penalty = getattr(block.ffn, "sparsity_penalty", None)
+                if penalty is not None:
+                    reg_loss = penalty if reg_loss is None else reg_loss + penalty
             x = self.norm(x)
             if collecting and "pre_head" in self.diagnostic_heads:
                 diagnostics["pre_head"] = self.diagnostic_heads["pre_head"](self._pool_vit_tokens(x))
             feats = self._pool_vit_tokens(x)
             logits = self.head(feats)
+            self._pending_regularization = reg_loss
             if collecting:
                 diagnostics["final_decision"] = logits
                 return logits, diagnostics
@@ -545,16 +998,73 @@ class UnifiedTMTransformer(nn.Module):
                 record_callback=stage_record,
                 stage_index=stage_idx,
             )
+            for block in stage.blocks:
+                penalty = getattr(block.ffn, "sparsity_penalty", None)
+                if penalty is not None:
+                    reg_loss = penalty if reg_loss is None else reg_loss + penalty
 
         x = self.norm(tokens)
         if collecting and "pre_head" in self.diagnostic_heads:
             diagnostics["pre_head"] = self.diagnostic_heads["pre_head"](self._pool_swin_tokens(x))
         feats = self._pool_swin_tokens(x)
         logits = self.head(feats)
+        self._pending_regularization = reg_loss
         if collecting:
             diagnostics["final_decision"] = logits
             return logits, diagnostics
         return logits
+
+    def layer_param_groups(self) -> List[List[nn.Parameter]]:
+        groups: List[List[nn.Parameter]] = []
+        seen: Set[int] = set()
+
+        def add_params(params) -> None:
+            bucket: List[nn.Parameter] = []
+            if params is None:
+                return
+            for p in params:
+                if p is None:
+                    continue
+                if not isinstance(p, nn.Parameter):
+                    continue
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+                bucket.append(p)
+            if bucket:
+                groups.append(bucket)
+
+        if self.architecture == "vit":
+            add_params(self.patch_embed.parameters())
+            add_params([self.pos_embed])
+            if self.cls_token is not None:
+                add_params([self.cls_token])
+            for block in self.blocks:
+                add_params(block.parameters())
+            add_params(self.norm.parameters())
+            add_params(self.head.parameters())
+        else:
+            add_params(self.patch_embed.parameters())
+            for stage in self.stages:
+                for block in stage.blocks:
+                    add_params(block.parameters())
+                if stage.downsample is not None:
+                    add_params(stage.downsample.parameters())
+            add_params(self.norm.parameters())
+            add_params(self.head.parameters())
+
+        add_params(self.diagnostic_heads.parameters())
+        add_params(self.attn_head_heads.parameters())
+
+        remaining = [p for p in self.parameters() if id(p) not in seen]
+        if remaining:
+            groups.append(remaining)
+        return groups
+
+    def pop_regularization_loss(self) -> Optional[torch.Tensor]:
+        reg = self._pending_regularization
+        self._pending_regularization = None
+        return reg
 
 
 class TM_TransformerBlock(TMEncoderBlock):

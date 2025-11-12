@@ -19,6 +19,9 @@ class DeepTMNetwork(nn.Module):
         input_shape: Optional[Tuple[int, int, int]] = None,
         auto_expand_grayscale: bool = False,
         allow_channel_reduce: bool = True,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        clause_bias_init: float = 0.0,
     ):
         super().__init__()
         self.input_shape = tuple(input_shape) if input_shape is not None else None
@@ -52,13 +55,30 @@ class DeepTMNetwork(nn.Module):
                     allow_channel_reduce=self.allow_channel_reduce,
                 )
             self.layers.append(
-                FuzzyPatternTM_STE(prev, n_clauses, h, tau=tau, **layer_kwargs)
+                FuzzyPatternTM_STE(
+                    prev,
+                    n_clauses,
+                    h,
+                    tau=tau,
+                    clause_dropout=clause_dropout,
+                    literal_dropout=literal_dropout,
+                    clause_bias_init=clause_bias_init,
+                    **layer_kwargs,
+                )
             )
             self.norms.append(nn.LayerNorm(h))
             self.residuals.append(nn.Linear(prev, h, bias=False) if prev != h else nn.Identity())
             prev = h
 
-        self.classifier = FuzzyPatternTM_STE(prev, n_clauses * 2, n_classes, tau=tau)
+        self.classifier = FuzzyPatternTM_STE(
+            prev,
+            n_clauses * 2,
+            n_classes,
+            tau=tau,
+            clause_dropout=clause_dropout,
+            literal_dropout=literal_dropout,
+            clause_bias_init=clause_bias_init,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,5 +100,13 @@ class DeepTMNetwork(nn.Module):
             x = norm(self.dropout(torch.sigmoid(logits)) + identity)
         logits, clauses = self.classifier(x, use_ste=use_ste)
         return logits, clauses
+
+    def set_tau(self, tau: float) -> None:
+        for layer in self.layers:
+            if hasattr(layer, "tau"):
+                layer.tau = tau
+        if hasattr(self.classifier, "tau"):
+            self.classifier.tau = tau
+
 
 

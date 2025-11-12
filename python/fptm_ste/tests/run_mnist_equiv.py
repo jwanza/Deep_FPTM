@@ -81,6 +81,87 @@ DATASET_CONFIGS = {
     },
 }
 
+BASELINE_SCENARIOS: Dict[str, Dict[str, Any]] = {
+    "mnist_vit_patch4": {
+        "description": "MNIST ViT baseline with STE TM feed-forward (quick smoke test).",
+        "overrides": {
+            "dataset": "mnist",
+            "models": ["transformer"],
+            "seed": 1337,
+            "epochs": 3,
+            "batch_size": 64,
+            "test_batch_size": 128,
+            "transformer_arch": "vit",
+            "transformer_patch": 4,
+            "transformer_d_model": 64,
+            "transformer_layers": 2,
+            "transformer_heads": 4,
+            "transformer_mlp_ratio": "3.0",
+            "transformer_backend": "ste",
+            "transformer_ff": 256,
+            "transformer_drop_path": 0.0,
+            "transformer_dropout": 0.05,
+            "transformer_aux_weight": 0.0,
+            "randaugment": False,
+            "mixup_alpha": 0.0,
+            "cutmix_alpha": 0.0,
+        },
+    },
+    "mnist_swin_window4": {
+        "description": "MNIST Swin baseline with STE TM feed-forward (window=4).",
+        "overrides": {
+            "dataset": "mnist",
+            "models": ["transformer"],
+            "seed": 2024,
+            "epochs": 3,
+            "batch_size": 64,
+            "test_batch_size": 128,
+            "transformer_arch": "swin",
+            "transformer_patch": 2,
+            "transformer_depths": "1,1",
+            "transformer_stage_heads": "2,4",
+            "transformer_embed_dims": "48,96",
+            "transformer_mlp_ratio": "3.0,3.0",
+            "transformer_backend": "ste",
+            "transformer_window": 4,
+            "transformer_drop_path": 0.0,
+            "transformer_dropout": 0.05,
+            "transformer_aux_weight": 0.0,
+            "randaugment": False,
+            "mixup_alpha": 0.0,
+            "cutmix_alpha": 0.0,
+        },
+    },
+    "cifar10_swin_mini": {
+        "description": "CIFAR-10 Swin mini-run with DeepTM feed-forward (diagnostic baseline).",
+        "overrides": {
+            "dataset": "cifar10",
+            "models": ["transformer"],
+            "seed": 42,
+            "epochs": 2,
+            "batch_size": 64,
+            "test_batch_size": 128,
+            "transformer_arch": "swin",
+            "transformer_patch": 4,
+            "transformer_depths": "2,2",
+            "transformer_stage_heads": "3,6",
+            "transformer_embed_dims": "96,192",
+            "transformer_mlp_ratio": "3.0,3.0",
+            "transformer_backend": "deeptm",
+            "transformer_window": 4,
+            "transformer_drop_path": 0.1,
+            "transformer_dropout": 0.1,
+            "transformer_aux_weight": 0.05,
+            "randaugment": True,
+            "randaugment_n": 1,
+            "randaugment_m": 7,
+            "mixup_alpha": 0.4,
+            "cutmix_alpha": 0.5,
+            "warmup_epochs": 2,
+        },
+    },
+}
+
 
 def bool_env(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -119,6 +200,33 @@ def float_or_none(value: Optional[str], default: Optional[float] = None) -> Opti
     if not value:
         return default
     return float(value)
+
+
+def apply_gradient_centralization(module: nn.Module) -> None:
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        if param.grad.dim() > 1:
+            dims = tuple(range(1, param.grad.dim()))
+            mean = param.grad.mean(dim=dims, keepdim=True)
+            param.grad.sub_(mean)
+
+
+def build_param_groups_with_layer_decay(model: nn.Module, base_lr: float, weight_decay: float, layer_decay: float) -> List[Dict[str, Any]]:
+    if layer_decay is None or layer_decay == 1.0 or not hasattr(model, "layer_param_groups"):
+        return [{"params": list(model.parameters()), "lr": base_lr, "weight_decay": weight_decay}]
+    param_groups: List[Dict[str, Any]] = []
+    layer_groups = model.layer_param_groups()
+    total_layers = len(layer_groups)
+    for layer_id, params in enumerate(layer_groups):
+        scale = layer_decay ** (total_layers - layer_id - 1)
+        group_lr = base_lr * scale
+        param_groups.append({
+            "params": params,
+            "lr": group_lr,
+            "weight_decay": weight_decay,
+        })
+    return param_groups
 
 
 def optional_int_arg(value: str) -> Optional[int]:
@@ -183,6 +291,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr", type=float, default=None, help="Minimum learning rate for cosine decay.")
     parser.add_argument("--warmup-epochs", type=int, default=0, help="Number of warmup epochs before cosine decay.")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay value for AdamW optimizers.")
+    parser.add_argument("--lr-layer-decay", type=float, default=1.0, help="Layer-wise LR decay factor (set <1 to scale deeper layers).")
+    parser.add_argument("--gradient-centralize", action=argparse.BooleanOptionalAction, default=False, help="Apply gradient centralization before optimizer step.")
     parser.add_argument("--num-classes", type=int, default=None, help="Number of target classes.")
     parser.add_argument(
         "--dataset-root",
@@ -280,6 +390,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional random seed for torch.",
+    )
+    parser.add_argument(
+        "--baseline-scenarios",
+        nargs="+",
+        choices=sorted(BASELINE_SCENARIOS.keys()),
+        default=None,
+        help="Run predefined baseline scenario(s) prior to the main invocation.",
+    )
+    parser.add_argument(
+        "--baseline-output-dir",
+        default=None,
+        help="Directory for baseline metrics (defaults to derived path under output-json).",
+    )
+    parser.add_argument(
+        "--baseline-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only execute baseline scenario(s) and skip the main command.",
+    )
+    parser.add_argument(
+        "--list-baselines",
+        action="store_true",
+        help="List available baseline scenarios and exit.",
     )
 
     # TM specific options
@@ -501,6 +634,120 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Hidden dimension used inside TM-based feed-forward replacements.",
     )
     parser.add_argument(
+        "--transformer-ff-gate",
+        choices=["none", "linear", "geglu", "swiglu", "tm", "deeptm"],
+        default="none",
+        help="Gate style applied inside TM feed-forward blocks (e.g., linear/GEGLU/SwiGLU/TM-based).",
+    )
+    parser.add_argument(
+        "--transformer-ff-gate-activation",
+        choices=["sigmoid", "tanh", "relu"],
+        default="sigmoid",
+        help="Activation applied to feed-forward gates when enabled.",
+    )
+    parser.add_argument(
+        "--transformer-layerscale-init",
+        type=float,
+        default=1e-4,
+        help="Initial value for LayerScale multipliers applied to TM residual branches.",
+    )
+    parser.add_argument(
+        "--transformer-use-layerscale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable learnable LayerScale multipliers on transformer residual paths.",
+    )
+    parser.add_argument(
+        "--transformer-clause-drop",
+        type=float,
+        default=0.0,
+        help="Clause dropout probability applied within TM feed-forward modules.",
+    )
+    parser.add_argument(
+        "--transformer-literal-drop",
+        type=float,
+        default=0.0,
+        help="Literal dropout probability applied to TM inputs before clause evaluation.",
+    )
+    parser.add_argument(
+        "--transformer-sparsity-weight",
+        type=float,
+        default=0.0,
+        help="L1 penalty weight applied to TM clause activations.",
+    )
+    parser.add_argument(
+        "--transformer-clause-bias",
+        type=float,
+        default=0.0,
+        help="Initial additive bias applied to TM clause outputs.",
+    )
+    parser.add_argument(
+        "--transformer-norm",
+        choices=["layernorm", "rmsnorm", "scalenorm"],
+        default="layernorm",
+        help="Normalization applied inside TM transformer blocks.",
+    )
+    parser.add_argument(
+        "--transformer-ff-mix",
+        choices=["none", "linear", "depthwise", "linear_depthwise"],
+        default="none",
+        help="Optional continuous mixing applied around TM feed-forward layers.",
+    )
+    parser.add_argument(
+        "--transformer-bitwise-mix",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable XOR-style bitwise mixing of clause inputs before TM evaluation.",
+    )
+    parser.add_argument(
+        "--transformer-learnable-tau",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Make TM tau learnable within transformer feed-forward blocks.",
+    )
+    parser.add_argument(
+        "--transformer-tau-min",
+        type=float,
+        default=0.05,
+        help="Lower bound for learnable TM tau.",
+    )
+    parser.add_argument(
+        "--transformer-tau-max",
+        type=float,
+        default=0.95,
+        help="Upper bound for learnable TM tau.",
+    )
+    parser.add_argument(
+        "--transformer-tau-ema",
+        type=float,
+        default=None,
+        help="Optional EMA beta for smoothing tau updates (set between 0 and 1).",
+    )
+    parser.add_argument(
+        "--transformer-clause-attention",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable clause-level attention projections inside TM feed-forwards.",
+    )
+    parser.add_argument(
+        "--transformer-clause-routing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable neuro-symbolic clause gating of feed-forward outputs.",
+    )
+    parser.add_argument(
+        "--transformer-bypass",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add a continuous MLP bypass alongside TM outputs.",
+    )
+    parser.add_argument(
+        "--transformer-bypass-scale",
+        type=float,
+        default=1.0,
+        help="Initial gain applied to the continuous bypass pathway.",
+    )
+    parser.add_argument(
         "--transformer-dropout",
         type=float,
         default=0.1,
@@ -556,6 +803,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def list_baseline_scenarios() -> None:
+    print("Available baseline scenarios:")
+    for name in sorted(BASELINE_SCENARIOS):
+        info = BASELINE_SCENARIOS[name]
+        description = info.get("description", "")
+        print(f"  - {name}: {description}")
+
+
+def build_baseline_args(
+    base_args: argparse.Namespace,
+    scenario_name: str,
+    *,
+    output_dir: Optional[str] = None,
+) -> argparse.Namespace:
+    if scenario_name not in BASELINE_SCENARIOS:
+        raise KeyError(f"Unknown baseline scenario '{scenario_name}'.")
+    scenario = BASELINE_SCENARIOS[scenario_name]
+    overrides = scenario.get("overrides", {})
+    scenario_args = copy.deepcopy(base_args)
+
+    # Reset baseline-management flags to avoid recursion.
+    scenario_args.baseline_scenarios = None
+    scenario_args.baseline_output_dir = None
+    scenario_args.baseline_only = False
+    scenario_args.list_baselines = False
+
+    for key, value in overrides.items():
+        setattr(scenario_args, key, value)
+
+    # Derive per-scenario JSON output path.
+    default_output = getattr(base_args, "output_json", DEFAULT_OUTPUT_JSON)
+    base_dir = output_dir or os.path.join(os.path.dirname(default_output) or ".", "baselines")
+    os.makedirs(base_dir, exist_ok=True)
+    scenario_args.output_json = os.path.join(base_dir, f"{scenario_name}.json")
+
+    # Avoid export collisions when compiling TM artifacts.
+    if hasattr(scenario_args, "export_prefix"):
+        scenario_args.export_prefix = f"{scenario_name}_{scenario_args.export_prefix}"
+
+    return scenario_args
 
 
 def current_device(preferred: str = "auto") -> torch.device:
@@ -749,6 +1038,8 @@ def evaluate_model(model: nn.Module,
             xb = prepare_fn(x)
             outputs = model(xb, use_ste=use_ste)
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            if hasattr(model, "pop_regularization_loss"):
+                model.pop_regularization_loss()
             pred = logits.argmax(dim=1)
             if collect_preds: preds.extend(pred.cpu().tolist())
             correct += (pred == y).sum().item()
@@ -817,7 +1108,8 @@ def train_tm_model(model: nn.Module,
                    base_lr: float,
                    min_lr: float,
                    warmup_epochs: int,
-                   weight_decay: float) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   weight_decay: float,
+                   gradient_centralize: bool = False) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -841,6 +1133,8 @@ def train_tm_model(model: nn.Module,
                 loss = F.cross_entropy(logits, y)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
+            if gradient_centralize:
+                apply_gradient_centralization(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(opt)
             scaler.update()
@@ -945,7 +1239,8 @@ def run_variant_tm(train_loader,
                    base_lr: float = 1e-3,
                    min_lr: float = 1e-3,
                    warmup_epochs: int = 0,
-                   weight_decay: float = 1e-5) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                   weight_decay: float = 1e-5,
+                   gradient_centralize: bool = False) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
     if tm_impl == "fptm":
         model = FuzzyPatternTMFPTM(
@@ -992,6 +1287,7 @@ def run_variant_tm(train_loader,
         min_lr=min_lr,
         warmup_epochs=warmup_epochs,
         weight_decay=weight_decay,
+        gradient_centralize=gradient_centralize,
     )
     bundle = model.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
@@ -1018,7 +1314,8 @@ def run_variant_deeptm(train_loader,
                        base_lr: float = 1e-3,
                        min_lr: float = 1e-3,
                        warmup_epochs: int = 0,
-                       weight_decay: float = 1e-5) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       weight_decay: float = 1e-5,
+                       gradient_centralize: bool = False) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
     model = DeepTMNetwork(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -1048,6 +1345,7 @@ def run_variant_deeptm(train_loader,
         min_lr=min_lr,
         warmup_epochs=warmup_epochs,
         weight_decay=weight_decay,
+        gradient_centralize=gradient_centralize,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
@@ -1077,7 +1375,8 @@ def run_variant_hybrid(train_loader,
         n_classes=n_classes,
         tm_tau=tm_tau,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    param_groups = build_param_groups_with_layer_decay(model, base_lr, weight_decay, layer_decay)
+    opt = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
@@ -1099,6 +1398,8 @@ def run_variant_hybrid(train_loader,
                 loss = F.cross_entropy(logits, y)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
+            if gradient_centralize:
+                apply_gradient_centralization(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(opt)
             scaler.update()
@@ -1179,7 +1480,28 @@ def run_variant_transformer(train_loader,
                             min_lr: float = 7e-4,
                             warmup_epochs: int = 0,
                             weight_decay: float = 1e-5,
+                            layer_decay: float = 1.0,
+                            gradient_centralize: bool = False,
                             aux_weight: float = 0.0,
+                            ff_gate: str = "none",
+                            ff_gate_activation: str = "sigmoid",
+                            layerscale_init: float = 1e-4,
+                            use_layerscale: bool = True,
+                            clause_dropout: float = 0.0,
+                            literal_dropout: float = 0.0,
+                            sparsity_weight: float = 0.0,
+                            clause_bias_init: float = 0.0,
+                            norm_type: str = "layernorm",
+                            mix_type: str = "none",
+                            bitwise_mix: bool = False,
+                            learnable_tau: bool = False,
+                            tau_min: float = 0.05,
+                            tau_max: float = 0.95,
+                            tau_ema_beta: Optional[float] = None,
+                            clause_attention: bool = False,
+                            clause_routing: bool = False,
+                            continuous_bypass: bool = False,
+                            bypass_scale: float = 1.0,
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
     model = UnifiedTMTransformer(
         num_classes=num_classes,
@@ -1201,6 +1523,25 @@ def run_variant_transformer(train_loader,
         use_cls_token=use_cls_token,
         pool=pool,
         grad_checkpoint=grad_checkpoint,
+        ff_gate=ff_gate,
+        ff_gate_activation=ff_gate_activation,
+        layerscale_init=layerscale_init,
+        use_layerscale=use_layerscale,
+        clause_dropout=clause_dropout,
+        literal_dropout=literal_dropout,
+        ff_sparsity_weight=sparsity_weight,
+        clause_bias_init=clause_bias_init,
+        norm_type=norm_type,
+        ff_mix_type=mix_type,
+        ff_bitwise_mix=bitwise_mix,
+        learnable_tau=learnable_tau,
+        tau_min=tau_min,
+        tau_max=tau_max,
+        tau_ema_beta=tau_ema_beta,
+        clause_attention=clause_attention,
+        clause_routing=clause_routing,
+        continuous_bypass=continuous_bypass,
+        bypass_scale=bypass_scale,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -1243,8 +1584,13 @@ def run_variant_transformer(train_loader,
                             aux_loss += F.cross_entropy(aux_logits, y)
                     aux_loss = aux_loss / max(len(aux_outputs), 1)
                     loss = loss + aux_weight * aux_loss
+                reg_loss = model.pop_regularization_loss()
+                if reg_loss is not None:
+                    loss = loss + reg_loss
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
+            if gradient_centralize:
+                apply_gradient_centralization(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(opt)
             scaler.update()
@@ -1313,10 +1659,7 @@ def run_variant_transformer(train_loader,
     return label, last_train_acc, test_acc, train_time, preds, diagnostics, best_test_acc
 
 
-def main(argv: Optional[List[str]] = None):
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
+def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
     maybe_set_seed(args.seed)
     if args.tm_L is None:
         args.tm_L = args.tm_literal_budget if args.tm_literal_budget is not None else 16
@@ -1558,6 +1901,7 @@ def main(argv: Optional[List[str]] = None):
                     min_lr=tm_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
@@ -1583,6 +1927,7 @@ def main(argv: Optional[List[str]] = None):
                     min_lr=deeptm_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
                 )
                 variant_classes = args.num_classes
             elif model_key == "hybrid":
@@ -1604,6 +1949,7 @@ def main(argv: Optional[List[str]] = None):
                     min_lr=hybrid_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
                 )
                 variant_classes = hybrid_classes
             elif model_key == "transformer":
@@ -1640,7 +1986,28 @@ def main(argv: Optional[List[str]] = None):
                     min_lr=transformer_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
+                    layer_decay=args.lr_layer_decay,
+                    gradient_centralize=args.gradient_centralize,
                     aux_weight=args.transformer_aux_weight,
+                    ff_gate=args.transformer_ff_gate,
+                    ff_gate_activation=args.transformer_ff_gate_activation,
+                    layerscale_init=args.transformer_layerscale_init,
+                    use_layerscale=args.transformer_use_layerscale,
+                    clause_dropout=args.transformer_clause_drop,
+                    literal_dropout=args.transformer_literal_drop,
+                    sparsity_weight=args.transformer_sparsity_weight,
+                    clause_bias_init=args.transformer_clause_bias,
+                    norm_type=args.transformer_norm,
+                    mix_type=args.transformer_ff_mix,
+                    bitwise_mix=args.transformer_bitwise_mix,
+                    learnable_tau=args.transformer_learnable_tau,
+                    tau_min=args.transformer_tau_min,
+                    tau_max=args.transformer_tau_max,
+                    tau_ema_beta=args.transformer_tau_ema,
+                    clause_attention=args.transformer_clause_attention,
+                    clause_routing=args.transformer_clause_routing,
+                    continuous_bypass=args.transformer_bypass,
+                    bypass_scale=args.transformer_bypass_scale,
                 )
                 bundle = None
                 variant_classes = args.num_classes
@@ -1710,6 +2077,36 @@ def main(argv: Optional[List[str]] = None):
     else:
         print("Boolean datasets: skipped (flag disabled)")
     print("Summary JSON:", args.output_json)
+    return results
+
+
+def main(argv: Optional[List[str]] = None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.list_baselines:
+        list_baseline_scenarios()
+        return
+
+    baseline_names = tuple(args.baseline_scenarios or [])
+    target_dir = args.baseline_output_dir
+    if target_dir is not None:
+        os.makedirs(target_dir, exist_ok=True)
+
+    for scenario_name in baseline_names:
+        scenario_args = build_baseline_args(args, scenario_name, output_dir=target_dir)
+        print(f"\n>>> Running baseline scenario: {scenario_name}")
+        run_experiment_with_args(scenario_args)
+
+    if baseline_names and args.baseline_only:
+        return
+
+    args.baseline_scenarios = None
+    args.baseline_output_dir = None
+    args.baseline_only = False
+    args.list_baselines = False
+
+    run_experiment_with_args(args)
 
 
 if __name__ == "__main__":

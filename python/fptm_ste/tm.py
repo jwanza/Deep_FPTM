@@ -127,6 +127,9 @@ class FuzzyPatternTM_STE(nn.Module):
         input_shape: Optional[Tuple[int, int, int]] = None,
         auto_expand_grayscale: bool = False,
         allow_channel_reduce: bool = True,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        clause_bias_init: float = 0.0,
     ):
         super().__init__()
         self.n_features = n_features
@@ -136,6 +139,9 @@ class FuzzyPatternTM_STE(nn.Module):
         self.input_shape = tuple(input_shape) if input_shape is not None else None
         self.auto_expand_grayscale = auto_expand_grayscale
         self.allow_channel_reduce = allow_channel_reduce
+        self.clause_dropout = clause_dropout
+        self.literal_dropout = literal_dropout
+        self.clause_bias = nn.Parameter(torch.full((n_clauses,), clause_bias_init, dtype=torch.float32))
         if self.input_shape is not None:
             product = self.input_shape[0] * self.input_shape[1] * self.input_shape[2]
             if product != self.n_features:
@@ -179,6 +185,9 @@ class FuzzyPatternTM_STE(nn.Module):
         B, F_ = x.shape
         assert F_ == self.n_features
 
+        if self.training and self.literal_dropout > 0.0:
+            x = F.dropout(x, p=self.literal_dropout, training=True)
+
         if use_ste:
             p_pos = self._ste_binary(self.ta_pos, self.tau)
             p_neg = self._ste_binary(self.ta_neg, self.tau)
@@ -206,6 +215,8 @@ class FuzzyPatternTM_STE(nn.Module):
         neg_prod = torch.exp(-torch.clamp(neg_score, min=0.0, max=10.0))
 
         clause_outputs = torch.cat([pos_prod, neg_prod], dim=1)  # [B, n_clauses]
+        if self.training and self.clause_dropout > 0.0:
+            clause_outputs = F.dropout(clause_outputs, p=self.clause_dropout, training=True)
         return pos_prod, neg_prod, clause_outputs
 
     def forward(self, x: torch.Tensor, use_ste: bool = True):
@@ -223,7 +234,7 @@ class FuzzyPatternTM_STE(nn.Module):
             allow_channel_reduce=self.allow_channel_reduce,
         )
         _, _, clause_outputs = self._clause_products(flat_x, use_ste=use_ste, already_flat=True)
-        logits = clause_outputs @ self.voting
+        logits = (clause_outputs + self.clause_bias.view(1, -1)) @ self.voting
         return logits, clause_outputs
 
     @torch.no_grad()

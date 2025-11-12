@@ -1,3 +1,4 @@
+import pytest
 import torch
 from fptm_ste import TM_TransformerBlock, UnifiedTMTransformer
 
@@ -121,3 +122,225 @@ def test_unified_tm_transformer_swin_diagnostics():
         assert value.shape == (1, 10), key
 
 
+
+
+
+@pytest.mark.parametrize("gate_type", ["linear", "geglu", "swiglu"])
+def test_tm_feedforward_split_gates(gate_type):
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        ff_gate=gate_type,
+    )
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+    logits.sum().backward()
+
+
+def test_tm_feedforward_tm_gate():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        ff_gate="tm",
+    )
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+    logits.sum().backward()
+
+
+def test_tm_feedforward_deeptm_gate():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="deeptm",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        ff_gate="deeptm",
+    )
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+    logits.sum().backward()
+
+
+def test_unified_tm_transformer_clause_dropout():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        clause_dropout=0.25,
+        literal_dropout=0.1,
+        clause_bias_init=0.05,
+    )
+    model.train()
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    reg = model.pop_regularization_loss()
+    loss = logits.sum()
+    if reg is not None:
+        loss = loss + reg
+    loss.backward()
+
+
+def test_unified_tm_transformer_sparsity_penalty():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        ff_sparsity_weight=0.1,
+    )
+    model.train()
+    x = torch.rand(2, 3, 32, 32, requires_grad=True)
+    logits = model(x, use_ste=True)
+    reg = model.pop_regularization_loss()
+    assert reg is not None
+    (logits.sum() + reg).backward()
+
+
+@pytest.mark.parametrize("norm_type", ["layernorm", "rmsnorm", "scalenorm"])
+def test_unified_tm_transformer_norm_variants(norm_type):
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        norm_type=norm_type,
+    )
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+
+
+def test_unified_tm_transformer_feature_mix():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        ff_mix_type="linear_depthwise",
+        ff_bitwise_mix=True,
+    )
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+
+
+def test_unified_tm_transformer_learnable_tau():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        learnable_tau=True,
+        tau_ema_beta=0.9,
+    )
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+    reg = model.pop_regularization_loss()
+    assert reg is None or reg.shape == ()
+
+
+def test_unified_tm_transformer_clause_attention():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        clause_attention=True,
+        clause_routing=True,
+    )
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+
+
+def test_unified_tm_transformer_continuous_bypass():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        continuous_bypass=True,
+        bypass_scale=0.5,
+    )
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
