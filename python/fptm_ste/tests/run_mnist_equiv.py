@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
@@ -349,6 +349,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=int_env("TM_MNIST_TEST_BATCH", 512),
         help="Evaluation batch size.",
+    )
+    parser.add_argument(
+        "--test-holdout-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of the evaluation dataset reserved for blind holdout (0 disables the split).",
+    )
+    parser.add_argument(
+        "--test-holdout-seed",
+        type=int,
+        default=None,
+        help="Optional random seed controlling evaluation/holdout split when --test-holdout-fraction > 0.",
     )
     parser.add_argument(
         "--imagenet-train-dir",
@@ -931,6 +943,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Temperature for external teacher KD.",
     )
     parser.add_argument(
+        "--distill-teacher-trainable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow external teacher weights to update during distillation.",
+    )
+    parser.add_argument(
+        "--distill-teacher-lr",
+        type=float,
+        default=None,
+        help="Optional learning rate for trainable teacher parameters (defaults to transformer base LR).",
+    )
+    parser.add_argument(
         "--transformer-contrastive-weight",
         type=float,
         default=0.0,
@@ -1358,8 +1382,31 @@ def evaluate_model(model: nn.Module,
             total += y.size(0)
     acc = correct / total
     if was_training:
+        if teacher_model is not None and distill_teacher_trainable:
+            teacher_model.train()
         model.train()
     return acc, preds
+
+
+def evaluate_classifier(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    was_training = model.training
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(x)
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            preds = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    acc = correct / total if total > 0 else 0.0
+    if was_training:
+        model.train()
+    return acc
 
 
 def evaluate_transformer_components(
@@ -1496,6 +1543,8 @@ def build_distillation_teacher(
     in_channels: int,
     device: torch.device,
     img_size: Tuple[int, int],
+    *,
+    trainable: bool = False,
 ) -> nn.Module:
     if not timm_name and not checkpoint_path:
         raise ValueError("No teacher configuration provided.")
@@ -1518,9 +1567,12 @@ def build_distillation_teacher(
             state = state["state_dict"]
         teacher.load_state_dict(state, strict=False)
     teacher.to(device)
-    teacher.eval()
-    for param in teacher.parameters():
-        param.requires_grad_(False)
+    if trainable:
+        teacher.train()
+    else:
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad_(False)
     return teacher
 
 
@@ -2113,6 +2165,7 @@ def run_variant_transformer(train_loader,
                             visualize_topk: int = 3,
                             class_names: Optional[Sequence[str]] = None,
                             test_dataset: Optional[Dataset] = None,
+                            holdout_loader: Optional[DataLoader] = None,
                             normalize_stats: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
                             clause_specialize: bool = False,
                             clause_specialize_strength: float = 0.5,
@@ -2120,6 +2173,8 @@ def run_variant_transformer(train_loader,
                             distill_teacher_checkpoint: str = "",
                             distill_teacher_weight: float = 0.0,
                             distill_teacher_temp: float = 1.0,
+                            distill_teacher_trainable: bool = False,
+                            distill_teacher_lr: Optional[float] = None,
                             save_path: str = "",
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     base_model_kwargs: Dict[str, Any] = {
@@ -2183,17 +2238,8 @@ def run_variant_transformer(train_loader,
     base_model_kwargs["tm_clauses"] = tm_clauses
     model = UnifiedTMTransformer(**base_model_kwargs).to(device)
     apply_tm_prior_template(model, tm_prior_template)
-    param_groups = build_param_groups_with_layer_decay(model, base_lr, weight_decay, layer_decay)
-    opt = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-    ema_model = copy.deepcopy(model) if ema_decay > 0 else None
-    start = time.time()
-    last_train_acc: Optional[float] = None
-    best_test_acc: Optional[float] = None
-    label = f"Transformer-{architecture.upper()}"
-    collect_aux = aux_weight > 0
     teacher_model = None
-    if distill_teacher_weight > 0.0 and (distill_teacher_timm or distill_teacher_checkpoint):
+    if (distill_teacher_weight > 0.0 or distill_teacher_trainable) and (distill_teacher_timm or distill_teacher_checkpoint):
         teacher_model = build_distillation_teacher(
             distill_teacher_timm,
             distill_teacher_checkpoint,
@@ -2201,8 +2247,24 @@ def run_variant_transformer(train_loader,
             in_channels,
             device,
             image_size,
+            trainable=distill_teacher_trainable,
         )
+    teacher_lr_value = distill_teacher_lr if distill_teacher_lr is not None else base_lr
+    if teacher_model is not None:
         print(f"Loaded teacher model: {distill_teacher_timm or distill_teacher_checkpoint}")
+    param_groups = build_param_groups_with_layer_decay(model, base_lr, weight_decay, layer_decay)
+    opt = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
+    if teacher_model is not None and distill_teacher_trainable:
+        teacher_params = [p for p in teacher_model.parameters() if p.requires_grad]
+        if teacher_params:
+            opt.add_param_group({"params": teacher_params, "lr": teacher_lr_value, "weight_decay": weight_decay})
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    ema_model = copy.deepcopy(model) if ema_decay > 0 else None
+    start = time.time()
+    last_train_acc: Optional[float] = None
+    best_test_acc: Optional[float] = None
+    label = f"Transformer-{architecture.upper()}"
+    collect_aux = aux_weight > 0
     component_history: List[Dict[str, Any]] = []
     writer = None
     if log_dir:
@@ -2242,25 +2304,34 @@ def run_variant_transformer(train_loader,
         contrast_count = 0
         total_teacher_kd = 0.0
         teacher_count = 0
+        total_teacher_ce = 0.0
+        teacher_ce_count = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             if cycle_steps > 0:
                 current_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
                 set_optimizer_lr(opt, current_lr)
                 epoch_lr = current_lr
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            external_teacher_logits: Optional[torch.Tensor] = None
-            if teacher_model is not None:
-                with torch.no_grad():
-                    teacher_out = teacher_model(x)
-                    if isinstance(teacher_out, tuple):
-                        external_teacher_logits = teacher_out[0]
-                    else:
-                        external_teacher_logits = teacher_out
             x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_epoch_alpha, cutmix_epoch_alpha)
+            teacher_inputs = x_aug if distill_teacher_trainable else x
             opt.zero_grad(set_to_none=True)
             distill_term: Optional[torch.Tensor] = None
             contrast_term: Optional[torch.Tensor] = None
+            teacher_ce_term: Optional[torch.Tensor] = None
+            external_teacher_logits: Optional[torch.Tensor] = None
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                teacher_logits_for_loss: Optional[torch.Tensor] = None
+                if teacher_model is not None:
+                    if distill_teacher_trainable:
+                        teacher_out = teacher_model(teacher_inputs)
+                        teacher_logits = teacher_out[0] if isinstance(teacher_out, tuple) else teacher_out
+                        teacher_logits_for_loss = teacher_logits
+                        external_teacher_logits = teacher_logits.detach()
+                    else:
+                        with torch.no_grad():
+                            teacher_out = teacher_model(teacher_inputs)
+                            teacher_logits = teacher_out[0] if isinstance(teacher_out, tuple) else teacher_out
+                            external_teacher_logits = teacher_logits
                 outputs = model(
                     x_aug,
                     use_ste=True,
@@ -2299,6 +2370,18 @@ def run_variant_transformer(train_loader,
                             aux_loss += F.cross_entropy(aux_logits, y, label_smoothing=label_smoothing)
                     aux_loss = aux_loss / max(len(aux_outputs), 1)
                     loss = loss + aux_weight * aux_loss
+                if teacher_logits_for_loss is not None:
+                    if lam is not None:
+                        teacher_ce_term = lam * F.cross_entropy(
+                            teacher_logits_for_loss, targets_a, label_smoothing=label_smoothing
+                        ) + (1 - lam) * F.cross_entropy(
+                            teacher_logits_for_loss, targets_b, label_smoothing=label_smoothing
+                        )
+                    else:
+                        teacher_ce_term = F.cross_entropy(
+                            teacher_logits_for_loss, y, label_smoothing=label_smoothing
+                        )
+                    loss = loss + teacher_ce_term
                 if self_distill_weight > 0.0 and ema_model is not None:
                     with torch.no_grad():
                         teacher_out = ema_model(x_aug, use_ste=True)
@@ -2324,6 +2407,9 @@ def run_variant_transformer(train_loader,
                 reg_loss = model.pop_regularization_loss()
                 if reg_loss is not None:
                     loss = loss + reg_loss
+            if teacher_ce_term is not None:
+                total_teacher_ce += teacher_ce_term.detach().item()
+                teacher_ce_count += 1
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -2366,6 +2452,10 @@ def run_variant_transformer(train_loader,
         avg_distill = (total_distill / distill_count) if distill_count > 0 else None
         avg_contrast = (total_contrast / contrast_count) if contrast_count > 0 else None
         avg_teacher_kd = (total_teacher_kd / teacher_count) if teacher_count > 0 else None
+        avg_teacher_ce = (total_teacher_ce / teacher_ce_count) if teacher_ce_count > 0 else None
+        teacher_eval_acc = None
+        if teacher_model is not None:
+            teacher_eval_acc = evaluate_classifier(teacher_model, test_loader, device)
         component_history.append(
             {
                 "epoch": epoch + 1,
@@ -2377,6 +2467,8 @@ def run_variant_transformer(train_loader,
                 "contrastive_loss": avg_contrast,
                 "clause_usage": clause_usage,
                 "teacher_kd_loss": avg_teacher_kd,
+                "teacher_ce_loss": avg_teacher_ce,
+                "teacher_accuracy": teacher_eval_acc,
             }
         )
 
@@ -2389,6 +2481,10 @@ def run_variant_transformer(train_loader,
             extras["contrast_loss"] = avg_contrast
         if avg_teacher_kd is not None:
             extras["teacher_kd_loss"] = avg_teacher_kd
+        if avg_teacher_ce is not None:
+            extras["teacher_ce_loss"] = avg_teacher_ce
+        if teacher_eval_acc is not None:
+            extras["teacher_acc"] = teacher_eval_acc
         if writer is not None:
             writer.add_scalar(f"{label}/loss/train", avg_loss, epoch)
             if epoch_acc is not None:
@@ -2403,6 +2499,10 @@ def run_variant_transformer(train_loader,
                 writer.add_scalar(f"{label}/aux/contrastive_loss", avg_contrast, epoch)
             if avg_teacher_kd is not None:
                 writer.add_scalar(f"{label}/aux/teacher_kd_loss", avg_teacher_kd, epoch)
+            if avg_teacher_ce is not None:
+                writer.add_scalar(f"{label}/teacher/ce_loss", avg_teacher_ce, epoch)
+            if teacher_eval_acc is not None:
+                writer.add_scalar(f"{label}/teacher/accuracy", teacher_eval_acc, epoch)
             for name, value in component_acc.items():
                 writer.add_scalar(f"{label}/components/{name}", value, epoch)
         log_msg = format_epoch_log(
@@ -2424,12 +2524,39 @@ def run_variant_transformer(train_loader,
 
     train_time = time.time() - start
     eval_model = ema_model if ema_model is not None else model
-    test_acc, final_component_acc, preds, final_clause_usage = evaluate_transformer_components(
+    eval_acc, eval_component_acc, eval_preds, eval_clause_usage = evaluate_transformer_components(
         eval_model,
         test_loader,
         device,
         collect_preds=True,
     )
+    teacher_eval_final = None
+    if teacher_model is not None:
+        teacher_eval_final = evaluate_classifier(teacher_model, test_loader, device)
+    holdout_acc = None
+    holdout_component_acc: Optional[Dict[str, float]] = None
+    holdout_clause_usage: Optional[Dict[str, List[float]]] = None
+    holdout_preds: List[int] = []
+    teacher_holdout_acc = None
+    if holdout_loader is not None:
+        holdout_acc, holdout_component_acc, holdout_preds, holdout_clause_usage = evaluate_transformer_components(
+            eval_model,
+            holdout_loader,
+            device,
+            collect_preds=True,
+        )
+        if teacher_model is not None:
+            teacher_holdout_acc = evaluate_classifier(teacher_model, holdout_loader, device)
+    if holdout_loader is not None and holdout_acc is not None:
+        test_acc = holdout_acc
+        final_component_acc = holdout_component_acc or {}
+        final_clause_usage = holdout_clause_usage or {}
+        preds = holdout_preds
+    else:
+        test_acc = eval_acc
+        final_component_acc = eval_component_acc
+        final_clause_usage = eval_clause_usage
+        preds = eval_preds
     if best_test_acc is None or test_acc > best_test_acc:
         best_test_acc = test_acc
     diagnostics = {
@@ -2445,7 +2572,18 @@ def run_variant_transformer(train_loader,
             "teacher_weight": distill_teacher_weight,
             "teacher_temp": distill_teacher_temp,
         },
+        "eval_accuracy": eval_acc,
+        "eval_component_accuracy": eval_component_acc,
+        "eval_clause_usage": eval_clause_usage,
     }
+    if teacher_eval_final is not None:
+        diagnostics["teacher_eval_accuracy"] = teacher_eval_final
+    if holdout_loader is not None and holdout_acc is not None:
+        diagnostics["holdout_accuracy"] = holdout_acc
+        diagnostics["holdout_component_accuracy"] = holdout_component_acc
+        diagnostics["holdout_clause_usage"] = holdout_clause_usage
+        if teacher_holdout_acc is not None:
+            diagnostics["teacher_holdout_accuracy"] = teacher_holdout_acc
 
     if clause_specialize and final_clause_usage:
         model.apply_clause_head_specialization(final_clause_usage, clause_specialize_strength)
@@ -2600,6 +2738,9 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             args.write_bool_dataset = False
 
     test_normalize_stats: Optional[Tuple[Sequence[float], Sequence[float]]] = None
+    holdout_loader: Optional[DataLoader] = None
+    holdout_dataset: Optional[Dataset] = None
+    eval_dataset: Optional[Dataset] = None
 
     if imagenet_mode:
         crop_size = args.imagenet_crop
@@ -2675,14 +2816,39 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
         )
+        eval_dataset = test_ds
+        holdout_fraction = max(0.0, min(1.0, float(args.test_holdout_fraction)))
+        if holdout_fraction > 0.0 and len(test_ds) > 1:
+            proposed_size = int(round(len(test_ds) * holdout_fraction))
+            holdout_size = max(1, min(proposed_size, len(test_ds) - 1))
+            eval_size = len(test_ds) - holdout_size
+            split_seed = (
+                args.test_holdout_seed
+                if args.test_holdout_seed is not None
+                else (args.seed if args.seed is not None else 0)
+            )
+            generator = torch.Generator()
+            generator.manual_seed(split_seed)
+            eval_dataset, holdout_dataset = random_split(test_ds, [eval_size, holdout_size], generator=generator)
+        else:
+            holdout_fraction = 0.0
         test_loader = DataLoader(
-            test_ds,
+            eval_dataset,
             batch_size=args.test_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
         )
+        if holdout_dataset is not None:
+            holdout_loader = DataLoader(
+                holdout_dataset,
+                batch_size=args.test_batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+            )
 
     if args.write_bool_dataset:
         with profile_block("write-boolean-datasets"):
@@ -2693,6 +2859,9 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                 args.bool_test_path,
                 thr=args.bool_threshold,
             )
+
+    if eval_dataset is None:
+        eval_dataset = test_ds
 
     tm_feature_mode = args.tm_feature_mode.lower()
     tm_bundle = None
@@ -2978,7 +3147,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     visualize_samples=args.visualize_samples,
                     visualize_topk=args.visualize_topk,
                     class_names=getattr(train_ds, "classes", None),
-                    test_dataset=test_ds,
+                    test_dataset=eval_dataset,
+                    holdout_loader=holdout_loader,
                     normalize_stats=test_normalize_stats,
                     clause_specialize=args.transformer_clause_specialize,
                     clause_specialize_strength=args.transformer_clause_specialize_strength,
@@ -2986,6 +3156,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     distill_teacher_checkpoint=args.distill_teacher_checkpoint,
                     distill_teacher_weight=args.distill_teacher_weight,
                     distill_teacher_temp=args.distill_teacher_temp,
+                    distill_teacher_trainable=args.distill_teacher_trainable,
+                    distill_teacher_lr=args.distill_teacher_lr,
                             save_path=args.transformer_save_path,
                 )
                 bundle = None
@@ -3019,6 +3191,16 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             "best_epoch_test_accuracy": best_epoch_test_acc,
             "profile": profile,
         }
+        if diagnostics is not None:
+            results[model_key]["diagnostics"] = diagnostics
+            if "eval_accuracy" in diagnostics:
+                results[model_key]["eval_accuracy"] = diagnostics["eval_accuracy"]
+            if "holdout_accuracy" in diagnostics:
+                results[model_key]["holdout_accuracy"] = diagnostics["holdout_accuracy"]
+            if "teacher_eval_accuracy" in diagnostics:
+                results[model_key]["teacher_eval_accuracy"] = diagnostics["teacher_eval_accuracy"]
+            if "teacher_holdout_accuracy" in diagnostics:
+                results[model_key]["teacher_holdout_accuracy"] = diagnostics["teacher_holdout_accuracy"]
         if model_key == "tm":
             results[model_key]["feature_mode"] = tm_feature_mode
             results[model_key]["n_features"] = tm_n_features

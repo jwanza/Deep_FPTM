@@ -41,7 +41,11 @@ This guide shows how to launch the upgraded TM transformers, outlines every conf
 | `--transformer-auto-clause-batches` | number of batches sampled during auto tuning |
 | `--transformer-self-distill-weight`, `--transformer-self-distill-temp` | EMA-teacher self-distillation controls |
 | `--transformer-contrastive-weight`, `--transformer-contrastive-temp` | supervised contrastive auxiliary controls |
+| `--test-holdout-fraction` | fraction of the evaluation set reserved as a blind holdout (0 reuses the full test split each epoch) |
+| `--test-holdout-seed` | random seed controlling the evaluation/holdout partition when using a holdout fraction |
 | `--transformer-save-path` | write a checkpoint (state dict + config + metrics) for the trained transformer |
+| `--distill-teacher-trainable` | allow the external teacher to fine-tune during KD (adds teacher CE loss and accuracy logging) |
+| `--distill-teacher-lr` | optional learning rate override for trainable teacher parameters (defaults to transformer LR) |
 
 Additional data-prep knobs:
 - `--tm-feature-mode` with presets from `fptm_ste.datasets`, plus `--tm-feature-config`, `--tm-feature-size`, `--tm-feature-grayscale`, reuse cached boolean TM features when needed.
@@ -258,6 +262,8 @@ Collect wall-clock timings (the runner logs per-epoch duration) and accuracy to 
 - Control KD strength with `--distill-teacher-weight` and temperature with `--distill-teacher-temp`.  
 - Combine with EMA self-distillation (`--transformer-self-distill-weight/temp`) and clause-aware head specialisation (`--transformer-clause-specialize`).  
 - Diagnostic JSON now records `teacher_kd_loss` (per epoch) and final clause usage, making it easy to compare student-only vs teacher-guided runs.
+- Pass `--distill-teacher-trainable` (optionally with `--distill-teacher-lr`) to fine-tune the teacher backbone alongside the student; the runner logs `teacher_ce_loss` and `teacher_acc` each epoch.
+- Use `--test-holdout-fraction` to reserve part of the evaluation set as a blind holdout while still tracking student/teacher accuracy during training.
 
 ### 9.1 Step-by-step: ViT Teacher → TM-ViT Student (MNIST demo)
 1. Activate the project environment and expose the package path:
