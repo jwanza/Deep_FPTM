@@ -9,6 +9,7 @@ from torch.utils.checkpoint import checkpoint
 from .tm import FuzzyPatternTM_STE
 from .deep_tm import DeepTMNetwork
 from .swin_tm import DropPath, WindowAttention, InstrumentedMultiheadAttention
+from .tm_positional import RelativePositionBias2D, RotaryEmbedding
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
 
 
@@ -126,6 +127,8 @@ class TMFeedForward(nn.Module):
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
+        use_flash_attention: bool = False,
+        use_residual_attention: bool = False,
     ) -> None:
         super().__init__()
         self.backend = backend.lower()
@@ -210,6 +213,7 @@ class TMFeedForward(nn.Module):
             self.bypass_gain = nn.Parameter(torch.tensor(bypass_scale))
         else:
             self.register_parameter("bypass_gain", None)
+        self.last_clause_outputs: Optional[torch.Tensor] = None
         if self.backend == "ste":
             self.core = FuzzyPatternTM_STE(
                 hidden_dim,
@@ -337,6 +341,7 @@ class TMFeedForward(nn.Module):
             self._sparsity_penalty = clause_outputs.abs().mean() * self.sparsity_weight
         else:
             self._sparsity_penalty = None
+        self.last_clause_outputs = clause_outputs.view(B, T, -1).detach()
         logits = logits.view(B, T, C)
         if self.clause_attn_proj is not None:
             clause_ctx = self.clause_attn_proj(clause_outputs).view(B, T, C)
@@ -389,10 +394,34 @@ class TMEncoderBlock(nn.Module):
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
+        use_flash_attention: bool = False,
+        use_residual_attention: bool = False,
+        grid_size: Optional[Tuple[int, int]] = None,
+        include_cls_token: bool = False,
+        relative_position_type: str = "none",
     ) -> None:
         super().__init__()
         self.norm1 = build_norm(norm_type, dim)
-        self.attn = InstrumentedMultiheadAttention(dim, num_heads, attn_drop)
+        rpb = None
+        rotary = None
+        position_type = relative_position_type.lower()
+        if position_type not in {"none", "learned", "rotary"}:
+            raise ValueError(f"Unknown relative position type '{relative_position_type}'.")
+        if position_type in {"learned", "rotary"} and grid_size is None:
+            raise ValueError("grid_size must be provided when using relative positional encodings.")
+        if position_type == "learned" and grid_size is not None:
+            rpb = RelativePositionBias2D(num_heads, grid_size, has_cls_token=include_cls_token)
+        if position_type == "rotary" and grid_size is not None:
+            seq_len = grid_size[0] * grid_size[1] + (1 if include_cls_token else 0)
+            rotary = RotaryEmbedding(dim // num_heads, max_seq_len=seq_len)
+        self.attn = InstrumentedMultiheadAttention(
+            dim,
+            num_heads,
+            attn_drop,
+            use_flash=use_flash_attention,
+            relative_position_bias=rpb,
+            rotary_emb=rotary,
+        )
         self.attn_drop = nn.Dropout(drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         hidden_dim = int(dim * mlp_ratio)
@@ -424,6 +453,9 @@ class TMEncoderBlock(nn.Module):
         self.norm2 = build_norm(norm_type, dim)
         self.num_heads = num_heads
         self.enable_layerscale = enable_layerscale
+        self.use_residual_attention = use_residual_attention
+        self.last_attention: Optional[torch.Tensor] = None
+        self.last_head_context: Optional[torch.Tensor] = None
         if enable_layerscale:
             self.attn_scale = nn.Parameter(torch.ones(dim))
             self.tm_scale = nn.Parameter(torch.ones(dim) * layerscale_init)
@@ -437,12 +469,17 @@ class TMEncoderBlock(nn.Module):
         use_ste: bool = True,
         *,
         collect_diagnostics: bool = False,
+        attn_residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_in = self.norm1(x)
         attn_out, head_context, _ = self.attn(attn_in)
         attn_out = self.attn_drop(attn_out)
+        if self.use_residual_attention and attn_residual is not None:
+            attn_out = attn_out + attn_residual
         if self.enable_layerscale and self.attn_scale is not None:
             attn_out = attn_out * self.attn_scale.view(1, 1, -1)
+        self.last_attention = attn_out
+        self.last_head_context = head_context if collect_diagnostics else None
         x = x + self.drop_path(attn_out)
         ff_input = self.norm2(x)
         ff_out = self.ffn(ff_input, use_ste=use_ste)
@@ -489,13 +526,32 @@ class TMSwinBlock(nn.Module):
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
+        use_flash_attention: bool = False,
+        use_residual_attention: bool = False,
+        relative_position_type: str = "none",
     ) -> None:
         super().__init__()
         self.dim = dim
         self.window_size = window_size
         self.shift_size = shift_size
         self.norm1 = build_norm(norm_type, dim)
-        self.attn = WindowAttention(dim, num_heads, attn_drop)
+        position_type = relative_position_type.lower()
+        if position_type not in {"none", "learned", "rotary"}:
+            raise ValueError(f"Unknown relative position type '{relative_position_type}'.")
+        rpb = None
+        rotary = None
+        if position_type == "learned":
+            rpb = RelativePositionBias2D(num_heads, (window_size, window_size), has_cls_token=False)
+        if position_type == "rotary":
+            rotary = RotaryEmbedding(dim // num_heads, max_seq_len=window_size * window_size)
+        self.attn = WindowAttention(
+            dim,
+            num_heads,
+            attn_drop,
+            use_flash=use_flash_attention,
+            relative_position_bias=rpb,
+            rotary_emb=rotary,
+        )
         self.attn_drop = nn.Dropout(drop)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         hidden_dim = int(dim * mlp_ratio)
@@ -527,6 +583,10 @@ class TMSwinBlock(nn.Module):
         self.norm2 = build_norm(norm_type, dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         self.enable_layerscale = enable_layerscale
+        self.use_residual_attention = use_residual_attention
+        self.last_attention: Optional[torch.Tensor] = None
+        self.last_head_tokens: Optional[torch.Tensor] = None
+        self.last_hw: Optional[Tuple[int, int]] = None
         if enable_layerscale:
             self.attn_scale = nn.Parameter(torch.ones(dim))
             self.tm_scale = nn.Parameter(torch.ones(dim) * layerscale_init)
@@ -542,6 +602,7 @@ class TMSwinBlock(nn.Module):
         use_ste: bool = True,
         *,
         collect_diagnostics: bool = False,
+        attn_residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, int, int, Optional[torch.Tensor]]:
         B, L, C = x.shape
         assert L == H * W, "Unexpected token count for Swin block"
@@ -575,8 +636,13 @@ class TMSwinBlock(nn.Module):
         x = x.reshape(B, H * W, C)
         head_tokens = head_context_merged.reshape(B, H * W, self.attn.attn.num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
         attn_proj = self.attn_drop(x)
+        if self.use_residual_attention and attn_residual is not None:
+            attn_proj = attn_proj + attn_residual
         if self.enable_layerscale and self.attn_scale is not None:
             attn_proj = attn_proj * self.attn_scale.view(1, 1, -1)
+        self.last_attention = attn_proj
+        self.last_head_tokens = head_tokens if collect_diagnostics else None
+        self.last_hw = (H, W)
         x = shortcut + self.drop_path1(attn_proj)
 
         ff_out = self.ffn(self.norm2(x), use_ste=use_ste)
@@ -623,6 +689,9 @@ class TMSwinStage(nn.Module):
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
+        use_flash_attention: bool = False,
+        use_residual_attention: bool = False,
+        relative_position_type: str = "none",
     ) -> None:
         super().__init__()
         blocks = []
@@ -660,26 +729,42 @@ class TMSwinStage(nn.Module):
                     clause_routing=clause_routing,
                     continuous_bypass=continuous_bypass,
                     bypass_scale=bypass_scale,
+                    use_flash_attention=use_flash_attention,
+                    use_residual_attention=use_residual_attention,
+                    relative_position_type=relative_position_type,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
         self.downsample = PatchMerging(dim, dim * 2) if downsample else None
         self.use_checkpoint = use_checkpoint
+        self.use_residual_attention = use_residual_attention
 
     def forward(self, x: torch.Tensor, H: int, W: int, use_ste: bool = True,
                 *, collect_diagnostics: bool = False,
                 record_callback: Optional[Callable[[str, torch.Tensor, int, int, Optional[torch.Tensor]], None]] = None,
                 stage_index: int = 0) -> Tuple[torch.Tensor, int, int]:
+        attn_residual = None
         for block_idx, block in enumerate(self.blocks):
             if self.use_checkpoint and self.training and x.requires_grad:
-                def _forward(inp, blk=block, h=H, w=W):  # type: ignore
-                    out, _, _, _ = blk(inp, h, w, use_ste=use_ste, collect_diagnostics=False)
+                residual = attn_residual if self.use_residual_attention else None
+
+                def _forward(inp, blk=block, h=H, w=W, res=residual):  # type: ignore
+                    out, _, _, _ = blk(inp, h, w, use_ste=use_ste, collect_diagnostics=False, attn_residual=res)
                     return out
 
                 x = checkpoint(_forward, x)
                 head_tokens = None
             else:
-                x, H, W, head_tokens = block(x, H, W, use_ste=use_ste, collect_diagnostics=collect_diagnostics)
+                x, H, W, head_tokens = block(
+                    x,
+                    H,
+                    W,
+                    use_ste=use_ste,
+                    collect_diagnostics=collect_diagnostics,
+                    attn_residual=attn_residual if self.use_residual_attention else None,
+                )
+            if self.use_residual_attention:
+                attn_residual = block.last_attention
             if collect_diagnostics and record_callback is not None:
                 record_callback(f"stage{stage_index + 1}_block{block_idx + 1}", x, H, W, head_tokens)
         if collect_diagnostics and record_callback is not None:
@@ -712,6 +797,7 @@ class UnifiedTMTransformer(nn.Module):
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.1,
+        drop_path_schedule: str = "linear",
         window_size: int = 7,
         use_cls_token: bool = True,
         pool: str = "cls",
@@ -735,6 +821,9 @@ class UnifiedTMTransformer(nn.Module):
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
+        use_flash_attention: bool = False,
+        use_residual_attention: bool = False,
+        relative_position_type: str = "none",
     ) -> None:
         super().__init__()
         self.architecture = architecture.lower()
@@ -761,7 +850,14 @@ class UnifiedTMTransformer(nn.Module):
         self.clause_routing = clause_routing
         self.continuous_bypass = continuous_bypass
         self.bypass_scale = bypass_scale
+        self.use_flash_attention = use_flash_attention
+        self.use_residual_attention = use_residual_attention
+        self.latest_clause_metrics: Dict[str, torch.Tensor] = {}
+        self.relative_position_type = relative_position_type.lower()
+        if self.relative_position_type not in {"none", "learned", "rotary"}:
+            raise ValueError(f"Unknown relative positional encoding '{relative_position_type}'.")
         self._pending_regularization: Optional[torch.Tensor] = None
+        schedule = drop_path_schedule.lower()
 
         self.component_dims: Dict[str, int] = {}
         self.component_order: List[str] = []
@@ -773,7 +869,10 @@ class UnifiedTMTransformer(nn.Module):
 
         if self.architecture == "vit":
             self.patch_embed = PatchEmbed(in_channels, int(embed_dim), patch_size, flatten=True)
-            num_patches = (image_size[0] // patch_size) * (image_size[1] // patch_size)
+            grid_h = image_size[0] // patch_size
+            grid_w = image_size[1] // patch_size
+            num_patches = grid_h * grid_w
+            grid_size = (grid_h, grid_w)
             self.cls_token = nn.Parameter(torch.zeros(1, 1, int(embed_dim))) if use_cls_token else None
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + (1 if self.cls_token is not None else 0), int(embed_dim)))
             self.pos_drop = nn.Dropout(drop_rate)
@@ -781,7 +880,11 @@ class UnifiedTMTransformer(nn.Module):
             head = num_heads if isinstance(num_heads, int) else num_heads[0]
             mlp = mlp_ratio if isinstance(mlp_ratio, (int, float)) else mlp_ratio[0]
             clause_list = _expand_vit_clauses(tm_clauses, depth)
-            drop_path = torch.linspace(0, drop_path_rate, depth).tolist()
+            if schedule == "cosine":
+                steps = torch.linspace(0.0, 1.0, depth)
+                drop_path = (drop_path_rate * 0.5 * (1 - torch.cos(torch.pi * steps))).tolist()
+            else:
+                drop_path = torch.linspace(0, drop_path_rate, depth).tolist()
             self.blocks = nn.ModuleList(
                 [
                     TMEncoderBlock(
@@ -813,6 +916,11 @@ class UnifiedTMTransformer(nn.Module):
                         clause_routing=self.clause_routing,
                         continuous_bypass=self.continuous_bypass,
                         bypass_scale=self.bypass_scale,
+                        use_flash_attention=self.use_flash_attention,
+                        use_residual_attention=self.use_residual_attention,
+                        grid_size=grid_size,
+                        include_cls_token=self.cls_token is not None,
+                        relative_position_type=self.relative_position_type,
                     )
                     for i in range(depth)
                 ]
@@ -847,7 +955,11 @@ class UnifiedTMTransformer(nn.Module):
             stage_mlp = _to_sequence(mlp_ratio, len(stage_depths))
             stage_clauses = _to_sequence(tm_clauses, len(stage_depths))
             total_blocks = sum(stage_depths)
-            drop_path = torch.linspace(0, drop_path_rate, total_blocks).tolist()
+            if schedule == "cosine":
+                steps = torch.linspace(0.0, 1.0, total_blocks)
+                drop_path = (drop_path_rate * 0.5 * (1 - torch.cos(torch.pi * steps))).tolist()
+            else:
+                drop_path = torch.linspace(0, drop_path_rate, total_blocks).tolist()
             self.patch_embed = PatchEmbed(in_channels, stage_dims[0], patch_size, flatten=False)
             stages = []
             dp_offset = 0
@@ -868,6 +980,26 @@ class UnifiedTMTransformer(nn.Module):
                     use_checkpoint=grad_checkpoint,
                     gate_type=self.ff_gate,
                     gate_activation=self.ff_gate_activation,
+                    norm_type=self.norm_type,
+                    layerscale_init=self.layerscale_init,
+                    enable_layerscale=self.use_layerscale,
+                    clause_dropout=self.clause_dropout,
+                    literal_dropout=self.literal_dropout,
+                    sparsity_weight=self.ff_sparsity_weight,
+                    clause_bias_init=self.clause_bias_init,
+                    mix_type=self.ff_mix_type,
+                    bitwise_mix=self.ff_bitwise_mix,
+                    learnable_tau=self.learnable_tau,
+                    tau_min=self.tau_min,
+                    tau_max=self.tau_max,
+                    tau_ema_beta=self.tau_ema_beta,
+                    clause_attention=self.clause_attention,
+                    clause_routing=self.clause_routing,
+                    continuous_bypass=self.continuous_bypass,
+                    bypass_scale=self.bypass_scale,
+                    use_flash_attention=self.use_flash_attention,
+                    use_residual_attention=self.use_residual_attention,
+                    relative_position_type=self.relative_position_type,
                 )
                 stages.append(stage)
                 dp_offset += depth
@@ -930,14 +1062,22 @@ class UnifiedTMTransformer(nn.Module):
         self,
         x: torch.Tensor,
         use_ste: bool = True,
+        *,
         collect_diagnostics: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        return_features: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, Dict[str, torch.Tensor]],
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor],
+    ]:
         if x.dim() != 4:
             raise ValueError("UnifiedTMTransformer expects image tensor of shape (B, C, H, W).")
 
         diagnostics: Dict[str, torch.Tensor] = {}
         collecting = collect_diagnostics
         reg_loss: Optional[torch.Tensor] = None
+        clause_metrics: Dict[str, torch.Tensor] = {}
 
         if self.architecture == "vit":
             x = self.patch_embed(x)
@@ -948,19 +1088,35 @@ class UnifiedTMTransformer(nn.Module):
             x = self.pos_drop(x)
             if collecting and "patch_embed" in self.diagnostic_heads:
                 diagnostics["patch_embed"] = self.diagnostic_heads["patch_embed"](self._pool_vit_tokens(x))
+            attn_residual = None
             for idx, block in enumerate(self.blocks):
                 component_key = f"block_{idx + 1}"
                 use_ckpt = self.grad_checkpoint and self.training and x.requires_grad and not collecting
                 if use_ckpt:
-                    x = checkpoint(lambda inp, blk=block: blk(inp, use_ste=use_ste, collect_diagnostics=False), x)
+                    residual = attn_residual if self.use_residual_attention else None
+                    def _block_forward(inp: torch.Tensor, blk: TMEncoderBlock = block) -> torch.Tensor:
+                        return blk(
+                            inp,
+                            use_ste=use_ste,
+                            collect_diagnostics=False,
+                            attn_residual=residual,
+                        )
+                    x = checkpoint(_block_forward, x)
                     head_context = None
                 else:
-                    result = block(x, use_ste=use_ste, collect_diagnostics=collecting)
+                    result = block(
+                        x,
+                        use_ste=use_ste,
+                        collect_diagnostics=collecting,
+                        attn_residual=attn_residual if self.use_residual_attention else None,
+                    )
                     if collecting:
                         x, head_context = result  # type: ignore[misc]
                     else:
                         x = result  # type: ignore[assignment]
                         head_context = None
+                if self.use_residual_attention:
+                    attn_residual = block.last_attention
                 if collecting and component_key in self.diagnostic_heads:
                     diagnostics[component_key] = self.diagnostic_heads[component_key](self._pool_vit_tokens(x))
                     if head_context is not None:
@@ -969,6 +1125,17 @@ class UnifiedTMTransformer(nn.Module):
                             head_key = f"{component_key}_head{head_idx + 1}"
                             if head_key in self.attn_head_heads:
                                 diagnostics[head_key] = self.attn_head_heads[head_key](head_feats[:, head_idx, :])
+                if collecting:
+                    clause_out = getattr(block.ffn, "last_clause_outputs", None)
+                    if clause_out is not None:
+                        clause_mean = clause_out.abs().mean(dim=(0, 1)).detach()
+                        clause_metrics[f"{component_key}_clause_mean"] = clause_mean.cpu()
+                        head_chunks = torch.chunk(clause_mean, block.num_heads)
+                        head_means = torch.tensor(
+                            [chunk.mean().item() for chunk in head_chunks],
+                            dtype=clause_mean.dtype,
+                        )
+                        clause_metrics[f"{component_key}_head_mean"] = head_means.cpu()
                 penalty = getattr(block.ffn, "sparsity_penalty", None)
                 if penalty is not None:
                     reg_loss = penalty if reg_loss is None else reg_loss + penalty
@@ -979,8 +1146,16 @@ class UnifiedTMTransformer(nn.Module):
             logits = self.head(feats)
             self._pending_regularization = reg_loss
             if collecting:
+                self.latest_clause_metrics = clause_metrics
+            else:
+                self.latest_clause_metrics = {}
+            if collecting:
                 diagnostics["final_decision"] = logits
+                if return_features:
+                    return logits, diagnostics, feats
                 return logits, diagnostics
+            if return_features:
+                return logits, feats
             return logits
 
         tokens = self.patch_embed(x)
@@ -1011,6 +1186,19 @@ class UnifiedTMTransformer(nn.Module):
                 record_callback=stage_record,
                 stage_index=stage_idx,
             )
+            if collecting:
+                for block_idx, block in enumerate(stage.blocks):
+                    clause_out = getattr(block.ffn, "last_clause_outputs", None)
+                    if clause_out is not None:
+                        clause_mean = clause_out.abs().mean(dim=(0, 1)).detach()
+                        key = f"stage{stage_idx + 1}_block{block_idx + 1}"
+                        clause_metrics[key + "_clause_mean"] = clause_mean.cpu()
+                        head_chunks = torch.chunk(clause_mean, block.attn.attn.num_heads)
+                        head_means = torch.tensor(
+                            [chunk.mean().item() for chunk in head_chunks],
+                            dtype=clause_mean.dtype,
+                        )
+                        clause_metrics[key + "_head_mean"] = head_means.cpu()
             for block in stage.blocks:
                 penalty = getattr(block.ffn, "sparsity_penalty", None)
                 if penalty is not None:
@@ -1023,9 +1211,60 @@ class UnifiedTMTransformer(nn.Module):
         logits = self.head(feats)
         self._pending_regularization = reg_loss
         if collecting:
+            self.latest_clause_metrics = clause_metrics
+        else:
+            self.latest_clause_metrics = {}
+        if collecting:
             diagnostics["final_decision"] = logits
+            if return_features:
+                return logits, diagnostics, feats
             return logits, diagnostics
+        if return_features:
+            return logits, feats
         return logits
+
+    def consume_clause_metrics(self) -> Dict[str, torch.Tensor]:
+        metrics = {key: value.clone() for key, value in self.latest_clause_metrics.items()}
+        self.latest_clause_metrics = {}
+        return metrics
+
+    def apply_clause_head_specialization(
+        self,
+        clause_metrics: Dict[str, List[float]],
+        smoothing: float = 0.5,
+    ) -> None:
+        smoothing = float(max(0.0, min(1.0, smoothing)))
+        if self.architecture == "vit":
+            for idx, block in enumerate(self.blocks):
+                key = f"block_{idx + 1}_head_mean"
+                if key not in clause_metrics:
+                    continue
+                values = torch.tensor(
+                    clause_metrics[key],
+                    dtype=block.attn.head_gains.dtype,
+                    device=block.attn.head_gains.device,
+                )
+                if values.numel() != block.attn.num_heads:
+                    continue
+                norm = values / (values.mean() + 1e-6)
+                gains = (1.0 - smoothing) + smoothing * norm
+                block.attn.set_head_gains(gains)
+        else:
+            for stage_idx, stage in enumerate(self.stages):
+                for block_idx, block in enumerate(stage.blocks):
+                    key = f"stage{stage_idx + 1}_block{block_idx + 1}_head_mean"
+                    if key not in clause_metrics:
+                        continue
+                    values = torch.tensor(
+                        clause_metrics[key],
+                        dtype=block.attn.attn.head_gains.dtype,
+                        device=block.attn.attn.head_gains.device,
+                    )
+                    if values.numel() != block.attn.attn.num_heads:
+                        continue
+                    norm = values / (values.mean() + 1e-6)
+                    gains = (1.0 - smoothing) + smoothing * norm
+                    block.attn.set_head_gains(gains)
 
     def layer_param_groups(self) -> List[List[nn.Parameter]]:
         groups: List[List[nn.Parameter]] = []

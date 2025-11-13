@@ -260,6 +260,48 @@ def test_unified_tm_transformer_norm_variants(norm_type):
     assert logits.shape == (2, 10)
 
 
+def test_unified_tm_transformer_clause_metrics_capture():
+    model = UnifiedTMTransformer(
+        num_classes=4,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=16,
+    )
+    image = torch.rand(3, 32, 32)
+    model(image.unsqueeze(0), use_ste=True, collect_diagnostics=True)
+    metrics = model.consume_clause_metrics()
+    assert "block_1_clause_mean" in metrics
+    assert isinstance(metrics["block_1_clause_mean"], torch.Tensor)
+
+
+def test_unified_tm_transformer_clause_specialization_adjusts_gains():
+    model = UnifiedTMTransformer(
+        num_classes=4,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=16,
+    )
+    before = model.blocks[0].attn.head_gains.clone()
+    metrics = {"block_1_head_mean": [0.2, 0.8]}
+    model.apply_clause_head_specialization(metrics, smoothing=1.0)
+    after = model.blocks[0].attn.head_gains
+    assert not torch.allclose(before, after)
+
+
 def test_unified_tm_transformer_feature_mix():
     model = UnifiedTMTransformer(
         num_classes=10,
@@ -320,6 +362,48 @@ def test_unified_tm_transformer_clause_attention():
         clause_attention=True,
         clause_routing=True,
     )
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+
+
+def test_unified_tm_transformer_relative_pos_learned():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        relative_position_type="learned",
+    )
+    assert model.blocks[0].attn.relative_position_bias is not None
+    x = torch.rand(2, 3, 32, 32)
+    logits = model(x, use_ste=True)
+    assert logits.shape == (2, 10)
+
+
+def test_unified_tm_transformer_relative_pos_rotary():
+    model = UnifiedTMTransformer(
+        num_classes=10,
+        architecture="vit",
+        backend="ste",
+        image_size=(32, 32),
+        in_channels=3,
+        patch_size=4,
+        embed_dim=32,
+        depths=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        tm_clauses=32,
+        relative_position_type="rotary",
+    )
+    assert model.blocks[0].attn.rotary_emb is not None
     x = torch.rand(2, 3, 32, 32)
     logits = model(x, use_ste=True)
     assert logits.shape == (2, 10)

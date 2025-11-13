@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -130,6 +130,8 @@ class FuzzyPatternTM_STE(nn.Module):
         clause_dropout: float = 0.0,
         literal_dropout: float = 0.0,
         clause_bias_init: float = 0.0,
+        use_bitpack: bool = True,
+        bitpack_threshold: float = 0.5,
     ):
         super().__init__()
         self.n_features = n_features
@@ -142,13 +144,8 @@ class FuzzyPatternTM_STE(nn.Module):
         self.clause_dropout = clause_dropout
         self.literal_dropout = literal_dropout
         self.clause_bias = nn.Parameter(torch.full((n_clauses,), clause_bias_init, dtype=torch.float32))
-        if self.input_shape is not None:
-            product = self.input_shape[0] * self.input_shape[1] * self.input_shape[2]
-            if product != self.n_features:
-                raise ValueError(
-                    "input_shape product does not equal n_features: "
-                    f"{product} vs {self.n_features}."
-                )
+        self.use_bitpack = use_bitpack
+        self.bitpack_threshold = bitpack_threshold
 
         half = n_clauses // 2
         # Parameters as logits -> probabilities via sigmoid
@@ -188,16 +185,26 @@ class FuzzyPatternTM_STE(nn.Module):
         if self.training and self.literal_dropout > 0.0:
             x = F.dropout(x, p=self.literal_dropout, training=True)
 
+        sig_pos = torch.sigmoid(self.ta_pos)
+        sig_neg = torch.sigmoid(self.ta_neg)
+        sig_pos_inv = torch.sigmoid(self.ta_pos_inv)
+        sig_neg_inv = torch.sigmoid(self.ta_neg_inv)
+
+        hard_pos_zero = sig_pos >= self.tau
+        hard_neg_zero = sig_neg >= self.tau
+        hard_pos_one = sig_pos_inv >= self.tau
+        hard_neg_one = sig_neg_inv >= self.tau
+
         if use_ste:
             p_pos = self._ste_binary(self.ta_pos, self.tau)
             p_neg = self._ste_binary(self.ta_neg, self.tau)
             p_pos_inv = self._ste_binary(self.ta_pos_inv, self.tau)
             p_neg_inv = self._ste_binary(self.ta_neg_inv, self.tau)
         else:
-            p_pos = torch.sigmoid(self.ta_pos)
-            p_neg = torch.sigmoid(self.ta_neg)
-            p_pos_inv = torch.sigmoid(self.ta_pos_inv)
-            p_neg_inv = torch.sigmoid(self.ta_neg_inv)
+            p_pos = sig_pos
+            p_neg = sig_neg
+            p_pos_inv = sig_pos_inv
+            p_neg_inv = sig_neg_inv
 
         p_pos = p_pos.clamp(0.0, 1.0)
         p_neg = p_neg.clamp(0.0, 1.0)
@@ -211,8 +218,11 @@ class FuzzyPatternTM_STE(nn.Module):
         pos_score = scale * (torch.matmul(x_neg, p_pos.t()) + torch.matmul(x, p_pos_inv.t()))  # [B, half]
         neg_score = scale * (torch.matmul(x_neg, p_neg.t()) + torch.matmul(x, p_neg_inv.t()))  # [B, half]
 
-        pos_prod = torch.exp(-torch.clamp(pos_score, min=0.0, max=10.0))
-        neg_prod = torch.exp(-torch.clamp(neg_score, min=0.0, max=10.0))
+        pos_soft = torch.exp(-torch.clamp(pos_score, min=0.0, max=10.0))
+        neg_soft = torch.exp(-torch.clamp(neg_score, min=0.0, max=10.0))
+
+        pos_prod = pos_soft
+        neg_prod = neg_soft
 
         clause_outputs = torch.cat([pos_prod, neg_prod], dim=1)  # [B, n_clauses]
         if self.training and self.clause_dropout > 0.0:

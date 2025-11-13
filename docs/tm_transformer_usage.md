@@ -6,6 +6,8 @@ This guide shows how to launch the upgraded TM transformers, outlines every conf
 
 - Activate the virtual environment: `source venv/bin/activate`
 - Ensure the package path is visible: `export PYTHONPATH=$PWD/python:$PYTHONPATH`
+- Install runtime dependencies: `pip install -r requirements.txt`  
+  (Important extras: `matplotlib` for overlay rendering.)
 
 ## 2. Core CLI Parameters (Quick Reference)
 
@@ -21,17 +23,24 @@ This guide shows how to launch the upgraded TM transformers, outlines every conf
 | `--transformer-mlp-ratio` | feed-forward expansion (float or list) |
 | `--transformer-window` | Swin window size |
 | `--transformer-drop-path` | max drop-path rate (scheduled per block) |
+| `--transformer-drop-path-schedule` | drop-path schedule (`linear` or `cosine`) |
 | `--transformer-dropout` | attention / TM dropout |
 | `--transformer-ema-decay` | EMA decay (0 disables) |
 | `--transformer-grad-checkpoint` | gradient checkpointing toggle |
 | `--lr-layer-decay` | per-layer LR scaling factor (1.0 disables) |
 | `--gradient-centralize` | enable gradient centralisation before each step |
+| `--lr-cycle-steps` | cosine-restart cycle length in optimizer steps (0 disables) |
 | `--randaugment`, `--mixup-alpha`, `--cutmix-alpha` | augmentation toggles |
+| `--transformer-use-flash-attn` | leverage PyTorch SDPA/FlashAttention kernels when available |
+| `--transformer-residual-attn` | enable cross-block residual attention connections |
+| `--mixup-schedule`, `--cutmix-schedule` | mixup / CutMix strength schedule (`constant`, `linear`, `cosine`) |
 | `--label-smoothing` | label smoothing factor applied to all CE losses |
 | `--tm-prior-template` | initializes TM clauses with optional symmetry priors |
 | `--transformer-auto-clause` | auto-tune clause budgets from diagnostic accuracies |
 | `--transformer-clause-target` | total clause budget when auto tuning (0 keeps sum) |
 | `--transformer-auto-clause-batches` | number of batches sampled during auto tuning |
+| `--transformer-self-distill-weight`, `--transformer-self-distill-temp` | EMA-teacher self-distillation controls |
+| `--transformer-contrastive-weight`, `--transformer-contrastive-temp` | supervised contrastive auxiliary controls |
 
 Additional data-prep knobs:
 - `--tm-feature-mode` with presets from `fptm_ste.datasets`, plus `--tm-feature-config`, `--tm-feature-size`, `--tm-feature-grayscale`, reuse cached boolean TM features when needed.
@@ -50,7 +59,6 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
   --mixup-alpha 0.8 --cutmix-alpha 1.0 --randaugment \
   --epochs 20 --batch-size 128
 ```
-
 
 ### 3.2 Swin + DeepTM backend (CIFAR-10, hierarchical)
 ```bash
@@ -73,6 +81,57 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
   --transformer-arch vit --transformer-backend ste \
   --transformer-patch 2 --epochs 10 --batch-size 256
 ```
+
+### 3.4 Interpretability Overlays (MNIST quick reference)
+```bash
+source SOURCE.THIS  # venv + PYTHONPATH
+PYTHONPATH=python python3 python/fptm_ste/tests/run_mnist_equiv.py \
+  --device cpu \  # generates overlays without optional CUDA kernels
+  --dataset mnist \
+  --models transformer \
+  --transformer-arch vit \
+  --transformer-backend ste \
+  --transformer-patch 4 \
+  --transformer-embed-dims 64 \
+  --transformer-layers 1 \
+  --transformer-heads 4 \
+  --transformer-mlp-ratio 3.0 \
+  --epochs 1 --batch-size 16 --test-batch-size 64 \
+  --transformer-use-cls --transformer-pool cls \
+  --visualize-overlays /tmp/vit_tm_overlays \
+  --visualize-samples 4 \
+  --visualize-topk 3
+```
+
+### 3.5 Distillation with Pretrained Teachers (CIFAR-10)
+```bash
+source SOURCE.THIS
+PYTHONPATH=python python3 python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset cifar10 --models transformer \
+  --transformer-arch vit --transformer-backend ste \
+  --transformer-patch 4 --epochs 100 --batch-size 256 \
+  --transformer-embed-dims 96 --transformer-layers 8 --transformer-heads 6 \
+  --distill-teacher-timm vit_base_patch16_224 \
+  --distill-teacher-weight 0.7 \
+  --distill-teacher-temp 2.0 \
+  --transformer-self-distill-weight 0.5 \
+  --transformer-self-distill-temp 2.0 \
+  --transformer-clause-specialize \
+  --transformer-clause-specialize-strength 0.5 \
+  --visualize-overlays /tmp/vit_tm_kd --visualize-samples 6
+```
+
+### 3.6 Bit-packed vs Dense Comparison (MNIST)
+```bash
+# Bit-packed forward + fused voting
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset mnist --models tm --epochs 5 --batch-size 256 --log-interval 20
+
+# Dense baseline (full STE matmuls)
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset mnist --models tm --epochs 5 --batch-size 256 --log-interval 20
+```
+Collect wall-clock timings (the runner logs per-epoch duration) and accuracy to quantify gains.
 
 ## 4. Tuning Recommendations by Component
 
@@ -97,11 +156,18 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 - **Gradient checkpointing (`--transformer-grad-checkpoint`)**: saves memory for deep Swin models.
 - **RandAugment (`--randaugment`, `--randaugment-n`, `--randaugment-m`)**: mimic ImageNet pipelines; defaults are n=2, m=9.
 - **Mixup / CutMix (`--mixup-alpha`, `--cutmix-alpha`)**: typical values 0.8 / 1.0; disable on tiny datasets.
+- **Dynamic aug schedules (`--mixup-schedule`, `--cutmix-schedule`)**: ramp strengths with `cosine` or `linear` ramps to ease early optimisation.
 - **Label smoothing (`--label-smoothing`)**: 0.05–0.1 reduces overconfidence when Mixup is off.
+- **Cosine LR restarts (`--lr-cycle-steps`)**: rejuvenate training late by cycling the cosine schedule (combine with warmup).
 - **Epochs & batch size**: extend training (≥100 epochs) when augmentations and DeepTM backend are active.
 - **TM priors (`--tm-prior-template`)**: `symmetric` seeds complementary clause masks (helpful on symmetric datasets like MNIST).
 - **Clause auto-tuning (`--transformer-auto-clause`)**: reallocates clause budgets from diagnostic accuracies—great for Swin when some stages underperform.
 - **Layer-wise LR decay (`--lr-layer-decay`)**: set ~0.85 to stabilise deep Swin stacks; pair with `--gradient-centralize`.
+- **Self-distillation (`--transformer-self-distill-weight/temp`)**: blend EMA-teacher logits (KD style) into the training loss for better calibration.
+- **Supervised contrastive head (`--transformer-contrastive-weight/temp`)**: regularise pooled features; especially helpful when mixup is mild.
+- **Drop-path schedule (`--transformer-drop-path-schedule`)**: `cosine` emphasis on deeper blocks mitigates early-stage underfitting.
+- **Flash attention (`--transformer-use-flash-attn`)**: activates PyTorch SDPA kernels (FlashAttention on NVIDIA) for faster multi-head attention.
+- **Residual attention (`--transformer-residual-attn`)**: carry attention updates across blocks (ViT v2 style) to stabilise very deep stacks.
 
 ### 4.5 Boolean Feature Pipelines (Optional)
 - `--tm-feature-mode {raw,fashion_aug,conv}` selects raw tensors or cached boolean features.
@@ -157,6 +223,16 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 
 **ResNet/Swin/ViT baselines report ImageNet-scale statistics (224×224 inputs, fp32). When comparing directly with CIFAR-scale TM models, adjust expectations for resolution-dependent FLOP/latency scaling.
 
+### 6.3 Benchmark Utility
+- `python python/fptm_ste/benchmark_profiles.py` generates quick latency/throughput profiles over random batches.
+- Flags of interest:
+  - `--models` (`tm_vit_ste_base`, `tm_vit_deeptm_base`, `tm_swin_deeptm_tiny`, ...)
+  - `--batch-sizes` (comma-separated, e.g. `1,32`)
+  - `--device` (`auto`, `cpu`, `cuda`)
+  - `--warmup` / `--iters` for tuning measurement passes
+- Example (CPU):  
+  `python python/fptm_ste/benchmark_profiles.py --models tm_vit_ste_base --batch-sizes 1,32 --device cpu --warmup 5 --iters 20 --output benchmarks_cpu.json`
+
 ## 7. Decision Log & Accuracy Snapshot
 - **Baseline ViT + STE (3 epochs, MNIST, no new tricks)**  
   Command: `python python/fptm_ste/tests/run_mnist_equiv.py --dataset mnist --models transformer --transformer-arch vit --transformer-backend ste --transformer-patch 4 --epochs 3 --batch-size 64 --test-batch-size 128`  
@@ -164,4 +240,20 @@ python python/fptm_ste/tests/run_mnist_equiv.py \
 - **Enhanced ViT recipe (label smoothing, priors, auto clause, mixup/cutmix, EMA, layer decay)**  
   Command: `python python/fptm_ste/tests/run_mnist_equiv.py --dataset mnist --models transformer --transformer-arch vit --transformer-backend ste --transformer-patch 4 --epochs 3 --batch-size 64 --test-batch-size 128 --label-smoothing 0.1 --tm-prior-template symmetric --transformer-ff-gate geglu --transformer-ff-mix linear_depthwise --transformer-bitwise-mix --transformer-learnable-tau --transformer-tau-ema 0.9 --transformer-clause-attention --transformer-clause-routing --transformer-bypass --transformer-bypass-scale 0.5 --transformer-clause-drop 0.1 --transformer-literal-drop 0.05 --transformer-sparsity-weight 0.01 --transformer-clause-bias 0.05 --transformer-norm rmsnorm --transformer-aux-weight 0.05 --mixup-alpha 0.2 --cutmix-alpha 0.2 --lr 7e-4 --min-lr 1e-5 --warmup-epochs 1 --lr-layer-decay 0.85 --gradient-centralize --transformer-ema-decay 0.995 --transformer-auto-clause --transformer-auto-clause-batches 4 --report-epoch-test`  
   Result: test accuracy **95.50 %**, component accuracies substantially higher, runtime ~169 s.
+- **Advanced recipe smoke test (dynamic aug schedules, KD, contrastive, cosine restarts)**  
+  Command: `python python/fptm_ste/tests/run_mnist_equiv.py --dataset mnist --models transformer --transformer-arch vit --epochs 1 --batch-size 64 --test-batch-size 128 --transformer-patch 4 --transformer-d-model 32 --transformer-layers 1 --transformer-heads 2 --transformer-mlp-ratio 2.0 --transformer-backend ste --transformer-drop-path 0.05 --transformer-drop-path-schedule cosine --transformer-ff-gate geglu --transformer-ff-mix linear_depthwise --transformer-bitwise-mix --transformer-learnable-tau --transformer-tau-ema 0.9 --transformer-clause-attention --transformer-clause-routing --transformer-bypass --transformer-bypass-scale 0.5 --transformer-clause-drop 0.1 --transformer-literal-drop 0.05 --transformer-sparsity-weight 0.01 --transformer-clause-bias 0.05 --transformer-norm rmsnorm --transformer-aux-weight 0.05 --mixup-alpha 0.2 --cutmix-alpha 0.2 --mixup-schedule cosine --cutmix-schedule cosine --lr 7e-4 --min-lr 1e-5 --warmup-epochs 1 --lr-layer-decay 0.85 --gradient-centralize --lr-cycle-steps 50 --transformer-ema-decay 0.995 --transformer-self-distill-weight 0.5 --transformer-self-distill-temp 2.0 --transformer-contrastive-weight 0.1 --transformer-contrastive-temp 0.2 --transformer-auto-clause --transformer-auto-clause-batches 2 --label-smoothing 0.1 --tm-prior-template symmetric --report-epoch-test`  
+  Result: test accuracy **50.8 %** after a single epoch (sanity check confirming new knobs; expect higher accuracy with longer schedules).
 - Auto-clause tuning logs the adjusted clause budgets (e.g., `Auto-tuned clause counts: 256`) before training begins to facilitate reproducibility.
+
+## 8. Interpretability Logging
+- Pass `--transformer-log-dir runs/tm_vit` to `run_mnist_equiv.py` to stream per-epoch metrics into TensorBoard.
+- Logged scalars include component/head accuracies, mixup/CutMix schedules, auxiliary losses, and tracked best accuracy.
+- Launch TensorBoard via `tensorboard --logdir runs/tm_vit` and inspect groups under `Transformer-*`.
+- Generate overlay figures on demand via `--visualize-overlays` and `--visualize-samples`. Overlays combine original images, attention heatmaps, clause activation maps, and top-k class predictions. Use `--device cpu` for guaranteed portability if CUDA/Triton kernels are unavailable.
+
+## 9. External Distillation Workflow
+- Enable pretrained teachers with `--distill-teacher-timm <model>` (e.g. `vit_base_patch16_224`, `swin_tiny_patch4_window7_224`).  
+- Optionally load a fine-tuned checkpoint: `--distill-teacher-checkpoint /path/to/state_dict.pt`.  
+- Control KD strength with `--distill-teacher-weight` and temperature with `--distill-teacher-temp`.  
+- Combine with EMA self-distillation (`--transformer-self-distill-weight/temp`) and clause-aware head specialisation (`--transformer-clause-specialize`).  
+- Diagnostic JSON now records `teacher_kd_loss` (per epoch) and final clause usage, making it easy to compare student-only vs teacher-guided runs.

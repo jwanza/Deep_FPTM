@@ -14,10 +14,20 @@ except ImportError:  # pragma: no cover - timm is an optional dependency
 from .tm import FuzzyPatternTM_STE
 from .binarizers import SwinDualBinarizer, CNNSingleBinarizer
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
+from .tm_positional import RelativePositionBias2D, RotaryEmbedding, apply_rotary_pos_emb
 
 
 class InstrumentedMultiheadAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        *,
+        use_flash: bool = False,
+        relative_position_bias: Optional[RelativePositionBias2D] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
@@ -28,19 +38,58 @@ class InstrumentedMultiheadAttention(nn.Module):
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.attn_dropout = nn.Dropout(dropout)
+        self.use_flash = use_flash
+        self.register_buffer("head_gains", torch.ones(num_heads), persistent=False)
+        self.relative_position_bias = relative_position_bias
+        self.rotary_emb = rotary_emb
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def set_head_gains(self, gains: torch.Tensor) -> None:
+        if gains.numel() != self.num_heads:
+            raise ValueError(f"Expected {self.num_heads} gains, received {gains.numel()}.")
+        gains = gains.to(self.qkv.weight.device, dtype=self.head_gains.dtype)
+        with torch.no_grad():
+            self.head_gains.copy_(gains)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         B, T, C = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn_scores = torch.matmul(q * self.scale, k.transpose(-2, -1))
-        attn_weights = attn_scores.softmax(dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-        context = torch.matmul(attn_weights, v)
+        if self.rotary_emb is not None:
+            sin, cos = self.rotary_emb.get_sin_cos(T, device=x.device, dtype=x.dtype)
+            q, k = apply_rotary_pos_emb(q, k, sin, cos)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        can_flash = (
+            self.use_flash
+            and self.relative_position_bias is None
+            and x.is_cuda
+            and hasattr(F, "scaled_dot_product_attention")
+        )
+        if can_flash:
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
+            attn_weights = None
+        else:
+            attn_scores = torch.matmul(q * self.scale, k.transpose(-2, -1))
+            if self.relative_position_bias is not None:
+                bias = self.relative_position_bias(device=x.device, dtype=attn_scores.dtype)
+                if bias.shape[-1] != attn_scores.shape[-1]:
+                    raise ValueError(
+                        f"Relative bias shape mismatch: expected {attn_scores.shape[-1]}, got {bias.shape[-1]}"
+                    )
+                attn_scores = attn_scores + bias.unsqueeze(0)
+            attn_weights = attn_scores.softmax(dim=-1)
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+            context = torch.matmul(attn_weights, v)
+        context = context * self.head_gains.view(1, self.num_heads, 1, 1)
         context_merge = context.transpose(1, 2).contiguous().view(B, T, C)
         out = self.out_proj(context_merge)
-        return out, context, attn_weights
+        return out, context, attn_weights if not can_flash else None
 
 
 class _SwinBackbone(nn.Module):
@@ -139,14 +188,25 @@ class _SwinBackbone(nn.Module):
             return False
         try:
             model_name = self._resolve_timm_model(variant, input_size, version, timm_model_name)
-            self.swin = timm.create_model(
-                model_name,
-                pretrained=pretrained,
-                features_only=True,
-                out_indices=tuple(range(self.num_scales)),
-                img_size=input_size,
-                pretrained_cfg_overlay={"drop_path_rate": drop_path},
-            )
+            try:
+                self.swin = timm.create_model(
+                    model_name,
+                    pretrained=pretrained,
+                    features_only=True,
+                    out_indices=tuple(range(self.num_scales)),
+                    img_size=input_size,
+                    pretrained_cfg_overlay={"drop_path_rate": drop_path},
+                )
+            except TypeError:
+                self.swin = timm.create_model(
+                    model_name,
+                    pretrained=pretrained,
+                    features_only=True,
+                    out_indices=tuple(range(self.num_scales)),
+                    img_size=input_size,
+                )
+                if hasattr(self.swin, "drop_path_rate"):
+                    self.swin.drop_path_rate = drop_path
             self.use_timm = True
             return True
         except Exception as exc:  # pragma: no cover - defensive
@@ -339,6 +399,7 @@ class SwinFeatureExtractor(nn.Module):
         input_size: int = 224,
         output_channels: Optional[Sequence[int]] = None,
         freeze_stages: int = 0,
+        freeze: bool = False,
         use_checkpoint: bool = False,
         drop_path_rate: float = 0.2,
         use_fpn: bool = False,
@@ -369,6 +430,10 @@ class SwinFeatureExtractor(nn.Module):
             )
         else:
             self.backbone = _SwinBackbone(**backbone_kwargs)
+
+        if freeze:
+            for param in self.backbone.parameters():
+                param.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         return self.backbone(x)
@@ -839,14 +904,33 @@ def build_swin_stage_configs(
 
 
 class WindowAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        *,
+        use_flash: bool = False,
+        relative_position_bias: Optional[RelativePositionBias2D] = None,
+        rotary_emb: Optional[RotaryEmbedding] = None,
+    ) -> None:
         super().__init__()
-        self.attn = InstrumentedMultiheadAttention(embed_dim, num_heads, dropout)
+        self.attn = InstrumentedMultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout,
+            use_flash=use_flash,
+            relative_position_bias=relative_position_bias,
+            rotary_emb=rotary_emb,
+        )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_out, context, weights = self.attn(x)
-        weights_mean = weights.mean(dim=0)
+        weights_mean = weights.mean(dim=0) if weights is not None else None
         return attn_out, weights_mean, context
+
+    def set_head_gains(self, gains: torch.Tensor) -> None:
+        self.attn.set_head_gains(gains)
 
 
 class WindowTMFeedForward(nn.Module):
@@ -870,6 +954,7 @@ class WindowTMFeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.gate = nn.Parameter(torch.tensor(0.5))
         self.clause_pool = clause_pool
+        self.last_clause_outputs: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, *, use_ste: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
         B, H, W, C = x.shape
@@ -878,6 +963,7 @@ class WindowTMFeedForward(nn.Module):
         windows_flat = windows.reshape(-1, self.window_size * self.window_size * C)
         tm_in = self.pre_tm(windows_flat)
         logits, clause_outputs = self.tm(tm_in, use_ste=use_ste)
+        self.last_clause_outputs = clause_outputs.detach()
         window_out = self.post_tm(logits).view(-1, self.window_size, self.window_size, C)
         merged = window_reverse(window_out, self.window_size, H, W)
         gate = torch.sigmoid(self.gate)

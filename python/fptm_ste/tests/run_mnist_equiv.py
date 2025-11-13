@@ -25,9 +25,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
+
+try:  # pragma: no cover - optional dependency
+    import timm
+except ImportError:  # pragma: no cover
+    timm = None
 
 from fptm_ste import FuzzyPatternTM_STE, FuzzyPatternTMFPTM
 from fptm_ste.binarizers import CNNSingleBinarizer
@@ -41,6 +46,7 @@ from fptm_ste.datasets import (
     prepare_boolean_feature_bundle,
     prepare_fashion_augmented_bundle,
 )
+from fptm_ste.visualization import generate_transformer_overlay
 
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
@@ -54,6 +60,10 @@ DEFAULT_BOOL_TRAIN_PATH = os.environ.get("TM_BOOL_TRAIN_PATH", "/tmp/MNISTTraini
 DEFAULT_BOOL_TEST_PATH = os.environ.get("TM_BOOL_TEST_PATH", "/tmp/MNISTTestData.txt")
 DEFAULT_OUTPUT_JSON = os.environ.get("TM_OUTPUT_JSON", "/tmp/mnist_equiv_results.json")
 DEFAULT_EXPORT_PREFIX = os.environ.get("TM_EXPORT_PREFIX", "tm_mnist")
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+DEFAULT_IMAGENET_ROOT = os.environ.get("TM_IMAGENET_ROOT", "/datasets/imagenet")
 
 DATASET_CONFIGS = {
     "mnist": {
@@ -79,6 +89,15 @@ DATASET_CONFIGS = {
         "input_channels": 3,
         "image_size": (32, 32),
         "num_classes": 10,
+    },
+    "imagenet": {
+        "train_class": datasets.ImageFolder,
+        "test_class": datasets.ImageFolder,
+        "train_transform": None,
+        "test_transform": None,
+        "input_channels": 3,
+        "image_size": (224, 224),
+        "num_classes": 1000,
     },
 }
 
@@ -203,6 +222,49 @@ def float_or_none(value: Optional[str], default: Optional[float] = None) -> Opti
     return float(value)
 
 
+def _coerce_transform_spec(transform_spec: Optional[Any]) -> List[Any]:
+    if transform_spec is None:
+        return []
+    if isinstance(transform_spec, transforms.Compose):
+        return list(transform_spec.transforms)
+    if isinstance(transform_spec, (list, tuple)):
+        return list(transform_spec)
+    return [transform_spec]
+
+
+def _build_transform(
+    transform_spec: Optional[Any],
+    *,
+    target_size: Optional[Tuple[int, int]],
+    apply_randaugment: bool,
+    randaugment_n: int,
+    randaugment_m: int,
+    add_normalize: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]] = None,
+) -> transforms.Compose:
+    steps = _coerce_transform_spec(transform_spec)
+    if target_size is not None:
+        resize = transforms.Resize(target_size, interpolation=InterpolationMode.BICUBIC, antialias=True)
+        steps = [resize] + steps
+    if apply_randaugment:
+        steps.insert(0, transforms.RandAugment(num_ops=randaugment_n, magnitude=randaugment_m))
+    has_tensor = any(isinstance(t, transforms.ToTensor) for t in steps)
+    if not has_tensor:
+        steps.append(transforms.ToTensor())
+    if add_normalize is not None:
+        mean, std = add_normalize
+        steps.append(transforms.Normalize(mean=mean, std=std))
+    return transforms.Compose(steps)
+
+
+def _extract_normalize(transform: transforms.Compose) -> Optional[Tuple[Sequence[float], Sequence[float]]]:
+    if not isinstance(transform, transforms.Compose):
+        return None
+    for step in transform.transforms:
+        if isinstance(step, transforms.Normalize):
+            return (tuple(step.mean), tuple(step.std))
+    return None
+
+
 def apply_gradient_centralization(module: nn.Module) -> None:
     for param in module.parameters():
         if param.grad is None:
@@ -288,9 +350,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=int_env("TM_MNIST_TEST_BATCH", 512),
         help="Evaluation batch size.",
     )
+    parser.add_argument(
+        "--imagenet-train-dir",
+        type=str,
+        default=None,
+        help="Override ImageNet training directory (defaults to <dataset_root>/train).",
+    )
+    parser.add_argument(
+        "--imagenet-val-dir",
+        type=str,
+        default=None,
+        help="Override ImageNet validation directory (defaults to <dataset_root>/val).",
+    )
+    parser.add_argument(
+        "--imagenet-resize",
+        type=int,
+        default=256,
+        help="Resize shorter side to this size for ImageNet evaluation pipeline.",
+    )
+    parser.add_argument(
+        "--imagenet-crop",
+        type=int,
+        default=224,
+        help="Crop size for ImageNet training and evaluation.",
+    )
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate for AdamW optimizers.")
     parser.add_argument("--min-lr", type=float, default=None, help="Minimum learning rate for cosine decay.")
     parser.add_argument("--warmup-epochs", type=int, default=0, help="Number of warmup epochs before cosine decay.")
+    parser.add_argument(
+        "--lr-cycle-steps",
+        type=int,
+        default=0,
+        help="Optional cosine restart cycle length in optimizer steps (0 disables restarts).",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay value for AdamW optimizers.")
     parser.add_argument(
         "--label-smoothing",
@@ -623,6 +715,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum drop-path rate across transformer layers.",
     )
     parser.add_argument(
+        "--transformer-drop-path-schedule",
+        choices=["linear", "cosine"],
+        default="linear",
+        help="Drop-path schedule across blocks (linear default or cosine).",
+    )
+    parser.add_argument(
         "--transformer-use-cls",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -797,10 +895,112 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="EMA decay for transformer weights (0 disables EMA).",
     )
     parser.add_argument(
+        "--transformer-self-distill-weight",
+        type=float,
+        default=0.0,
+        help="KL divergence weight for self-distillation from EMA teacher.",
+    )
+    parser.add_argument(
+        "--transformer-self-distill-temp",
+        type=float,
+        default=1.0,
+        help="Temperature used for self-distillation logits.",
+    )
+    parser.add_argument(
+        "--distill-teacher-timm",
+        type=str,
+        default="",
+        help="Optional timm model name to use as external teacher (pretrained).",
+    )
+    parser.add_argument(
+        "--distill-teacher-checkpoint",
+        type=str,
+        default="",
+        help="Path to a teacher checkpoint (torch.load state_dict).",
+    )
+    parser.add_argument(
+        "--distill-teacher-weight",
+        type=float,
+        default=0.0,
+        help="Weight for external teacher KD loss.",
+    )
+    parser.add_argument(
+        "--distill-teacher-temp",
+        type=float,
+        default=1.0,
+        help="Temperature for external teacher KD.",
+    )
+    parser.add_argument(
+        "--transformer-contrastive-weight",
+        type=float,
+        default=0.0,
+        help="Supervised contrastive loss weight on pooled transformer features.",
+    )
+    parser.add_argument(
+        "--transformer-contrastive-temp",
+        type=float,
+        default=0.1,
+        help="Temperature for supervised contrastive objective.",
+    )
+    parser.add_argument(
         "--transformer-grad-checkpoint",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable gradient checkpointing inside transformer blocks.",
+    )
+    parser.add_argument(
+        "--transformer-use-flash-attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use PyTorch scaled_dot_product_attention (FlashAttention when available).",
+    )
+    parser.add_argument(
+        "--transformer-residual-attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable cross-block residual attention (adds previous attention output to the next block).",
+    )
+    parser.add_argument(
+        "--transformer-relative-pos",
+        choices=["none", "learned", "rotary"],
+        default="none",
+        help="Relative positional encoding type for transformer attention.",
+    )
+    parser.add_argument(
+        "--transformer-clause-specialize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Rescale attention heads based on clause usage diagnostics.",
+    )
+    parser.add_argument(
+        "--transformer-clause-specialize-strength",
+        type=float,
+        default=0.5,
+        help="Smoothing factor (0-1) for clause-aware head specialization.",
+    )
+    parser.add_argument(
+        "--transformer-log-dir",
+        type=str,
+        default="",
+        help="Optional TensorBoard log directory for transformer diagnostics.",
+    )
+    parser.add_argument(
+        "--visualize-overlays",
+        type=str,
+        default="",
+        help="Directory to save interpretability overlays (empty to disable).",
+    )
+    parser.add_argument(
+        "--visualize-samples",
+        type=int,
+        default=0,
+        help="Number of test samples to visualize with overlays.",
+    )
+    parser.add_argument(
+        "--visualize-topk",
+        type=int,
+        default=3,
+        help="Top-K classes to display in overlay reports.",
     )
     parser.add_argument(
         "--randaugment",
@@ -831,6 +1031,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="CutMix alpha value (0 disables CutMix).",
+    )
+    parser.add_argument(
+        "--mixup-schedule",
+        choices=["constant", "linear", "cosine"],
+        default="cosine",
+        help="Schedule for mixup strength across epochs.",
+    )
+    parser.add_argument(
+        "--cutmix-schedule",
+        choices=["constant", "linear", "cosine"],
+        default="cosine",
+        help="Schedule for CutMix strength across epochs.",
     )
 
     return parser
@@ -939,6 +1151,14 @@ def cosine_warmup_lr(epoch: int, total_epochs: int, base_lr: float, min_lr: floa
     return min_lr + (base_lr - min_lr) * cosine
 
 
+def cosine_restart_lr(step: int, total_steps: int, cycle_steps: int, base_lr: float, min_lr: float) -> float:
+    if cycle_steps <= 0:
+        return cosine_warmup_lr(step, total_steps, base_lr, min_lr, 0)
+    cycle_pos = step % cycle_steps
+    cosine = 0.5 * (1.0 + math.cos(math.pi * cycle_pos / float(max(1, cycle_steps))))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
 def update_cosine_warmup_lr(
     optimizer: Optimizer,
     epoch: int,
@@ -950,6 +1170,39 @@ def update_cosine_warmup_lr(
     lr = cosine_warmup_lr(epoch, total_epochs, base_lr, min_lr, warmup_epochs)
     set_optimizer_lr(optimizer, lr)
     return lr
+
+
+def cosine_with_restarts_lr(
+    step: int,
+    warmup_steps: int,
+    base_lr: float,
+    min_lr: float,
+    cycle_steps: int,
+) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        warm_progress = float(step + 1) / float(max(1, warmup_steps))
+        return base_lr * warm_progress
+    if cycle_steps <= 0:
+        return min_lr
+    step_after = step - warmup_steps
+    cycle_pos = step_after % cycle_steps
+    cosine = 0.5 * (1.0 + math.cos(math.pi * cycle_pos / float(max(1, cycle_steps))))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def schedule_scalar(epoch: int, total_epochs: int, value: float, schedule: str) -> float:
+    if value <= 0.0:
+        return 0.0
+    if schedule == "constant" or total_epochs <= 1:
+        return value
+    progress = float(epoch) / float(max(1, total_epochs - 1))
+    if schedule == "linear":
+        factor = progress
+    elif schedule == "cosine":
+        factor = 0.5 * (1.0 - math.cos(math.pi * progress))
+    else:
+        factor = 1.0
+    return value * factor
 
 
 def format_epoch_log(
@@ -1034,6 +1287,28 @@ def apply_mixup_cutmix(
     return inputs_clone, targets, targets[perm], lam, "cutmix"
 
 
+def supervised_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    if features.dim() > 2:
+        features = features.view(features.size(0), -1)
+    if features.size(0) <= 1:
+        return features.new_zeros(())
+    feats = F.normalize(features, dim=1)
+    similarity = torch.matmul(feats, feats.t()) / max(temperature, 1e-6)
+    logits_mask = torch.ones_like(similarity, dtype=torch.bool)
+    logits_mask.fill_diagonal_(False)
+    labels = labels.view(-1, 1)
+    positive_mask = (labels == labels.t()) & logits_mask
+    if positive_mask.sum() == 0:
+        return features.new_zeros(())
+    exp_sim = torch.exp(similarity) * logits_mask
+    log_prob = similarity - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+    mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / positive_mask.sum(dim=1).clamp(min=1)
+    loss = -mean_log_prob_pos[positive_mask.sum(dim=1) > 0].mean()
+    if torch.isnan(loss):
+        return features.new_zeros(())
+    return loss
+
+
 def save_bool_dataset(train_loader, test_loader, train_path: str, test_path: str, thr: float = 0.5):
     if os.path.exists(train_path) and os.path.exists(test_path):
         print(f"  boolean datasets cached: {train_path}, {test_path}")
@@ -1088,7 +1363,7 @@ def evaluate_transformer_components(
     *,
     collect_preds: bool = True,
     max_batches: Optional[int] = None,
-) -> Tuple[float, Dict[str, float], List[int]]:
+) -> Tuple[float, Dict[str, float], List[int], Dict[str, List[float]]]:
     was_training = model.training
     model.eval()
     total_correct = 0
@@ -1096,6 +1371,8 @@ def evaluate_transformer_components(
     component_correct: Dict[str, int] = defaultdict(int)
     component_total: Dict[str, int] = defaultdict(int)
     preds: List[int] = []
+    clause_sum: Dict[str, torch.Tensor] = {}
+    clause_count: Dict[str, int] = defaultdict(int)
     with torch.no_grad():
         for batch_idx, (x, y) in enumerate(loader, start=1):
             x = x.to(device, non_blocking=True)
@@ -1114,6 +1391,13 @@ def evaluate_transformer_components(
                 comp_pred = comp_logits.argmax(dim=1)
                 component_correct[name] += (comp_pred == y).sum().item()
                 component_total[name] += y.size(0)
+            batch_clause_metrics = model.consume_clause_metrics()
+            for key, tensor in batch_clause_metrics.items():
+                if key not in clause_sum:
+                    clause_sum[key] = tensor.clone()
+                else:
+                    clause_sum[key] += tensor
+                clause_count[key] += 1
             if max_batches is not None and batch_idx >= max_batches:
                 break
     if was_training:
@@ -1123,7 +1407,12 @@ def evaluate_transformer_components(
         name: (component_correct[name] / component_total[name]) if component_total[name] > 0 else 0.0
         for name in sorted(component_correct)
     }
-    return final_acc, component_acc, preds
+    clause_metrics = {
+        key: (clause_sum[key] / clause_count[key]).tolist()
+        for key in clause_sum
+        if clause_count[key] > 0
+    }
+    return final_acc, component_acc, preds, clause_metrics
 
 
 def _vit_clause_list(tm_clauses: Union[int, Sequence[int]], depth: int) -> List[int]:
@@ -1167,17 +1456,80 @@ def _collect_stage_accuracies(
     return stage_scores
 
 
+def _collect_clause_usage(
+    clause_metrics: Dict[str, List[float]],
+    architecture: str,
+    depths: Union[int, Sequence[int]],
+) -> List[float]:
+    if architecture == "vit":
+        depth = depths if isinstance(depths, int) else (sum(depths) if depths else 0)
+        usage_vals: List[float] = []
+        for i in range(depth):
+            vals = clause_metrics.get(f"block_{i + 1}_clause_mean")
+            if vals:
+                usage_vals.append(float(sum(vals) / len(vals)))
+            else:
+                usage_vals.append(0.0)
+        return usage_vals
+    stage_depths = list(depths) if isinstance(depths, Sequence) else [int(depths)]
+    usage_vals = []
+    for stage_idx, stage_depth in enumerate(stage_depths):
+        block_usages: List[float] = []
+        for block_idx in range(stage_depth):
+            vals = clause_metrics.get(f"stage{stage_idx + 1}_block{block_idx + 1}_clause_mean")
+            if vals:
+                block_usages.append(float(sum(vals) / len(vals)))
+        usage_vals.append(float(sum(block_usages) / len(block_usages)) if block_usages else 0.0)
+    return usage_vals
+
+
+def build_distillation_teacher(
+    timm_name: str,
+    checkpoint_path: str,
+    num_classes: int,
+    in_channels: int,
+    device: torch.device,
+) -> nn.Module:
+    if not timm_name and not checkpoint_path:
+        raise ValueError("No teacher configuration provided.")
+    if timm is None:
+        raise ImportError("timm is required for external teacher distillation.")
+    if not timm_name:
+        raise ValueError("A timm model name is required when loading an external teacher.")
+    teacher = timm.create_model(timm_name, pretrained=True, num_classes=num_classes, in_chans=in_channels)
+    if hasattr(teacher, "reset_classifier"):
+        teacher.reset_classifier(num_classes)
+    if checkpoint_path:
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        teacher.load_state_dict(state, strict=False)
+    teacher.to(device)
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+    return teacher
+
+
 def _scale_clause_counts(
     base_counts: List[int],
     accuracies: List[float],
     clause_target: int,
+    usage: Optional[List[float]] = None,
 ) -> List[int]:
     target_acc = 0.75
+    target_usage = 0.25
     new_counts: List[int] = []
-    for base, acc in zip(base_counts, accuracies):
+    for idx, (base, acc) in enumerate(zip(base_counts, accuracies)):
         factor = 1.0 + (target_acc - acc)
         factor = max(0.5, min(1.5, factor))
-        new_counts.append(max(8, int(round(base * factor))))
+        usage_factor = 1.0
+        if usage is not None and idx < len(usage):
+            usage_val = max(0.0, min(1.0, usage[idx]))
+            usage_factor = 1.0 + (target_usage - usage_val)
+            usage_factor = max(0.7, min(1.3, usage_factor))
+        combined = factor * usage_factor
+        new_counts.append(max(8, int(round(base * combined))))
     if clause_target > 0:
         total = sum(new_counts)
         if total > 0:
@@ -1204,7 +1556,7 @@ def auto_tune_transformer_clauses(
     temp_kwargs["tm_clauses"] = tm_clauses
     temp_model = UnifiedTMTransformer(**temp_kwargs).to(device)
     apply_tm_prior_template(temp_model, tm_prior_template)
-    _, component_acc, _ = evaluate_transformer_components(
+    _, component_acc, _, clause_metrics = evaluate_transformer_components(
         temp_model, train_loader, device, collect_preds=False, max_batches=auto_batches
     )
     del temp_model
@@ -1214,7 +1566,8 @@ def auto_tune_transformer_clauses(
         depth = depths if isinstance(depths, int) else (sum(depths) if depths else 0)
         base_counts = _vit_clause_list(tm_clauses, depth)
         accuracies = _collect_stage_accuracies(component_acc, architecture, depths)
-        new_counts = _scale_clause_counts(base_counts, accuracies, clause_target)
+        clause_usage_vals = _collect_clause_usage(clause_metrics, architecture, depths)
+        new_counts = _scale_clause_counts(base_counts, accuracies, clause_target, usage=clause_usage_vals)
         return _format_vit_clause_counts(new_counts, tm_clauses)
 
     # Swin-style: per-stage clause counts
@@ -1229,7 +1582,8 @@ def auto_tune_transformer_clauses(
     else:
         base_counts = [int(max(1, tm_clauses))] * len(stage_depths)
     accuracies = _collect_stage_accuracies(component_acc, architecture, stage_depths)
-    new_counts = _scale_clause_counts(base_counts, accuracies, clause_target)
+    clause_usage_vals = _collect_clause_usage(clause_metrics, architecture, stage_depths)
+    new_counts = _scale_clause_counts(base_counts, accuracies, clause_target, usage=clause_usage_vals)
     return tuple(int(max(1, c)) for c in new_counts)
 
 
@@ -1251,14 +1605,23 @@ def train_tm_model(model: nn.Module,
                    warmup_epochs: int,
                    weight_decay: float,
                    gradient_centralize: bool = False,
-                   label_smoothing: float = 0.0) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   label_smoothing: float = 0.0,
+                   lr_cycle_steps: int = 0) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
     last_train_acc: Optional[float] = None
     best_test_acc: Optional[float] = None
+    steps_per_epoch = max(1, len(train_loader))
+    warmup_steps = warmup_epochs * steps_per_epoch
+    cycle_steps = max(0, lr_cycle_steps)
     for epoch in range(epochs):
-        epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
+        global_step = epoch * steps_per_epoch
+        if cycle_steps > 0:
+            epoch_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
+            set_optimizer_lr(opt, epoch_lr)
+        else:
+            epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
@@ -1266,6 +1629,10 @@ def train_tm_model(model: nn.Module,
         epoch_total = 0
         num_batches = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
+            if cycle_steps > 0:
+                current_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
+                set_optimizer_lr(opt, current_lr)
+                epoch_lr = current_lr
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             xb = prepare_fn(x)
             opt.zero_grad(set_to_none=True)
@@ -1286,6 +1653,7 @@ def train_tm_model(model: nn.Module,
                 preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
+            global_step += 1
         dur = time.time() - epoch_start
         avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
@@ -1384,7 +1752,8 @@ def run_variant_tm(train_loader,
                    weight_decay: float = 1e-5,
                    gradient_centralize: bool = False,
                    label_smoothing: float = 0.0,
-                   tm_prior_template: str = "none") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                   tm_prior_template: str = "none",
+                   lr_cycle_steps: int = 0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
     if tm_impl == "fptm":
         model = FuzzyPatternTMFPTM(
@@ -1415,6 +1784,8 @@ def run_variant_tm(train_loader,
         label = "STE-TM"
 
     apply_tm_prior_template(model, tm_prior_template)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
@@ -1435,9 +1806,20 @@ def run_variant_tm(train_loader,
         weight_decay=weight_decay,
         gradient_centralize=gradient_centralize,
         label_smoothing=label_smoothing,
+        lr_cycle_steps=lr_cycle_steps,
     )
     bundle = model.discretize(threshold=0.5)
-    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / ttrain if ttrain > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
 
 
 def run_variant_deeptm(train_loader,
@@ -1464,7 +1846,8 @@ def run_variant_deeptm(train_loader,
                        weight_decay: float = 1e-5,
                        gradient_centralize: bool = False,
                        label_smoothing: float = 0.0,
-                       tm_prior_template: str = "none") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       tm_prior_template: str = "none",
+                       lr_cycle_steps: int = 0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepTMNetwork(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -1478,6 +1861,8 @@ def run_variant_deeptm(train_loader,
     ).to(device)
     apply_tm_prior_template(model, tm_prior_template)
     label = "Deep-TM"
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
         prepare_fn,
@@ -1497,9 +1882,20 @@ def run_variant_deeptm(train_loader,
         weight_decay=weight_decay,
         gradient_centralize=gradient_centralize,
         label_smoothing=label_smoothing,
+        lr_cycle_steps=lr_cycle_steps,
     )
     bundle = model.classifier.discretize(threshold=0.5)
-    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / ttrain if ttrain > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
 
 
 def run_variant_hybrid(train_loader,
@@ -1521,7 +1917,8 @@ def run_variant_hybrid(train_loader,
                        weight_decay: float = 1e-5,
                        gradient_centralize: bool = False,
                        label_smoothing: float = 0.0,
-                       tm_prior_template: str = "none") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any]]:
+                       tm_prior_template: str = "none",
+                       lr_cycle_steps: int = 0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = CNNHybrid(
         in_channels=in_channels,
         thresholds=thresholds,
@@ -1536,8 +1933,18 @@ def run_variant_hybrid(train_loader,
     last_train_acc: Optional[float] = None
     best_test_acc: Optional[float] = None
     label = "Hybrid"
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    steps_per_epoch = max(1, len(train_loader))
+    warmup_steps = warmup_epochs * steps_per_epoch
+    cycle_steps = max(0, lr_cycle_steps)
     for epoch in range(epochs):
-        epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
+        global_step = epoch * steps_per_epoch
+        if cycle_steps > 0:
+            epoch_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
+            set_optimizer_lr(opt, epoch_lr)
+        else:
+            epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
@@ -1545,6 +1952,10 @@ def run_variant_hybrid(train_loader,
         epoch_total = 0
         num_batches = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
+            if cycle_steps > 0:
+                current_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
+                set_optimizer_lr(opt, current_lr)
+                epoch_lr = current_lr
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
@@ -1563,6 +1974,7 @@ def run_variant_hybrid(train_loader,
                 preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
+            global_step += 1
         dur = time.time() - epoch_start
         avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
@@ -1598,7 +2010,17 @@ def run_variant_hybrid(train_loader,
     test_acc, preds = evaluate_model(model, lambda t: t, test_loader, device, use_ste=True)
     if best_test_acc is None or test_acc > best_test_acc:
         best_test_acc = test_acc
-    return label, last_train_acc, test_acc, train_time, preds, best_test_acc
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / train_time if train_time > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, last_train_acc, test_acc, train_time, preds, best_test_acc, profile
 
 
 def run_variant_transformer(train_loader,
@@ -1621,6 +2043,7 @@ def run_variant_transformer(train_loader,
                             mlp_ratio: Union[float, Sequence[float]],
                             window_size: int,
                             drop_path: float,
+                            drop_path_schedule: str,
                             dropout: float,
                             tm_clauses: Union[int, Sequence[int]],
                             tm_tau: float,
@@ -1630,11 +2053,14 @@ def run_variant_transformer(train_loader,
                             ema_decay: float,
                             mixup_alpha: float,
                             cutmix_alpha: float,
+                            mixup_schedule: str,
+                            cutmix_schedule: str,
                             base_lr: float = 7e-4,
                             min_lr: float = 7e-4,
                             warmup_epochs: int = 0,
                             weight_decay: float = 1e-5,
                             layer_decay: float = 1.0,
+                            lr_cycle_steps: int = 0,
                             gradient_centralize: bool = False,
                             aux_weight: float = 0.0,
                             label_smoothing: float = 0.0,
@@ -1661,7 +2087,27 @@ def run_variant_transformer(train_loader,
                             continuous_bypass: bool = False,
                             bypass_scale: float = 1.0,
                             tm_prior_template: str = "none",
-                            ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]]]:
+                            self_distill_weight: float = 0.0,
+                            self_distill_temp: float = 1.0,
+                            contrastive_weight: float = 0.0,
+                            contrastive_temp: float = 0.1,
+                            use_flash_attention: bool = False,
+                            use_residual_attention: bool = False,
+                            log_dir: str = "",
+                            relative_position_type: str = "none",
+                            visualize_dir: str = "",
+                            visualize_samples: int = 0,
+                            visualize_topk: int = 3,
+                            class_names: Optional[Sequence[str]] = None,
+                            test_dataset: Optional[Dataset] = None,
+                            normalize_stats: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
+                            clause_specialize: bool = False,
+                            clause_specialize_strength: float = 0.5,
+                            distill_teacher_timm: str = "",
+                            distill_teacher_checkpoint: str = "",
+                            distill_teacher_weight: float = 0.0,
+                            distill_teacher_temp: float = 1.0,
+                            ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     base_model_kwargs: Dict[str, Any] = {
         "num_classes": num_classes,
         "architecture": architecture,
@@ -1677,6 +2123,7 @@ def run_variant_transformer(train_loader,
         "drop_rate": dropout,
         "attn_drop_rate": dropout,
         "drop_path_rate": drop_path,
+        "drop_path_schedule": drop_path_schedule,
         "window_size": window_size,
         "use_cls_token": use_cls_token,
         "pool": pool,
@@ -1700,6 +2147,9 @@ def run_variant_transformer(train_loader,
         "clause_routing": clause_routing,
         "continuous_bypass": continuous_bypass,
         "bypass_scale": bypass_scale,
+        "use_flash_attention": use_flash_attention,
+        "use_residual_attention": use_residual_attention,
+        "relative_position_type": relative_position_type,
     }
 
     if auto_clause:
@@ -1728,26 +2178,93 @@ def run_variant_transformer(train_loader,
     best_test_acc: Optional[float] = None
     label = f"Transformer-{architecture.upper()}"
     collect_aux = aux_weight > 0
+    teacher_model = None
+    if distill_teacher_weight > 0.0 and (distill_teacher_timm or distill_teacher_checkpoint):
+        teacher_model = build_distillation_teacher(
+            distill_teacher_timm,
+            distill_teacher_checkpoint,
+            num_classes,
+            in_channels,
+            device,
+        )
+        print(f"Loaded teacher model: {distill_teacher_timm or distill_teacher_checkpoint}")
     component_history: List[Dict[str, Any]] = []
+    writer = None
+    if log_dir:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(log_dir=log_dir)
+        except Exception as exc:  # pragma: no cover - tensorboard optional
+            print(f"[WARN] TensorBoard writer unavailable: {exc}")
+            writer = None
+
+    steps_per_epoch = max(1, len(train_loader))
+    warmup_steps = warmup_epochs * steps_per_epoch
+    cycle_steps = max(0, lr_cycle_steps)
+    need_features = contrastive_weight > 0.0
+    mixup_schedule = (mixup_schedule or "constant").lower()
+    cutmix_schedule = (cutmix_schedule or "constant").lower()
 
     for epoch in range(epochs):
-        epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
+        mixup_epoch_alpha = schedule_scalar(epoch, epochs, mixup_alpha, mixup_schedule)
+        cutmix_epoch_alpha = schedule_scalar(epoch, epochs, cutmix_alpha, cutmix_schedule)
+        global_step = epoch * steps_per_epoch
+        if cycle_steps > 0:
+            epoch_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
+            set_optimizer_lr(opt, epoch_lr)
+        else:
+            epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
         num_batches = 0
+        total_distill = 0.0
+        distill_count = 0
+        total_contrast = 0.0
+        contrast_count = 0
+        total_teacher_kd = 0.0
+        teacher_count = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
+            if cycle_steps > 0:
+                current_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
+                set_optimizer_lr(opt, current_lr)
+                epoch_lr = current_lr
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_alpha, cutmix_alpha)
+            external_teacher_logits: Optional[torch.Tensor] = None
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_out = teacher_model(x)
+                    if isinstance(teacher_out, tuple):
+                        external_teacher_logits = teacher_out[0]
+                    else:
+                        external_teacher_logits = teacher_out
+            x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_epoch_alpha, cutmix_epoch_alpha)
             opt.zero_grad(set_to_none=True)
+            distill_term: Optional[torch.Tensor] = None
+            contrast_term: Optional[torch.Tensor] = None
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                outputs = model(x_aug, use_ste=True, collect_diagnostics=collect_aux)
-                if isinstance(outputs, tuple):
-                    logits, aux_outputs = outputs
+                outputs = model(
+                    x_aug,
+                    use_ste=True,
+                    collect_diagnostics=collect_aux,
+                    return_features=need_features,
+                )
+                features: Optional[torch.Tensor]
+                if collect_aux and need_features:
+                    logits, aux_outputs, features = outputs  # type: ignore[assignment]
+                elif collect_aux:
+                    logits, aux_outputs = outputs  # type: ignore[assignment]
+                    features = None
+                elif need_features:
+                    logits, features = outputs  # type: ignore[assignment]
+                    aux_outputs = {}
                 else:
-                    logits, aux_outputs = outputs, {}
+                    logits = outputs  # type: ignore[assignment]
+                    aux_outputs = {}
+                    features = None
                 if lam is not None:
                     loss = lam * F.cross_entropy(logits, targets_a, label_smoothing=label_smoothing) + (
                         1 - lam
@@ -1767,6 +2284,28 @@ def run_variant_transformer(train_loader,
                             aux_loss += F.cross_entropy(aux_logits, y, label_smoothing=label_smoothing)
                     aux_loss = aux_loss / max(len(aux_outputs), 1)
                     loss = loss + aux_weight * aux_loss
+                if self_distill_weight > 0.0 and ema_model is not None:
+                    with torch.no_grad():
+                        teacher_out = ema_model(x_aug, use_ste=True)
+                        teacher_logits = teacher_out[0] if isinstance(teacher_out, tuple) else teacher_out
+                    distill_term = F.kl_div(
+                        F.log_softmax(logits / self_distill_temp, dim=1),
+                        F.softmax(teacher_logits / self_distill_temp, dim=1),
+                        reduction="batchmean",
+                    ) * (self_distill_temp ** 2)
+                    loss = loss + self_distill_weight * distill_term
+                if external_teacher_logits is not None and distill_teacher_weight > 0.0:
+                    kd_loss = F.kl_div(
+                        F.log_softmax(logits / distill_teacher_temp, dim=1),
+                        F.softmax(external_teacher_logits / distill_teacher_temp, dim=1),
+                        reduction="batchmean",
+                    ) * (distill_teacher_temp ** 2)
+                    loss = loss + distill_teacher_weight * kd_loss
+                    total_teacher_kd += kd_loss.item()
+                    teacher_count += 1
+                if contrastive_weight > 0.0 and features is not None and features.numel() > 0:
+                    contrast_term = supervised_contrastive_loss(features, y, temperature=contrastive_temp)
+                    loss = loss + contrastive_weight * contrast_term
                 reg_loss = model.pop_regularization_loss()
                 if reg_loss is not None:
                     loss = loss + reg_loss
@@ -1783,10 +2322,17 @@ def run_variant_transformer(train_loader,
                         ema_param.data.mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
             running_loss += loss.item()
             num_batches += 1
+            if distill_term is not None:
+                total_distill += distill_term.detach().item()
+                distill_count += 1
+            if contrast_term is not None:
+                total_contrast += contrast_term.detach().item()
+                contrast_count += 1
             if report_train_acc:
                 preds = logits.argmax(dim=1)
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
+            global_step += 1
         dur = time.time() - epoch_start
         avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
@@ -1795,22 +2341,55 @@ def run_variant_transformer(train_loader,
             last_train_acc = epoch_acc
 
         eval_model = ema_model if ema_model is not None else model
-        epoch_test_acc, component_acc, _ = evaluate_transformer_components(
+        epoch_test_acc, component_acc, _, clause_usage = evaluate_transformer_components(
             eval_model,
             test_loader,
             device,
             collect_preds=False,
         )
         best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+        avg_distill = (total_distill / distill_count) if distill_count > 0 else None
+        avg_contrast = (total_contrast / contrast_count) if contrast_count > 0 else None
+        avg_teacher_kd = (total_teacher_kd / teacher_count) if teacher_count > 0 else None
         component_history.append(
             {
                 "epoch": epoch + 1,
                 "test_accuracy": epoch_test_acc,
                 "component_accuracy": component_acc,
+                "mixup_alpha": mixup_epoch_alpha,
+                "cutmix_alpha": cutmix_epoch_alpha,
+                "distill_loss": avg_distill,
+                "contrastive_loss": avg_contrast,
+                "clause_usage": clause_usage,
+                "teacher_kd_loss": avg_teacher_kd,
             }
         )
 
         extras = {f"{name}_acc": acc for name, acc in component_acc.items()}
+        extras["mixup_alpha"] = mixup_epoch_alpha
+        extras["cutmix_alpha"] = cutmix_epoch_alpha
+        if avg_distill is not None:
+            extras["distill_loss"] = avg_distill
+        if avg_contrast is not None:
+            extras["contrast_loss"] = avg_contrast
+        if avg_teacher_kd is not None:
+            extras["teacher_kd_loss"] = avg_teacher_kd
+        if writer is not None:
+            writer.add_scalar(f"{label}/loss/train", avg_loss, epoch)
+            if epoch_acc is not None:
+                writer.add_scalar(f"{label}/train/accuracy", epoch_acc, epoch)
+            writer.add_scalar(f"{label}/test/accuracy", epoch_test_acc, epoch)
+            writer.add_scalar(f"{label}/test/best_accuracy", best_test_acc, epoch)
+            writer.add_scalar(f"{label}/augment/mixup_alpha", mixup_epoch_alpha, epoch)
+            writer.add_scalar(f"{label}/augment/cutmix_alpha", cutmix_epoch_alpha, epoch)
+            if avg_distill is not None:
+                writer.add_scalar(f"{label}/aux/distillation_loss", avg_distill, epoch)
+            if avg_contrast is not None:
+                writer.add_scalar(f"{label}/aux/contrastive_loss", avg_contrast, epoch)
+            if avg_teacher_kd is not None:
+                writer.add_scalar(f"{label}/aux/teacher_kd_loss", avg_teacher_kd, epoch)
+            for name, value in component_acc.items():
+                writer.add_scalar(f"{label}/components/{name}", value, epoch)
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
@@ -1825,9 +2404,12 @@ def run_variant_transformer(train_loader,
         )
         print("  " + log_msg)
 
+        if clause_specialize and clause_usage:
+            model.apply_clause_head_specialization(clause_usage, clause_specialize_strength)
+
     train_time = time.time() - start
     eval_model = ema_model if ema_model is not None else model
-    test_acc, final_component_acc, preds = evaluate_transformer_components(
+    test_acc, final_component_acc, preds, final_clause_usage = evaluate_transformer_components(
         eval_model,
         test_loader,
         device,
@@ -1838,8 +2420,69 @@ def run_variant_transformer(train_loader,
     diagnostics = {
         "per_epoch": component_history,
         "final": final_component_acc,
+        "clause_usage": final_clause_usage,
+        "training": {
+            "mixup_schedule": mixup_schedule,
+            "cutmix_schedule": cutmix_schedule,
+            "self_distill_weight": self_distill_weight,
+            "contrastive_weight": contrastive_weight,
+            "teacher_model": distill_teacher_timm or distill_teacher_checkpoint,
+            "teacher_weight": distill_teacher_weight,
+            "teacher_temp": distill_teacher_temp,
+        },
     }
-    return label, last_train_acc, test_acc, train_time, preds, diagnostics, best_test_acc
+
+    if clause_specialize and final_clause_usage:
+        model.apply_clause_head_specialization(final_clause_usage, clause_specialize_strength)
+
+    if visualize_dir and visualize_samples > 0 and test_dataset is not None:
+        overlay_dir = Path(visualize_dir)
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        label_names: List[str]
+        if class_names is not None:
+            label_names = list(class_names)
+        else:
+            label_names = [str(i) for i in range(num_classes)]
+        sample_total = min(visualize_samples, len(test_dataset))
+        for sample_idx in range(sample_total):
+            sample = test_dataset[sample_idx]
+            if isinstance(sample, tuple):
+                sample_img, sample_label = sample[0], int(sample[1])
+            else:
+                sample_img, sample_label = sample, 0
+            if not isinstance(sample_img, torch.Tensor):
+                continue
+            generate_transformer_overlay(
+                eval_model,
+                sample_img,
+                sample_label,
+                label_names,
+                architecture,
+                patch_size,
+                image_size,
+                normalize_stats,
+                overlay_dir / f"sample_{sample_idx:05d}.png",
+                device=device,
+                topk=visualize_topk,
+            )
+    if writer is not None:
+        writer.add_scalar(f"{label}/final/test_accuracy", test_acc, epochs)
+        for name, value in final_component_acc.items():
+            writer.add_scalar(f"{label}/final/components/{name}", value, epochs)
+        writer.add_text(f"{label}/diagnostics_summary", json.dumps(diagnostics, indent=2))
+        writer.flush()
+        writer.close()
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / train_time if train_time > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, last_train_acc, test_acc, train_time, preds, diagnostics, best_test_acc, profile
 
 
 def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
@@ -1879,37 +2522,85 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
     if args.num_workers == 0:
         persistent_workers = False
 
-    transform = dataset_cfg["transform"]
     target_channels = args.tm_target_channels if args.tm_target_channels is not None else dataset_cfg["input_channels"]
     target_size = tuple(args.tm_target_size) if args.tm_target_size is not None else tuple(dataset_cfg["image_size"])
-    if transform is None:
-        transform_steps: List[Any] = []
-    elif isinstance(transform, transforms.Compose):
-        transform_steps = list(transform.transforms)
+    imagenet_mode = dataset_key == "imagenet"
+    if imagenet_mode and args.dataset_root == DEFAULT_DATA_ROOT:
+        args.dataset_root = DEFAULT_IMAGENET_ROOT
+    if imagenet_mode:
+        target_size = (args.imagenet_crop, args.imagenet_crop)
+        if args.write_bool_dataset:
+            print("[WARN] Boolean dataset export disabled for ImageNet.")
+            args.write_bool_dataset = False
+
+    test_normalize_stats: Optional[Tuple[Sequence[float], Sequence[float]]] = None
+
+    if imagenet_mode:
+        crop_size = args.imagenet_crop
+        resize_size = args.imagenet_resize
+        train_steps: List[Any] = [
+            transforms.RandomResizedCrop(crop_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(),
+        ]
+        if args.randaugment:
+            train_steps.append(transforms.RandAugment(num_ops=args.randaugment_n, magnitude=args.randaugment_m))
+        train_steps.extend([transforms.ToTensor(), transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
+        train_transform = transforms.Compose(train_steps)
+        test_transform = transforms.Compose(
+            [
+                transforms.Resize(resize_size, interpolation=InterpolationMode.BICUBIC),
+                transforms.CenterCrop(crop_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ]
+        )
+        test_normalize_stats = (IMAGENET_MEAN, IMAGENET_STD)
     else:
-        transform_steps = [transform]
-    if tuple(dataset_cfg["image_size"]) != target_size:
-        transform_steps.insert(0, transforms.Resize(target_size, interpolation=InterpolationMode.BICUBIC, antialias=True))
-    if args.randaugment:
-        transform_steps.insert(0, transforms.RandAugment(num_ops=args.randaugment_n, magnitude=args.randaugment_m))
-    has_tensor = any(isinstance(t, transforms.ToTensor) for t in transform_steps)
-    if not has_tensor:
-        transform_steps.append(transforms.ToTensor())
-    transform = transforms.Compose(transform_steps)
+        base_train_transform = dataset_cfg.get("train_transform", dataset_cfg.get("transform"))
+        base_test_transform = dataset_cfg.get("test_transform", dataset_cfg.get("transform"))
+        resize_target = target_size if tuple(dataset_cfg["image_size"]) != target_size else None
+        train_transform = _build_transform(
+            base_train_transform,
+            target_size=resize_target,
+            apply_randaugment=args.randaugment,
+            randaugment_n=args.randaugment_n,
+            randaugment_m=args.randaugment_m,
+            add_normalize=None,
+        )
+        test_transform = _build_transform(
+            base_test_transform,
+            target_size=resize_target,
+            apply_randaugment=False,
+            randaugment_n=args.randaugment_n,
+            randaugment_m=args.randaugment_m,
+            add_normalize=None,
+        )
+        test_normalize_stats = _extract_normalize(test_transform)
 
     with profile_block("load-dataset"):
-        train_ds = dataset_cfg["train_class"](
-            root=args.dataset_root,
-            train=True,
-            download=args.download,
-            transform=transform,
-        )
-        test_ds = dataset_cfg["test_class"](
-            root=args.dataset_root,
-            train=False,
-            download=args.download,
-            transform=transform,
-        )
+        if imagenet_mode:
+            dataset_root = args.dataset_root or DEFAULT_IMAGENET_ROOT
+            train_dir = args.imagenet_train_dir or os.path.join(dataset_root, "train")
+            val_dir = args.imagenet_val_dir or os.path.join(dataset_root, "val")
+            if not os.path.isdir(train_dir):
+                raise FileNotFoundError(f"ImageNet train directory not found: {train_dir}")
+            if not os.path.isdir(val_dir):
+                raise FileNotFoundError(f"ImageNet validation directory not found: {val_dir}")
+            train_ds = dataset_cfg["train_class"](train_dir, transform=train_transform)
+            test_ds = dataset_cfg["test_class"](val_dir, transform=test_transform)
+        else:
+            train_ds = dataset_cfg["train_class"](
+                root=args.dataset_root,
+                train=True,
+                download=args.download,
+                transform=train_transform,
+            )
+            test_ds = dataset_cfg["test_class"](
+                root=args.dataset_root,
+                train=False,
+                download=args.download,
+                transform=test_transform,
+            )
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
@@ -2060,7 +2751,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
         with profile_block(f"variant-{model_key}"):
             diagnostics: Optional[Dict[str, Any]] = None
             if model_key == "tm":
-                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_tm(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_tm(
                     tm_train_loader,
                     tm_test_loader,
                     device,
@@ -2086,11 +2777,12 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
                     label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
                     tm_prior_template=args.tm_prior_template,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
-                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_deeptm(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deeptm(
                     deeptm_train_loader,
                     deeptm_test_loader,
                     device,
@@ -2114,12 +2806,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
                     label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
                     tm_prior_template=args.tm_prior_template,
                 )
                 variant_classes = args.num_classes
             elif model_key == "hybrid":
                 hybrid_classes = args.hybrid_classes if args.hybrid_classes is not None else args.num_classes
-                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc = run_variant_hybrid(
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_hybrid(
                     train_loader,
                     test_loader,
                     device,
@@ -2139,10 +2832,11 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     gradient_centralize=args.gradient_centralize,
                     label_smoothing=args.label_smoothing,
                     tm_prior_template=args.tm_prior_template,
+                    lr_cycle_steps=args.lr_cycle_steps,
                 )
                 variant_classes = hybrid_classes
             elif model_key == "transformer":
-                label, train_acc, test_acc, train_time, preds, diagnostics, best_epoch_test_acc = run_variant_transformer(
+                label, train_acc, test_acc, train_time, preds, diagnostics, best_epoch_test_acc, profile = run_variant_transformer(
                     train_loader,
                     test_loader,
                     device,
@@ -2162,6 +2856,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     mlp_ratio=transformer_mlp_cfg,
                     window_size=args.transformer_window,
                     drop_path=args.transformer_drop_path,
+                    drop_path_schedule=args.transformer_drop_path_schedule,
                     dropout=args.transformer_dropout,
                     tm_clauses=transformer_tm_clauses_cfg,
                     tm_tau=args.tm_tau,
@@ -2171,11 +2866,14 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     ema_decay=args.transformer_ema_decay,
                     mixup_alpha=args.mixup_alpha,
                     cutmix_alpha=args.cutmix_alpha,
+                    mixup_schedule=args.mixup_schedule,
+                    cutmix_schedule=args.cutmix_schedule,
                     base_lr=transformer_base_lr,
                     min_lr=transformer_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
                     layer_decay=args.lr_layer_decay,
+                    lr_cycle_steps=args.lr_cycle_steps,
                     gradient_centralize=args.gradient_centralize,
                     aux_weight=args.transformer_aux_weight,
                     label_smoothing=args.label_smoothing,
@@ -2202,6 +2900,26 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     continuous_bypass=args.transformer_bypass,
                     bypass_scale=args.transformer_bypass_scale,
                     tm_prior_template=args.tm_prior_template,
+                    self_distill_weight=args.transformer_self_distill_weight,
+                    self_distill_temp=args.transformer_self_distill_temp,
+                    contrastive_weight=args.transformer_contrastive_weight,
+                    contrastive_temp=args.transformer_contrastive_temp,
+                    use_flash_attention=args.transformer_use_flash_attn,
+                    use_residual_attention=args.transformer_residual_attn,
+                    log_dir=args.transformer_log_dir,
+                    relative_position_type=args.transformer_relative_pos,
+                    visualize_dir=args.visualize_overlays,
+                    visualize_samples=args.visualize_samples,
+                    visualize_topk=args.visualize_topk,
+                    class_names=getattr(train_ds, "classes", None),
+                    test_dataset=test_ds,
+                    normalize_stats=test_normalize_stats,
+                    clause_specialize=args.transformer_clause_specialize,
+                    clause_specialize_strength=args.transformer_clause_specialize_strength,
+                    distill_teacher_timm=args.distill_teacher_timm,
+                    distill_teacher_checkpoint=args.distill_teacher_checkpoint,
+                    distill_teacher_weight=args.distill_teacher_weight,
+                    distill_teacher_temp=args.distill_teacher_temp,
                 )
                 bundle = None
                 variant_classes = args.num_classes
@@ -2232,6 +2950,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             "json": export_path,
             "preds": preds,
             "best_epoch_test_accuracy": best_epoch_test_acc,
+            "profile": profile,
         }
         if model_key == "tm":
             results[model_key]["feature_mode"] = tm_feature_mode
@@ -2246,6 +2965,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                 }
         if model_key == "transformer" and diagnostics is not None:
             results[model_key]["diagnostics"] = diagnostics
+            results[model_key]["clause_usage"] = diagnostics.get("clause_usage")
 
     output_dir = os.path.dirname(args.output_json)
     if output_dir:
@@ -2262,6 +2982,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             acc_parts.append(f"train_acc={train_acc:.4f}")
         if test_acc is not None:
             acc_parts.append(f"test_acc={test_acc:.4f}")
+        profile = info.get("profile", {})
+        throughput = profile.get("samples_per_second")
+        if throughput:
+            acc_parts.append(f"throughput={throughput:.1f}/s")
+        max_mem = profile.get("max_memory_bytes")
+        if max_mem:
+            acc_parts.append(f"max_mem={max_mem / (1024**2):.1f}MB")
         acc_str = " ".join(acc_parts)
         label = info.get("label", key.upper())
         print(f"{label:12s} {acc_str} train_time={info['train_time_s']:.1f}s json={info['json']}")
