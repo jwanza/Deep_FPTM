@@ -985,6 +985,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional TensorBoard log directory for transformer diagnostics.",
     )
     parser.add_argument(
+        "--transformer-save-path",
+        type=str,
+        default="",
+        help="Optional filepath to save the trained transformer checkpoint (state_dict + config).",
+    )
+    parser.add_argument(
         "--visualize-overlays",
         type=str,
         default="",
@@ -1489,6 +1495,7 @@ def build_distillation_teacher(
     num_classes: int,
     in_channels: int,
     device: torch.device,
+    img_size: Tuple[int, int],
 ) -> nn.Module:
     if not timm_name and not checkpoint_path:
         raise ValueError("No teacher configuration provided.")
@@ -1496,7 +1503,13 @@ def build_distillation_teacher(
         raise ImportError("timm is required for external teacher distillation.")
     if not timm_name:
         raise ValueError("A timm model name is required when loading an external teacher.")
-    teacher = timm.create_model(timm_name, pretrained=True, num_classes=num_classes, in_chans=in_channels)
+    teacher = timm.create_model(
+        timm_name,
+        pretrained=True,
+        num_classes=num_classes,
+        in_chans=in_channels,
+        img_size=img_size,
+    )
     if hasattr(teacher, "reset_classifier"):
         teacher.reset_classifier(num_classes)
     if checkpoint_path:
@@ -2107,6 +2120,7 @@ def run_variant_transformer(train_loader,
                             distill_teacher_checkpoint: str = "",
                             distill_teacher_weight: float = 0.0,
                             distill_teacher_temp: float = 1.0,
+                            save_path: str = "",
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     base_model_kwargs: Dict[str, Any] = {
         "num_classes": num_classes,
@@ -2186,6 +2200,7 @@ def run_variant_transformer(train_loader,
             num_classes,
             in_channels,
             device,
+            image_size,
         )
         print(f"Loaded teacher model: {distill_teacher_timm or distill_teacher_checkpoint}")
     component_history: List[Dict[str, Any]] = []
@@ -2482,6 +2497,57 @@ def run_variant_transformer(train_loader,
         "samples_per_second": throughput,
         "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
     }
+    if save_path:
+        checkpoint_path = Path(save_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        teacher_kd_summary = None
+        if diagnostics.get("per_epoch"):
+            teacher_kd_summary = diagnostics["per_epoch"][-1].get("teacher_kd_loss")
+        checkpoint = {
+            "model_state": model.state_dict(),
+            "model_kwargs": base_model_kwargs,
+            "train_args": {
+                "epochs": epochs,
+                "base_lr": base_lr,
+                "min_lr": min_lr,
+                "weight_decay": weight_decay,
+                "layer_decay": layer_decay,
+                "warmup_epochs": warmup_epochs,
+                "lr_cycle_steps": lr_cycle_steps,
+                "mixup_alpha": mixup_alpha,
+                "cutmix_alpha": cutmix_alpha,
+                "mixup_schedule": mixup_schedule,
+                "cutmix_schedule": cutmix_schedule,
+                "label_smoothing": label_smoothing,
+                "aux_weight": aux_weight,
+                "self_distill_weight": self_distill_weight,
+                "self_distill_temp": self_distill_temp,
+                "contrastive_weight": contrastive_weight,
+                "contrastive_temp": contrastive_temp,
+                "clause_specialize": clause_specialize,
+                "clause_specialize_strength": clause_specialize_strength,
+                "distill_teacher_timm": distill_teacher_timm,
+                "distill_teacher_checkpoint": distill_teacher_checkpoint,
+                "distill_teacher_weight": distill_teacher_weight,
+                "distill_teacher_temp": distill_teacher_temp,
+            },
+            "train_metrics": {
+                "train_accuracy": last_train_acc,
+                "test_accuracy": test_acc,
+                "best_test_accuracy": best_test_acc,
+                "teacher_kd_loss": teacher_kd_summary,
+                "train_time": train_time,
+            },
+            "meta": {
+                "architecture": architecture,
+                "backend": backend,
+                "timestamp": time.time(),
+                "image_size": image_size,
+                "num_classes": num_classes,
+            },
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"  Saved transformer checkpoint to {checkpoint_path}")
     return label, last_train_acc, test_acc, train_time, preds, diagnostics, best_test_acc, profile
 
 
@@ -2920,6 +2986,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     distill_teacher_checkpoint=args.distill_teacher_checkpoint,
                     distill_teacher_weight=args.distill_teacher_weight,
                     distill_teacher_temp=args.distill_teacher_temp,
+                            save_path=args.transformer_save_path,
                 )
                 bundle = None
                 variant_classes = args.num_classes

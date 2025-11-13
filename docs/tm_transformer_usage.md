@@ -41,6 +41,7 @@ This guide shows how to launch the upgraded TM transformers, outlines every conf
 | `--transformer-auto-clause-batches` | number of batches sampled during auto tuning |
 | `--transformer-self-distill-weight`, `--transformer-self-distill-temp` | EMA-teacher self-distillation controls |
 | `--transformer-contrastive-weight`, `--transformer-contrastive-temp` | supervised contrastive auxiliary controls |
+| `--transformer-save-path` | write a checkpoint (state dict + config + metrics) for the trained transformer |
 
 Additional data-prep knobs:
 - `--tm-feature-mode` with presets from `fptm_ste.datasets`, plus `--tm-feature-config`, `--tm-feature-size`, `--tm-feature-grayscale`, reuse cached boolean TM features when needed.
@@ -257,3 +258,73 @@ Collect wall-clock timings (the runner logs per-epoch duration) and accuracy to 
 - Control KD strength with `--distill-teacher-weight` and temperature with `--distill-teacher-temp`.  
 - Combine with EMA self-distillation (`--transformer-self-distill-weight/temp`) and clause-aware head specialisation (`--transformer-clause-specialize`).  
 - Diagnostic JSON now records `teacher_kd_loss` (per epoch) and final clause usage, making it easy to compare student-only vs teacher-guided runs.
+
+### 9.1 Step-by-step: ViT Teacher → TM-ViT Student (MNIST demo)
+1. Activate the project environment and expose the package path:
+   ```bash
+   source SOURCE.THIS
+   export PYTHONPATH=$PWD/python:$PYTHONPATH
+   ```
+2. Launch distillation with a pretrained TIMM ViT teacher and save the student checkpoint:
+   ```bash
+   python3 python/fptm_ste/tests/run_mnist_equiv.py \
+     --device cpu \
+     --dataset mnist \
+     --models transformer \
+     --transformer-arch vit \
+     --transformer-backend ste \
+     --transformer-patch 4 \
+     --transformer-embed-dims 64 \
+     --transformer-layers 1 \
+     --transformer-heads 4 \
+     --transformer-mlp-ratio 3.0 \
+     --epochs 1 \
+     --batch-size 512 \
+     --test-batch-size 512 \
+     --tm-target-size 64 64 \
+     --distill-teacher-timm vit_small_patch16_224 \
+     --distill-teacher-weight 0.5 \
+     --distill-teacher-temp 2.0 \
+     --transformer-save-path /tmp/mnist_vit_tm_distilled.pth
+   ```
+   Example outcome (CPU, 1 epoch smoke test): `test_acc ≈ 0.41`, `teacher_kd_loss ≈ 0.36`, checkpoint stored at `/tmp/mnist_vit_tm_distilled.pth`.
+3. To reuse the distilled model later:
+   ```python
+   import torch
+   from fptm_ste.tm_transformer import UnifiedTMTransformer
+
+   ckpt = torch.load("/tmp/mnist_vit_tm_distilled.pth", map_location="cpu")
+   model = UnifiedTMTransformer(**ckpt["model_kwargs"])
+   model.load_state_dict(ckpt["model_state"])
+   model.eval()
+   ```
+
+### 9.2 Step-by-step: Swin Teacher → TM-Swin Student
+1. Environment setup as above (`source SOURCE.THIS`, set `PYTHONPATH`).
+2. Distil from a pretrained Swin-T teacher while resizing MNIST to 64×64 for compatibility:
+   ```bash
+   python3 python/fptm_ste/tests/run_mnist_equiv.py \
+     --device cpu \
+     --dataset mnist \
+     --models transformer \
+     --transformer-arch swin \
+     --transformer-backend ste \
+     --transformer-patch 2 \
+     --transformer-depths 1,1 \
+     --transformer-stage-heads 2,4 \
+     --transformer-embed-dims 48,96 \
+     --transformer-mlp-ratio 3.0,3.0 \
+     --transformer-window 4 \
+     --epochs 1 \
+     --batch-size 512 \
+     --test-batch-size 512 \
+     --tm-target-size 64 64 \
+     --distill-teacher-timm swin_tiny_patch4_window7_224 \
+     --distill-teacher-weight 0.5 \
+     --distill-teacher-temp 2.0 \
+     --transformer-save-path /tmp/mnist_swin_tm_distilled.pth
+   ```
+   Example outcome (CPU, 1 epoch): `test_acc ≈ 0.36`, `teacher_kd_loss ≈ 0.12`, checkpoint saved to `/tmp/mnist_swin_tm_distilled.pth`.
+3. Load the Swin-based checkpoint using the same snippet shown above (replace the path).
+
+These MNIST runs are quick sanity checks; for CIFAR-10 or ImageNet swap `--dataset`, restore native image sizes (no `--tm-target-size` override), raise epochs, and move to GPU for realistic accuracy. The same `--transformer-save-path` flag works for long runs so you can archive the best distilled student for downstream evaluation or visualization.
