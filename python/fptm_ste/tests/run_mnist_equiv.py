@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover
 from fptm_ste import FuzzyPatternTM_STE, FuzzyPatternTMFPTM, FuzzyPatternTM_STCM
 from fptm_ste.binarizers import CNNSingleBinarizer
 from fptm_ste.deep_tm import DeepTMNetwork
+from fptm_ste.deep_ctm import DeepCTMNetwork
 from fptm_ste.export import export_compiled_to_json
 from fptm_ste.tm_transformer import UnifiedTMTransformer
 from fptm_ste.tm_priors import apply_tm_prior_template
@@ -50,13 +51,15 @@ from fptm_ste.datasets import (
 from fptm_ste.visualization import generate_transformer_overlay
 from fptm_ste.trainers import anneal_ste_factor
 
-AVAILABLE_MODELS = ("tm", "stcm", "deep_tm", "deep_stcm", "hybrid", "transformer")
+AVAILABLE_MODELS = ("tm", "stcm", "deep_tm", "deep_stcm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
     "tm": "tm",
     "stcm": "stcm",
     "deep_tm": "deeptm",
     "deep_stcm": "deepstcm",
+    "deep_ctm": "deepctm",
+    "deep_cstcm": "deepcstcm",
     "hybrid": "hybrid",
     "transformer": "transformer",
 }
@@ -1095,6 +1098,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deeptm-n-clauses", type=int, default=256, help="Number of clauses for Deep TM.")
     parser.add_argument("--deeptm-dropout", type=float, default=0.1, help="Dropout for Deep TM network.")
     parser.add_argument("--deeptm-tau", type=float, default=0.5, help="Tau for Deep TM classifier.")
+
+    # Deep CTM options (shared between deep_ctm and deep_cstcm)
+    parser.add_argument("--deepctm-channels", default=None, help="Comma-separated output channels per ConvTM block.")
+    parser.add_argument("--deepctm-kernels", default=None, help="Comma-separated kernel sizes per ConvTM block.")
+    parser.add_argument("--deepctm-strides", default=None, help="Comma-separated strides per ConvTM block.")
+    parser.add_argument("--deepctm-pools", default=None, help="Comma-separated pooling kernel per block (1 disables).")
+    parser.add_argument("--deepctm-clauses", default=None, help="Comma-separated clause counts per ConvTM block.")
+    parser.add_argument("--deepctm-head-clauses", type=int, default=None, help="Clause count in final TM classifier head.")
+    parser.add_argument("--deepctm-dropout", type=float, default=0.1, help="Dropout in Deep CTM blocks (Dropout2d).")
+    parser.add_argument("--deepctm-tau", type=float, default=0.5, help="Tau for Deep CTM blocks and head.")
+    parser.add_argument("--deepctm-core", choices=["tm", "deeptm"], default="tm", help="Per-patch core for deep_ctm (tm or deeptm).")
+    parser.add_argument("--deepcstcm-core", choices=["stcm", "deepstcm"], default="stcm", help="Per-patch core for deep_cstcm (stcm or deepstcm).")
+    parser.add_argument("--deepctm-core-hidden-dims", default=None, help="Comma-separated hidden dims for deep patch cores (deeptm/deepstcm).")
+    parser.add_argument("--deepctm-aux-weight", type=float, default=0.0, help="Auxiliary CE weight for per-block CTM diagnostic heads.")
 
     # Hybrid options
     parser.add_argument("--hybrid-thresholds", type=int, default=32, help="Number of thresholds for CNN binarizer.")
@@ -2149,6 +2166,50 @@ def evaluate_transformer_components(
     return final_acc, component_acc, preds, clause_metrics
 
 
+def evaluate_ctm_components(
+    model: "DeepCTMNetwork",
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    collect_preds: bool = True,
+    max_batches: Optional[int] = None,
+) -> Tuple[float, Dict[str, float], List[int]]:
+    was_training = model.training
+    model.eval()
+    total_correct = 0
+    total = 0
+    preds: List[int] = []
+    component_correct: Dict[str, int] = defaultdict(int)
+    component_total: Dict[str, int] = defaultdict(int)
+    with torch.no_grad():
+        for batch_idx, (x, y) in enumerate(loader, start=1):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            outputs = model(x, use_ste=True, collect_diagnostics=True)
+            if isinstance(outputs, tuple):
+                logits, component_logits = outputs  # type: ignore[assignment]
+            else:
+                logits, component_logits = outputs, {}
+            batch_preds = logits.argmax(dim=1)
+            if collect_preds:
+                preds.extend(batch_preds.cpu().tolist())
+            total_correct += (batch_preds == y).sum().item()
+            total += y.size(0)
+            for name, comp_logits in component_logits.items():
+                comp_pred = comp_logits.argmax(dim=1)
+                component_correct[name] += (comp_pred == y).sum().item()
+                component_total[name] += y.size(0)
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+    if was_training:
+        model.train()
+    final_acc = total_correct / total if total > 0 else 0.0
+    component_acc = {
+        name: (component_correct[name] / component_total[name]) if component_total[name] > 0 else 0.0
+        for name in sorted(component_correct)
+    }
+    return final_acc, component_acc, preds
+
 def _vit_clause_list(tm_clauses: Union[int, Sequence[int]], depth: int) -> List[int]:
     if isinstance(tm_clauses, Sequence) and not isinstance(tm_clauses, (str, bytes)):
         clause_list = [int(max(1, c)) for c in tm_clauses]
@@ -2702,9 +2763,29 @@ def train_tm_model(model: nn.Module,
             xb = prepare_fn(x)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                outputs = model(xb, use_ste=use_ste_train)
-                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                # CTM auxiliary training for diagnostic heads
+                aux_weight_value = float(getattr(model, "aux_weight", 0.0))
+                collect_ctm_diag = aux_weight_value > 0.0 and hasattr(model, "diag_heads")
+                if collect_ctm_diag:
+                    outputs = model(xb, use_ste=use_ste_train, collect_diagnostics=True)
+                    if isinstance(outputs, tuple):
+                        logits, component_logits = outputs  # type: ignore[assignment]
+                    else:
+                        logits, component_logits = outputs, {}
+                else:
+                    outputs = model(xb, use_ste=use_ste_train)
+                    logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                    component_logits = {}
                 loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                if collect_ctm_diag and component_logits:
+                    aux_loss = 0.0
+                    count_aux = 0
+                    for comp in component_logits.values():
+                        aux_loss = aux_loss + F.cross_entropy(comp, y, label_smoothing=label_smoothing)
+                        count_aux += 1
+                    if count_aux > 0:
+                        aux_loss = aux_loss / count_aux
+                        loss = loss + aux_weight_value * aux_loss
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -2766,16 +2847,28 @@ def train_tm_model(model: nn.Module,
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
         if report_epoch_test:
-            epoch_test_acc, _ = evaluate_model(
-                model,
-                prepare_fn,
-                test_loader,
-                device,
-                use_ste=use_ste_eval,
-                collect_preds=False,
-            )
+            epoch_test_acc, _ = evaluate_model(model, prepare_fn, test_loader, device, use_ste=use_ste_eval, collect_preds=False)
             if epoch_test_acc is not None:
                 best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
+        # Optional CTM component diagnostics
+        ctm_extras: Dict[str, float] = {}
+        try:
+            from fptm_ste.deep_ctm import DeepCTMNetwork as _DeepCTMMarker  # type: ignore
+            is_ctm = isinstance(model, _DeepCTMMarker)
+        except Exception:
+            is_ctm = False
+        if is_ctm:
+            # Test component accuracies
+            _, comp_test, _ = evaluate_ctm_components(model, test_loader, device, collect_preds=False)
+            # Train component accuracies on a small sample to reduce overhead
+            _, comp_train, _ = evaluate_ctm_components(model, train_loader, device, collect_preds=False, max_batches=2)
+            # Merge into extras
+            for name, val in comp_test.items():
+                key = f"{name}_te"
+                ctm_extras[key] = float(val)
+            for name, val in comp_train.items():
+                key = f"{name}_tr"
+                ctm_extras[key] = float(val)
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
@@ -2786,7 +2879,7 @@ def train_tm_model(model: nn.Module,
             best_acc=best_test_acc,
             lr=epoch_lr,
             duration=dur,
-            extras=None,
+            extras=ctm_extras if ctm_extras else None,
         )
         print("  " + log_msg)
     train_time = time.time() - start
@@ -3172,6 +3265,187 @@ def run_variant_hybrid(train_loader,
     }
     return label, last_train_acc, test_acc, train_time, preds, best_test_acc, profile
 
+
+def run_variant_deepctm(train_loader,
+                        test_loader,
+                        device,
+                        *,
+                        epochs: int,
+                        report_train_acc: bool,
+                        report_epoch_acc: bool,
+                        report_epoch_test: bool,
+                        in_channels: int,
+                        image_size: Tuple[int, int],
+                        num_classes: int,
+                        channels: Sequence[int],
+                        kernels: Sequence[int],
+                        strides: Sequence[int],
+                        pools: Sequence[int],
+                        clauses_per_block: Sequence[int],
+                        head_clauses: int,
+                        tau: float,
+                        dropout: float,
+                        core_backend: str,
+                        core_hidden_dims: Optional[Sequence[int]],
+                        clause_dropout: float,
+                        literal_dropout: float,
+                        base_lr: float,
+                        min_lr: float,
+                        warmup_epochs: int,
+                        weight_decay: float,
+                        gradient_centralize: bool,
+                        label_smoothing: float,
+                        aux_weight: float = 0.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+    model = DeepCTMNetwork(
+        in_channels=in_channels,
+        image_size=image_size,
+        num_classes=num_classes,
+        channels=channels,
+        kernels=kernels,
+        strides=strides,
+        pools=pools,
+        clauses_per_block=clauses_per_block,
+        head_clauses=head_clauses,
+        tau=tau,
+        dropout=dropout,
+        conv_core_backend=core_backend,
+        core_hidden_dims=core_hidden_dims,
+        clause_dropout=clause_dropout,
+        literal_dropout=literal_dropout,
+        aux_weight=aux_weight,
+        layer_cls=FuzzyPatternTM_STE,
+    ).to(device)
+    label = "Deep-CTM"
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
+        model,
+        lambda t: t,
+        train_loader,
+        test_loader,
+        device,
+        label,
+        use_ste_train=False,
+        use_ste_eval=True,
+        epochs=epochs,
+        report_train_acc=report_train_acc,
+        report_epoch_acc=report_epoch_acc,
+        report_epoch_test=report_epoch_test,
+        base_lr=base_lr,
+        min_lr=min_lr,
+        warmup_epochs=warmup_epochs,
+        weight_decay=weight_decay,
+        gradient_centralize=gradient_centralize,
+        label_smoothing=label_smoothing,
+        lr_cycle_steps=0,
+    )
+    bundle = model.classifier.discretize(threshold=0.5)
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / ttrain if ttrain > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
+
+
+def run_variant_deepcstcm(train_loader,
+                          test_loader,
+                          device,
+                          *,
+                          epochs: int,
+                          report_train_acc: bool,
+                          report_epoch_acc: bool,
+                          report_epoch_test: bool,
+                          in_channels: int,
+                          image_size: Tuple[int, int],
+                          num_classes: int,
+                          channels: Sequence[int],
+                          kernels: Sequence[int],
+                          strides: Sequence[int],
+                          pools: Sequence[int],
+                          clauses_per_block: Sequence[int],
+                          head_clauses: int,
+                          tau: float,
+                          dropout: float,
+                          core_backend: str,
+                          core_hidden_dims: Optional[Sequence[int]],
+                          clause_dropout: float,
+                          literal_dropout: float,
+                          stcm_operator: str,
+                          stcm_ternary_voting: bool,
+                          stcm_ternary_band: float,
+                          stcm_ste_temperature: float,
+                          base_lr: float,
+                          min_lr: float,
+                          warmup_epochs: int,
+                          weight_decay: float,
+                          gradient_centralize: bool,
+                          label_smoothing: float,
+                          aux_weight: float = 0.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+    model = DeepCTMNetwork(
+        in_channels=in_channels,
+        image_size=image_size,
+        num_classes=num_classes,
+        channels=channels,
+        kernels=kernels,
+        strides=strides,
+        pools=pools,
+        clauses_per_block=clauses_per_block,
+        head_clauses=head_clauses,
+        tau=tau,
+        dropout=dropout,
+        conv_core_backend=core_backend,
+        core_hidden_dims=core_hidden_dims,
+        clause_dropout=clause_dropout,
+        literal_dropout=literal_dropout,
+        aux_weight=aux_weight,
+        layer_cls=FuzzyPatternTM_STCM,
+        stcm_operator=stcm_operator,
+        stcm_ternary_voting=stcm_ternary_voting,
+        stcm_ternary_band=stcm_ternary_band,
+        stcm_ste_temperature=stcm_ste_temperature,
+    ).to(device)
+    label = "Deep-CSTCM"
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
+        model,
+        lambda t: t,
+        train_loader,
+        test_loader,
+        device,
+        label,
+        use_ste_train=False,
+        use_ste_eval=False,
+        epochs=epochs,
+        report_train_acc=report_train_acc,
+        report_epoch_acc=report_epoch_acc,
+        report_epoch_test=report_epoch_test,
+        base_lr=base_lr,
+        min_lr=min_lr,
+        warmup_epochs=warmup_epochs,
+        weight_decay=weight_decay,
+        gradient_centralize=gradient_centralize,
+        label_smoothing=label_smoothing,
+        lr_cycle_steps=0,
+    )
+    bundle = model.classifier.discretize(threshold=0.5)
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / ttrain if ttrain > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
 
 def run_variant_transformer(train_loader,
                             test_loader,
@@ -4769,6 +5043,111 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     lr_cycle_steps=args.lr_cycle_steps,
                 )
                 variant_classes = hybrid_classes
+            elif model_key == "deep_ctm":
+                # Derive defaults if flags not provided
+                if dataset_key == "mnist":
+                    dc_channels = parse_int_list(args.deepctm_channels) if args.deepctm_channels else [32, 64]
+                    dc_kernels = parse_int_list(args.deepctm_kernels) if args.deepctm_kernels else [5, 3]
+                    dc_strides = parse_int_list(args.deepctm_strides) if args.deepctm_strides else [1, 1]
+                    dc_pools = parse_int_list(args.deepctm_pools) if args.deepctm_pools else [2, 2]
+                    dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128]
+                    dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 256
+                else:
+                    dc_channels = parse_int_list(args.deepctm_channels) if args.deepctm_channels else [32, 64, 128]
+                    dc_kernels = parse_int_list(args.deepctm_kernels) if args.deepctm_kernels else [3, 3, 3]
+                    dc_strides = parse_int_list(args.deepctm_strides) if args.deepctm_strides else [1, 1, 1]
+                    dc_pools = parse_int_list(args.deepctm_pools) if args.deepctm_pools else [2, 2, 2]
+                    dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128, 256]
+                    dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 512
+                core_hidden = parse_int_list(args.deepctm_core_hidden_dims) if args.deepctm_core_hidden_dims else None
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deepctm(
+                    train_loader,
+                    test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    in_channels=input_channels,
+                    image_size=target_size,
+                    num_classes=args.num_classes,
+                    channels=dc_channels,
+                    kernels=dc_kernels,
+                    strides=dc_strides,
+                    pools=dc_pools,
+                    clauses_per_block=dc_clauses,
+                    head_clauses=dc_head,
+                    tau=args.deepctm_tau,
+                    dropout=args.deepctm_dropout,
+                    core_backend=args.deepctm_core,
+                    core_hidden_dims=core_hidden,
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    aux_weight=args.deepctm_aux_weight,
+                    base_lr=deeptm_base_lr,
+                    min_lr=deeptm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "deep_cstcm":
+                # Defaults per dataset
+                if dataset_key == "mnist":
+                    dc_channels = parse_int_list(args.deepctm_channels) if args.deepctm_channels else [32, 64]
+                    dc_kernels = parse_int_list(args.deepctm_kernels) if args.deepctm_kernels else [5, 3]
+                    dc_strides = parse_int_list(args.deepctm_strides) if args.deepctm_strides else [1, 1]
+                    dc_pools = parse_int_list(args.deepctm_pools) if args.deepctm_pools else [2, 2]
+                    dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128]
+                    dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 256
+                else:
+                    dc_channels = parse_int_list(args.deepctm_channels) if args.deepctm_channels else [32, 64, 128]
+                    dc_kernels = parse_int_list(args.deepctm_kernels) if args.deepctm_kernels else [3, 3, 3]
+                    dc_strides = parse_int_list(args.deepctm_strides) if args.deepctm_strides else [1, 1, 1]
+                    dc_pools = parse_int_list(args.deepctm_pools) if args.deepctm_pools else [2, 2, 2]
+                    dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128, 256]
+                    dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 512
+                core_hidden = parse_int_list(args.deepctm_core_hidden_dims) if args.deepctm_core_hidden_dims else None
+                stcm_min_lr = deeptm_min_lr
+                if args.min_lr is None:
+                    stcm_min_lr = deeptm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deepcstcm(
+                    train_loader,
+                    test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    in_channels=input_channels,
+                    image_size=target_size,
+                    num_classes=args.num_classes,
+                    channels=dc_channels,
+                    kernels=dc_kernels,
+                    strides=dc_strides,
+                    pools=dc_pools,
+                    clauses_per_block=dc_clauses,
+                    head_clauses=dc_head,
+                    tau=args.deepctm_tau,
+                    dropout=args.deepctm_dropout,
+                    core_backend=args.deepcstcm_core,
+                    core_hidden_dims=core_hidden,
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
+                    aux_weight=args.deepctm_aux_weight,
+                    base_lr=deeptm_base_lr,
+                    min_lr=stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                )
+                variant_classes = args.num_classes
             elif model_key == "transformer":
                 label, train_acc, test_acc, train_time, preds, diagnostics, best_epoch_test_acc, profile = run_variant_transformer(
                     train_loader,
@@ -4893,7 +5272,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                 raise ValueError(f"Unknown model variant '{model_key}'.")
 
         export_path = None
-        if model_key in {"tm", "deep_tm", "hybrid"} and args.export_compiled and bundle is not None:
+        if model_key in {"tm", "deep_tm", "deep_ctm", "deep_cstcm", "hybrid"} and args.export_compiled and bundle is not None:
             os.makedirs(args.export_dir, exist_ok=True)
             export_base = os.path.join(
                 args.export_dir,

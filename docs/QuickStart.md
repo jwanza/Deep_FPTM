@@ -1,5 +1,46 @@
 # Deep FPTM Quick Start
 
+## Deep Convolutional TM (CTM)
+
+Deep CTM adds convolutional weight sharing to TM layers and stacks them with residuals and normalization. Two variants are available:
+
+- deep_ctm: STE-based TM conv blocks with per-patch core selectable as `tm` (default) or `deeptm`
+- deep_cstcm: STCM-based TM conv blocks with per-patch core selectable as `stcm` (default) or `deepstcm`
+
+Example runs:
+
+- MNIST deep_ctm (simple per-patch core):
+
+```bash
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset mnist --models deep_ctm --epochs 5 --batch-size 128 \
+  --deepctm-tau 0.5 --deepctm-dropout 0.1 \
+  --deepctm-channels 32,64 --deepctm-kernels 5,3 --deepctm-strides 1,1 --deepctm-pools 2,2 \
+  --deepctm-clauses 128,128 --deepctm-head-clauses 256 --deepctm-core tm
+```
+
+- MNIST deep_ctm with deep per-patch core:
+
+```bash
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset mnist --models deep_ctm --epochs 5 --batch-size 128 \
+  --deepctm-core deeptm --deepctm-core-hidden-dims 128
+```
+
+- CIFAR-10 deep_cstcm (capacity operator):
+
+```bash
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset cifar10 --models deep_cstcm --epochs 20 --batch-size 128 \
+  --stcm-operator capacity \
+  --deepctm-channels 32,64,128 --deepctm-kernels 3,3,3 --deepctm-strides 1,1,1 --deepctm-pools 2,2,2 \
+  --deepctm-clauses 128,128,256 --deepctm-head-clauses 512 --deepcstcm-core stcm
+```
+
+Notes:
+- The conv per-patch core can be switched to a small deep TM via `--deepctm-core deeptm` (or `--deepcstcm-core deepstcm`) and sized with `--deepctm-core-hidden-dims`.
+- STCM-specific controls reuse existing flags: `--stcm-operator`, `--stcm-ternary-voting`, `--stcm-ternary-band`, `--stcm-ste-temperature`.
+
 This cheatsheet merges the scattered quick-start guides from the legacy Julia project and the new Python/STE stack.  Follow the steps that match your workflow.
 
 ---
