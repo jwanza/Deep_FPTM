@@ -1,8 +1,20 @@
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Type
 from .tm import FuzzyPatternTM_STE, prepare_tm_input
+
+
+def _class_supports_kwarg(cls: Type[nn.Module], name: str) -> bool:
+    try:
+        sig = inspect.signature(cls.__init__)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if name in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 class DeepTMNetwork(nn.Module):
@@ -22,6 +34,10 @@ class DeepTMNetwork(nn.Module):
         clause_dropout: float = 0.0,
         literal_dropout: float = 0.0,
         clause_bias_init: float = 0.0,
+        layer_cls: Type[nn.Module] = FuzzyPatternTM_STE,
+        layer_operator: Optional[str] = None,
+        layer_ternary_voting: Optional[bool] = None,
+        layer_extra_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.input_shape = tuple(input_shape) if input_shape is not None else None
@@ -44,6 +60,8 @@ class DeepTMNetwork(nn.Module):
         self.norms = nn.ModuleList()
         self.residuals = nn.ModuleList()
         self.noise_std = noise_std
+        self.layer_cls = layer_cls
+        self.layer_extra_kwargs = dict(layer_extra_kwargs or {})
 
         prev = input_dim
         for idx, h in enumerate(hidden_dims):
@@ -54,31 +72,41 @@ class DeepTMNetwork(nn.Module):
                     auto_expand_grayscale=self.auto_expand_grayscale,
                     allow_channel_reduce=self.allow_channel_reduce,
                 )
-            self.layers.append(
-                FuzzyPatternTM_STE(
-                    prev,
-                    n_clauses,
-                    h,
-                    tau=tau,
-                    clause_dropout=clause_dropout,
-                    literal_dropout=literal_dropout,
-                    clause_bias_init=clause_bias_init,
-                    **layer_kwargs,
-                )
+            tm_kwargs = dict(
+                n_features=prev,
+                n_clauses=n_clauses,
+                n_classes=h,
+                tau=tau,
+                clause_dropout=clause_dropout,
+                literal_dropout=literal_dropout,
+                clause_bias_init=clause_bias_init,
+                **layer_kwargs,
             )
+            tm_kwargs.update(self.layer_extra_kwargs)
+            if layer_operator is not None and _class_supports_kwarg(layer_cls, "operator"):
+                tm_kwargs["operator"] = layer_operator
+            if layer_ternary_voting is not None and _class_supports_kwarg(layer_cls, "ternary_voting"):
+                tm_kwargs["ternary_voting"] = layer_ternary_voting
+            self.layers.append(layer_cls(**tm_kwargs))
             self.norms.append(nn.LayerNorm(h))
             self.residuals.append(nn.Linear(prev, h, bias=False) if prev != h else nn.Identity())
             prev = h
 
-        self.classifier = FuzzyPatternTM_STE(
-            prev,
-            n_clauses * 2,
-            n_classes,
+        classifier_kwargs = dict(
+            n_features=prev,
+            n_clauses=n_clauses * 2,
+            n_classes=n_classes,
             tau=tau,
             clause_dropout=clause_dropout,
             literal_dropout=literal_dropout,
             clause_bias_init=clause_bias_init,
         )
+        classifier_kwargs.update(self.layer_extra_kwargs)
+        if layer_operator is not None and _class_supports_kwarg(layer_cls, "operator"):
+            classifier_kwargs["operator"] = layer_operator
+        if layer_ternary_voting is not None and _class_supports_kwarg(layer_cls, "ternary_voting"):
+            classifier_kwargs["ternary_voting"] = layer_ternary_voting
+        self.classifier = layer_cls(**classifier_kwargs)
         self.dropout = nn.Dropout(dropout)
 
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:

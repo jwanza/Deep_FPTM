@@ -171,3 +171,59 @@ Checkpoint meta: {'architecture': 'swin', 'backend': 'ste', 'timestamp': ..., 'i
 
 These commands were executed on November 13, 2025, and verified by running the inference snippets above.
 
+
+## 5. Advanced distillation controls
+
+- **Layer/token hints & relational KD**  
+  Activate FitNet-style guidance with `--transformer-hint-weight` (temperature via `--transformer-hint-temp`).  
+  Preserve token geometry using `--transformer-relational-weight`, which matches pairwise similarities between teacher and student diagnostics.
+
+- **Clause & attention alignment**  
+  Map teacher features into clause space using `--transformer-clause-align-weight`/`--transformer-clause-align-temp`.  
+  Encourage clause gates to follow teacher saliency with `--transformer-attn-guidance-weight`/`--transformer-attn-guidance-temp`.
+
+- **Two-stage KD scheduling**  
+  `--transformer-kd-stage-epochs` triggers the late-stage schedule. Adjust component strengths with `--transformer-kd-stage2-*-scale` and temperatures via `--transformer-kd-stage2-*-temp-scale`.  
+  Harden clauses gradually by setting `--transformer-kd-stage2-tau`.
+
+- **Clause warm start**  
+  Pre-adapt literals with the teacher for a few batches using `--transformer-clause-init-batches`, `--transformer-clause-init-lr`, and `--transformer-clause-init-temp`.
+
+- **Teacher adapters & mixup safety**  
+  For frozen teachers mixed with aggressive augmentations, enable `--distill-teacher-adapter` (with optional `--distill-teacher-adapter-lr`) so logits are calibrated after mixup/cutmix.
+
+- **Contrastive + KD hybrid**  
+  Combine KD with supervised contrastive training using `--transformer-contrastive-weight`, `--transformer-contrastive-temp`, and `--transformer-contrastive-use-teacher`.
+
+- **Offline teacher augmentation**  
+  Load pseudo-labelled batches with `--teacher-aug-path` and control how often they are sampled using `--teacher-aug-batches`.
+
+- **Teacher baseline fine-tuning**  
+  Run `--teacher-baseline` (optionally overriding the model with `--teacher-baseline-model`) to fine-tune the timm teacher standalone. The script auto-selects 224×224 ImageNet-style transforms for ViT/Swin, logs metrics to TensorBoard if `--teacher-baseline-log-dir` is set, and saves checkpoints via `--teacher-baseline-save-path`.
+
+Quick start (CIFAR-10 baseline with a Swin-B teacher):
+
+```bash
+python3 python/fptm_ste/tests/run_mnist_equiv.py \
+  --dataset cifar10 \
+  --teacher-baseline \
+  --teacher-baseline-model swin_base_patch4_window7_224 \
+  --teacher-baseline-epochs 30 \
+  --teacher-baseline-lr 3e-5 \
+  --teacher-baseline-save-path /tmp/cifar10_swin_teacher.pt
+```
+
+Minimal example (ViT hints + clause alignment + stage schedule):
+
+
+```bash
+python3 python/fptm_ste/tests/run_mnist_equiv.py \
+  --models transformer \
+  --transformer-arch vit \
+  --distill-teacher-timm vit_base_patch16_224 \
+  --transformer-hint-weight 0.4 \
+  --transformer-clause-align-weight 0.2 \
+  --transformer-kd-stage-epochs 5 \
+  --transformer-kd-stage2-teacher-scale 0.5 \
+  --transformer-kd-stage2-tau 0.35
+```

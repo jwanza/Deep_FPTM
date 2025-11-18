@@ -214,6 +214,7 @@ class TMFeedForward(nn.Module):
         else:
             self.register_parameter("bypass_gain", None)
         self.last_clause_outputs: Optional[torch.Tensor] = None
+        self.last_clause_outputs_raw: Optional[torch.Tensor] = None
         if self.backend == "ste":
             self.core = FuzzyPatternTM_STE(
                 hidden_dim,
@@ -341,7 +342,9 @@ class TMFeedForward(nn.Module):
             self._sparsity_penalty = clause_outputs.abs().mean() * self.sparsity_weight
         else:
             self._sparsity_penalty = None
-        self.last_clause_outputs = clause_outputs.view(B, T, -1).detach()
+        reshaped_clauses = clause_outputs.view(B, T, -1)
+        self.last_clause_outputs = reshaped_clauses.detach()
+        self.last_clause_outputs_raw = reshaped_clauses
         logits = logits.view(B, T, C)
         if self.clause_attn_proj is not None:
             clause_ctx = self.clause_attn_proj(clause_outputs).view(B, T, C)

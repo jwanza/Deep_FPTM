@@ -182,6 +182,24 @@ They honour the same environment variables.  For example:
 TM_MNIST_VARIANTS=hybrid julia --project=. examples/MNIST/mnist_hybrid_swin.jl
 ```
 
+### Setun–Ternary Clause Machine (STCM)
+
+The new `FuzzyPatternTM_STCM` module merges Setun-style ternary logic with the
+fuzzy-pattern TM:
+
+- One ternary state per feature per clause bank replaces the four literal
+  matrices used by `FuzzyPatternTMFPTM`, cutting literal parameters in half.
+- Clause operators are configurable (`capacity`/`product`), letting you choose
+  between capacity−mismatch dynamics or fast product t-norms.
+- Voting weights can stay continuous or switch to STE-based ternary logits for
+  hardware-friendly exports.
+- `DeepTMNetwork` accepts `layer_cls=FuzzyPatternTM_STCM` plus optional
+  `layer_operator` / `layer_ternary_voting` hints to build multi-layer stacks.
+
+See `docs/STCM.md` for a detailed architecture walkthrough, usage snippets, and
+a summary of the accompanying unit + end-to-end test suite
+(`python/tests/test_stcm_unit.py` and `python/tests/test_stcm_e2e.py`).
+
 ## Citation
 
 If you use the Fuzzy-Pattern Tsetlin Machine in a scientific publication, please cite the following paper: [arXiv:2508.08350](https://arxiv.org/abs/2508.08350)

@@ -68,7 +68,7 @@ python python/fptm_ste/tests/run_mnist_equiv.py
 
 Produces:
 
-- Train/test accuracy per variant (STE TM, Deep TM, CNN Hybrid, TM Transformer).
+- Train/test accuracy per variant (STE TM, STCM, Deep TM, Deep STCM, CNN Hybrid, TM Transformer).
 - JSON exports under `/tmp/*.json` for cross-language checks.
 - `/tmp/mnist_equiv_results.json` summarising KPIs.
 
@@ -92,6 +92,30 @@ Key switches (pass as CLI args or modify your trainer):
 - `--pretrained` to pull ImageNet weights.
 - `--head-config` to select how TM heads map to Swin stages.
 - `--log-uncertainty` to store agreement/disagreement statistics.
+
+### 3.4 Setun–Ternary Clause Machines (Python)
+
+You can now invoke balanced-ternary STCM baselines directly from the MNIST runner:
+
+```bash
+# MNIST STCM (raw pixels, ternary voting)
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --models stcm --dataset mnist \
+  --tm-feature-mode raw --epochs 10 \
+  --stcm-ternary-voting --stcm-operator capacity
+
+# CIFAR-10 STCM + Deep STCM (conv features)
+python python/fptm_ste/tests/run_mnist_equiv.py \
+  --models stcm deep_stcm --dataset cifar10 \
+  --tm-feature-mode conv --tm-feature-cache /tmp/tm_features \
+  --stcm-operator product --stcm-ternary-voting
+```
+
+Helpful switches:
+
+- `--models stcm` / `--models deep_stcm` select the ternary variants.
+- `--stcm-operator {capacity,product}` toggles between the capacity–mismatch and product operators.
+- `--stcm-ternary-voting`, `--stcm-ternary-band`, and `--stcm-ste-temperature` control the ternary mask/ voting behaviour.
 
 ---
 

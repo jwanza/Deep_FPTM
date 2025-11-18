@@ -14,18 +14,19 @@ import resource
 import time
 import math
 import copy
+import inspect
 from collections import defaultdict
 from dataclasses import replace
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
@@ -34,7 +35,7 @@ try:  # pragma: no cover - optional dependency
 except ImportError:  # pragma: no cover
     timm = None
 
-from fptm_ste import FuzzyPatternTM_STE, FuzzyPatternTMFPTM
+from fptm_ste import FuzzyPatternTM_STE, FuzzyPatternTMFPTM, FuzzyPatternTM_STCM
 from fptm_ste.binarizers import CNNSingleBinarizer
 from fptm_ste.deep_tm import DeepTMNetwork
 from fptm_ste.export import export_compiled_to_json
@@ -47,11 +48,15 @@ from fptm_ste.datasets import (
     prepare_fashion_augmented_bundle,
 )
 from fptm_ste.visualization import generate_transformer_overlay
+from fptm_ste.trainers import anneal_ste_factor
 
+AVAILABLE_MODELS = ("tm", "stcm", "deep_tm", "deep_stcm", "hybrid", "transformer")
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
     "tm": "tm",
+    "stcm": "stcm",
     "deep_tm": "deeptm",
+    "deep_stcm": "deepstcm",
     "hybrid": "hybrid",
     "transformer": "transformer",
 }
@@ -181,6 +186,410 @@ BASELINE_SCENARIOS: Dict[str, Dict[str, Any]] = {
         },
     },
 }
+
+
+class TeacherFeatureCollector:
+    """
+    Helper to capture intermediate teacher representations for distillation.
+    """
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self._module_map = dict(model.named_modules())
+        self.alias_map = self._build_alias_map()
+
+    def _build_alias_map(self) -> Dict[str, str]:
+        alias: Dict[str, str] = {}
+        if "patch_embed" in self._module_map:
+            alias["patch_embed"] = "patch_embed"
+        if hasattr(self.model, "blocks"):
+            blocks = getattr(self.model, "blocks")
+            try:
+                block_len = len(blocks)
+            except TypeError:
+                block_len = 0
+            for idx in range(block_len):
+                alias[f"blocks.{idx}"] = f"block_{idx + 1}"
+        if hasattr(self.model, "layers"):
+            layers = getattr(self.model, "layers")
+            for stage_idx, layer in enumerate(layers):
+                if hasattr(layer, "blocks"):
+                    try:
+                        block_count = len(layer.blocks)
+                    except TypeError:
+                        block_count = 0
+                    for block_idx in range(block_count):
+                        alias[f"layers.{stage_idx}.blocks.{block_idx}"] = (
+                            f"stage{stage_idx + 1}_block{block_idx + 1}"
+                        )
+        if "norm" in self._module_map:
+            alias["norm"] = "pre_head"
+        return alias
+
+    @staticmethod
+    def _extract_tensor(output: Any) -> Optional[torch.Tensor]:
+        if isinstance(output, torch.Tensor):
+            return output
+        if isinstance(output, (list, tuple)) and output:
+            for item in output:
+                if isinstance(item, torch.Tensor):
+                    return item
+        return None
+
+    def _make_hook(self, alias: str, store: Dict[str, torch.Tensor]):
+        def hook(_: nn.Module, __: Tuple[torch.Tensor, ...], output: Any):
+            tensor = self._extract_tensor(output)
+            if tensor is not None:
+                store[alias] = tensor.detach()
+
+        return hook
+
+    def collect(
+        self,
+        x: torch.Tensor,
+        *,
+        retain_logits_grad: bool,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+        features: Dict[str, torch.Tensor] = {}
+        handles: List[Any] = []
+        for name, alias in self.alias_map.items():
+            module = self._module_map.get(name)
+            if module is None:
+                continue
+            handles.append(module.register_forward_hook(self._make_hook(alias, features)))
+        try:
+            result = self.model(x)
+        finally:
+            for handle in handles:
+                handle.remove()
+        logits = result[0] if isinstance(result, (tuple, list)) else result
+        logits_for_loss = logits if retain_logits_grad else logits.detach()
+        return logits, features, logits_for_loss
+
+
+class TeacherHintAdapter(nn.Module):
+    """
+    Lightweight projection heads that map teacher features to student logits.
+    """
+
+    def __init__(self, num_classes: int, device: torch.device):
+        super().__init__()
+        self.num_classes = num_classes
+        self.device = device
+        self.adapters = nn.ModuleDict()
+        self._new_layers: List[nn.Module] = []
+
+    def _pool_feature(self, alias: str, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        if tensor.dim() == 4:
+            tensor = tensor.flatten(2).transpose(1, 2)
+        if tensor.dim() == 3:
+            if alias.startswith("stage"):
+                return tensor.mean(dim=1)
+            if tensor.size(1) > 0:
+                return tensor[:, 0]
+            return tensor.mean(dim=1)
+        if tensor.dim() == 2:
+            return tensor
+        if tensor.dim() > 2:
+            return tensor.view(tensor.size(0), -1)
+        return None
+
+    def _get_adapter(self, name: str, in_dim: int) -> nn.Linear:
+        if name not in self.adapters:
+            layer = nn.Linear(in_dim, self.num_classes)
+            nn.init.trunc_normal_(layer.weight, std=0.02)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+            layer = layer.to(self.device)
+            self.adapters[name] = layer
+            self._new_layers.append(layer)
+        return self.adapters[name]
+
+    def forward(self, feature_map: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        outputs: Dict[str, torch.Tensor] = {}
+        for name, tensor in feature_map.items():
+            pooled = self._pool_feature(name, tensor)
+            if pooled is None:
+                continue
+            pooled = pooled.to(self.device)
+            adapter = self._get_adapter(name, pooled.shape[-1])
+            outputs[name] = adapter(pooled)
+        return outputs
+
+    def consume_new_layers(self) -> List[nn.Module]:
+        created = self._new_layers
+        self._new_layers = []
+        return created
+
+
+class TeacherClauseProjector(nn.Module):
+    """
+    Projects teacher features into clause activation space for alignment.
+    """
+
+    def __init__(self, clause_dims: Dict[str, int], device: torch.device):
+        super().__init__()
+        self.clause_dims = clause_dims
+        self.device = device
+        self.adapters = nn.ModuleDict()
+        self._new_layers: List[nn.Module] = []
+
+    def _pool_feature(self, alias: str, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        if tensor.dim() == 4:
+            tensor = tensor.flatten(2).transpose(1, 2)
+        if tensor.dim() == 3:
+            if alias.startswith("stage"):
+                return tensor.mean(dim=1)
+            if tensor.size(1) > 0:
+                return tensor[:, 0]
+            return tensor.mean(dim=1)
+        if tensor.dim() == 2:
+            return tensor
+        if tensor.dim() > 2:
+            return tensor.view(tensor.size(0), -1)
+        return None
+
+    def _get_adapter(self, name: str, in_dim: int, out_dim: int) -> nn.Linear:
+        if name not in self.adapters:
+            layer = nn.Linear(in_dim, out_dim)
+            nn.init.trunc_normal_(layer.weight, std=0.02)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+            layer = layer.to(self.device)
+            self.adapters[name] = layer
+            self._new_layers.append(layer)
+        return self.adapters[name]
+
+    def forward(self, feature_map: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        outputs: Dict[str, torch.Tensor] = {}
+        for name, tensor in feature_map.items():
+            if name not in self.clause_dims:
+                continue
+            pooled = self._pool_feature(name, tensor)
+            if pooled is None:
+                continue
+            pooled = pooled.to(self.device)
+            adapter = self._get_adapter(name, pooled.shape[-1], self.clause_dims[name])
+            outputs[name] = adapter(pooled)
+        return outputs
+
+    def consume_new_layers(self) -> List[nn.Module]:
+        created = self._new_layers
+        self._new_layers = []
+        return created
+
+
+def infer_clause_dimensions(model: UnifiedTMTransformer) -> Dict[str, int]:
+    dims: Dict[str, int] = {}
+    if model.architecture == "vit":
+        for idx, block in enumerate(model.blocks):
+            ffn = getattr(block, "ffn", None)
+            if ffn is None:
+                continue
+            core = getattr(ffn, "core", None)
+            if core is None or not hasattr(core, "n_clauses"):
+                continue
+            dims[f"block_{idx + 1}"] = int(getattr(core, "n_clauses"))
+    else:
+        for stage_idx, stage in enumerate(model.stages):
+            for block_idx, block in enumerate(stage.blocks):
+                ffn = getattr(block, "ffn", None)
+                if ffn is None:
+                    continue
+                core = getattr(ffn, "core", None)
+                if core is None or not hasattr(core, "n_clauses"):
+                    continue
+                dims[f"stage{stage_idx + 1}_block{block_idx + 1}"] = int(getattr(core, "n_clauses"))
+    return dims
+
+
+def collect_clause_outputs(model: UnifiedTMTransformer) -> Dict[str, torch.Tensor]:
+    outputs: Dict[str, torch.Tensor] = {}
+    if model.architecture == "vit":
+        for idx, block in enumerate(model.blocks):
+            ffn = getattr(block, "ffn", None)
+            if ffn is None:
+                continue
+            clause_tensor = getattr(ffn, "last_clause_outputs_raw", None)
+            if clause_tensor is None:
+                continue
+            outputs[f"block_{idx + 1}"] = clause_tensor
+            ffn.last_clause_outputs_raw = None
+    else:
+        for stage_idx, stage in enumerate(model.stages):
+            for block_idx, block in enumerate(stage.blocks):
+                ffn = getattr(block, "ffn", None)
+                if ffn is None:
+                    continue
+                clause_tensor = getattr(ffn, "last_clause_outputs_raw", None)
+                if clause_tensor is None:
+                    continue
+                outputs[f"stage{stage_idx + 1}_block{block_idx + 1}"] = clause_tensor
+                ffn.last_clause_outputs_raw = None
+    return outputs
+
+
+def _flatten_teacher_tokens(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 4:
+        tensor = tensor.flatten(2).transpose(1, 2)
+    return tensor
+
+
+def compute_teacher_token_attention(alias: str, tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    tokens = _flatten_teacher_tokens(tensor)
+    if tokens.dim() != 3 or tokens.size(1) == 0:
+        return None
+    if alias.startswith("block_") and tokens.size(1) > 1:
+        cls_token = tokens[:, 0:1, :]
+        other_tokens = tokens[:, 1:, :]
+        attn_logits = torch.matmul(other_tokens, cls_token.transpose(1, 2)).squeeze(-1)
+        attention = torch.softmax(attn_logits, dim=1)
+        return attention
+    norms = tokens.norm(dim=-1)
+    norms = norms.clamp_min(1e-6)
+    attention = norms / norms.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return attention
+
+
+def compute_student_clause_token_distribution(
+    clause_tensor: torch.Tensor,
+    *,
+    drop_first_token: bool,
+) -> torch.Tensor:
+    if clause_tensor.dim() == 2:
+        clause_tensor = clause_tensor.unsqueeze(1)
+    if drop_first_token and clause_tensor.size(1) > 1:
+        clause_tensor = clause_tensor[:, 1:, :]
+    token_strength = clause_tensor.abs().mean(dim=2)
+    token_strength = token_strength.clamp_min(1e-6)
+    distribution = token_strength / token_strength.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return distribution
+
+
+def _select_clause_parameters(model: UnifiedTMTransformer) -> List[nn.Parameter]:
+    clause_params: List[nn.Parameter] = []
+    clause_keywords = ("ta_", "clause_bias", "core.voting", "core.tau", "core.clause")
+    for name, param in model.named_parameters():
+        if any(keyword in name for keyword in clause_keywords):
+            clause_params.append(param)
+    return clause_params
+
+
+def warm_start_clauses_with_teacher(
+    model: UnifiedTMTransformer,
+    teacher_collector: TeacherFeatureCollector,
+    dataloader: DataLoader,
+    device: torch.device,
+    *,
+    batches: int,
+    lr: float,
+    temperature: float,
+) -> None:
+    clause_params = _select_clause_parameters(model)
+    if not clause_params or batches <= 0:
+        return
+    optimizer = torch.optim.Adam(clause_params, lr=lr)
+    model.train()
+    processed = 0
+    for x, _ in dataloader:
+        if processed >= batches:
+            break
+        x = x.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            teacher_logits, _, _ = teacher_collector.collect(x, retain_logits_grad=False)
+            teacher_logits = teacher_logits.detach()
+        outputs = model(x, use_ste=True)
+        student_logits = outputs[0] if isinstance(outputs, tuple) else outputs
+        kd_loss = F.kl_div(
+            F.log_softmax(student_logits / temperature, dim=1),
+            F.softmax(teacher_logits / temperature, dim=1),
+            reduction="batchmean",
+        ) * (temperature ** 2)
+        kd_loss.backward()
+        optimizer.step()
+        processed += 1
+
+
+class DistillationStageScheduler:
+    """
+    Handles two-stage scheduling for KD weights, temperatures, and tm_tau annealing.
+    """
+
+    def __init__(
+        self,
+        *,
+        stage_epoch: int,
+        total_epochs: int,
+        base_weights: Dict[str, float],
+        base_temps: Dict[str, float],
+        weight_scales: Dict[str, float],
+        temp_scales: Dict[str, float],
+        base_tau: Optional[float],
+        target_tau: Optional[float],
+    ):
+        self.stage_epoch = max(0, stage_epoch)
+        self.total_epochs = max(1, total_epochs)
+        self.base_weights = base_weights
+        self.base_temps = base_temps
+        self.weight_scales = weight_scales
+        self.temp_scales = temp_scales
+        self.base_tau = base_tau
+        self.target_tau = target_tau
+
+    def _in_stage2(self, epoch: int) -> bool:
+        return self.stage_epoch > 0 and epoch >= self.stage_epoch
+
+    def compute(self, epoch: int) -> Tuple[Dict[str, float], Dict[str, float], Optional[float]]:
+        stage2 = self._in_stage2(epoch)
+        weights = {}
+        for key, value in self.base_weights.items():
+            scale = self.weight_scales.get(key, 1.0) if stage2 else 1.0
+            weights[key] = value * scale
+        temps = {}
+        for key, value in self.base_temps.items():
+            scale = self.temp_scales.get(key, 1.0) if stage2 else 1.0
+            temps[key] = value * scale
+        tau_value: Optional[float] = None
+        if (
+            stage2
+            and self.base_tau is not None
+            and self.target_tau is not None
+        ):
+            span = max(1, self.total_epochs - self.stage_epoch + 1)
+            progress = min(1.0, (epoch - self.stage_epoch + 1) / span)
+            tau_value = self.base_tau + (self.target_tau - self.base_tau) * progress
+        return weights, temps, tau_value
+
+
+class TeacherLogitAdapter(nn.Module):
+    """
+    Lightweight adapter to transform frozen teacher logits.
+    """
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.proj = nn.Linear(num_classes, num_classes, bias=True)
+        nn.init.eye_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.proj(logits)
+
+
+class TeacherContrastiveAdapter(nn.Module):
+    """
+    Projects teacher logits into student feature space for contrastive KD.
+    """
+
+    def __init__(self, num_classes: int, feature_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(num_classes, feature_dim, bias=True)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.proj(logits)
 
 
 def bool_env(name: str, default: bool) -> bool:
@@ -332,7 +741,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=DEFAULT_MODELS,
+        choices=AVAILABLE_MODELS,
         default=None,
         help="Subset of model variants to train. Defaults to all variants.",
     )
@@ -535,7 +944,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # TM specific options
     parser.add_argument(
         "--tm-impl",
-        choices=["ste", "fptm"],
+        choices=["ste", "fptm", "stcm"],
         default=os.environ.get("TM_MNIST_TM_IMPL", "ste"),
         help="Implementation for the TM baseline.",
     )
@@ -593,6 +1002,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=float_env("TM_MNIST_TAU", 0.4),
         help="Softmax temperature parameter for the TM variants.",
     )
+    parser.add_argument("--tm-clause-dropout", type=float, default=0.0, help="Clause dropout applied in STE/STCM layers.")
+    parser.add_argument("--tm-literal-dropout", type=float, default=0.0, help="Literal dropout applied in STE/STCM layers.")
     parser.add_argument(
         "--tm-lf",
         type=int,
@@ -649,6 +1060,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Allow collapsing multi-channel inputs to single-channel if requested.",
+    )
+    parser.add_argument(
+        "--stcm-operator",
+        choices=["capacity", "product"],
+        default="capacity",
+        help="Clause strength operator used by STCM variants.",
+    )
+    parser.add_argument(
+        "--stcm-ternary-voting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable ternary voting weights in STCM models.",
+    )
+    parser.add_argument(
+        "--stcm-ternary-band",
+        type=float,
+        default=0.0,
+        help="Neutral band for ternary literal selection in STCM.",
+    )
+    parser.add_argument(
+        "--stcm-ste-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for STCM STE ternary masks.",
     )
 
     # Deep TM options
@@ -955,6 +1390,168 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional learning rate for trainable teacher parameters (defaults to transformer base LR).",
     )
     parser.add_argument(
+        "--transformer-hint-weight",
+        type=float,
+        default=0.0,
+        help="Weight for FitNet-style hint distillation on transformer diagnostics.",
+    )
+    parser.add_argument(
+        "--transformer-hint-temp",
+        type=float,
+        default=1.0,
+        help="Temperature for hint distillation logits.",
+    )
+    parser.add_argument(
+        "--transformer-clause-align-weight",
+        type=float,
+        default=0.0,
+        help="Weight for clause activation alignment with teacher projections.",
+    )
+    parser.add_argument(
+        "--transformer-clause-align-temp",
+        type=float,
+        default=1.0,
+        help="Temperature for clause alignment distributions.",
+    )
+    parser.add_argument(
+        "--transformer-attn-guidance-weight",
+        type=float,
+        default=0.0,
+        help="Weight for aligning teacher attention with clause token usage.",
+    )
+    parser.add_argument(
+        "--transformer-attn-guidance-temp",
+        type=float,
+        default=1.0,
+        help="Temperature applied when matching attention distributions.",
+    )
+    parser.add_argument(
+        "--transformer-relational-weight",
+        type=float,
+        default=0.0,
+        help="Weight for relational KD on component logits.",
+    )
+    parser.add_argument(
+        "--distill-teacher-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable a trainable adapter on frozen teacher logits.",
+    )
+    parser.add_argument(
+        "--distill-teacher-adapter-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for the teacher logit adapter when enabled.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage-epochs",
+        type=int,
+        default=0,
+        help="Epoch index (1-based) to switch to KD stage 2 (0 disables staged scheduling).",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-teacher-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to external teacher KD weight after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-teacher-temp-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to external teacher KD temperature after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-self-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to EMA self-distillation weight after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-self-temp-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to EMA self-distillation temperature after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-hint-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to hint distillation weight after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-hint-temp-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to hint distillation temperature after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-clause-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to clause alignment weight after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-clause-temp-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to clause alignment temperature after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-attn-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to attention guidance weight after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-attn-temp-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to attention guidance temperature after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-rel-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to relational KD weight after the stage boundary.",
+    )
+    parser.add_argument(
+        "--transformer-kd-stage2-tau",
+        type=float,
+        default=None,
+        help="Target tm_tau value reached by the end of training (linear schedule starting at stage boundary).",
+    )
+    parser.add_argument(
+        "--transformer-clause-init-batches",
+        type=int,
+        default=0,
+        help="Calibration batches used for teacher-guided clause warm start (0 disables).",
+    )
+    parser.add_argument(
+        "--transformer-clause-init-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate used during clause warm start calibration.",
+    )
+    parser.add_argument(
+        "--transformer-clause-init-temp",
+        type=float,
+        default=2.0,
+        help="Temperature applied during clause warm start KD.",
+    )
+    parser.add_argument(
+        "--teacher-aug-path",
+        type=str,
+        default="",
+        help="Optional path to pseudo-labeled dataset generated by a teacher (torch .pt).",
+    )
+    parser.add_argument(
+        "--teacher-aug-batches",
+        type=int,
+        default=0,
+        help="Number of pseudo-labeled batches to use per epoch.",
+    )
+    parser.add_argument(
         "--transformer-contrastive-weight",
         type=float,
         default=0.0,
@@ -965,6 +1562,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Temperature for supervised contrastive objective.",
+    )
+    parser.add_argument(
+        "--transformer-contrastive-use-teacher",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Augment contrastive loss with teacher anchors.",
     )
     parser.add_argument(
         "--transformer-grad-checkpoint",
@@ -1073,6 +1676,86 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["constant", "linear", "cosine"],
         default="cosine",
         help="Schedule for CutMix strength across epochs.",
+    )
+    # Adapter learning-rate flag defined above with other KD controls.
+    parser.add_argument(
+        "--teacher-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fine-tune and evaluate the teacher standalone to establish a baseline.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-model",
+        type=str,
+        default="",
+        help="timm model name for teacher baseline (defaults to --distill-teacher-timm).",
+    )
+    parser.add_argument(
+        "--teacher-baseline-checkpoint",
+        type=str,
+        default="",
+        help="Optional checkpoint path for teacher baseline initialization.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-img-size",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Override teacher input image size (single value or H W). Defaults to teacher config.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-epochs",
+        type=int,
+        default=50,
+        help="Training epochs for teacher baseline fine-tuning.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-batch-size",
+        type=int,
+        default=None,
+        help="Mini-batch size for teacher baseline (defaults to --batch-size).",
+    )
+    parser.add_argument(
+        "--teacher-baseline-lr",
+        type=float,
+        default=1e-4,
+        help="Base learning rate for teacher baseline optimizer.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-min-lr",
+        type=float,
+        default=None,
+        help="Minimum learning rate for teacher baseline cosine schedule (defaults to lr).",
+    )
+    parser.add_argument(
+        "--teacher-baseline-warmup",
+        type=int,
+        default=5,
+        help="Warmup epochs for teacher baseline cosine schedule.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-weight-decay",
+        type=float,
+        default=0.05,
+        help="Weight decay applied during teacher baseline optimization.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-label-smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing coefficient for teacher baseline cross-entropy.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-log-dir",
+        type=str,
+        default="",
+        help="Optional TensorBoard directory for teacher baseline diagnostics.",
+    )
+    parser.add_argument(
+        "--teacher-baseline-save-path",
+        type=str,
+        default="",
+        help="Optional checkpoint path for saving the fine-tuned teacher baseline.",
     )
 
     return parser
@@ -1293,9 +1976,9 @@ def apply_mixup_cutmix(
     targets: torch.Tensor,
     mixup_alpha: float,
     cutmix_alpha: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[float], str]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[float], str, Optional[torch.Tensor]]:
     if mixup_alpha <= 0 and cutmix_alpha <= 0:
-        return inputs, targets, targets, None, "none"
+        return inputs, targets, targets, None, "none", None
 
     use_cuda = inputs.is_cuda
     if mixup_alpha > 0 and cutmix_alpha > 0:
@@ -1307,14 +1990,14 @@ def apply_mixup_cutmix(
     if choose_mixup:
         lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
         mixed = lam * inputs + (1 - lam) * inputs[perm]
-        return mixed, targets, targets[perm], lam, "mixup"
+        return mixed, targets, targets[perm], lam, "mixup", perm
 
     lam = torch.distributions.Beta(cutmix_alpha, cutmix_alpha).sample().item()
     y1, y2, x1, x2 = rand_bbox(inputs.size(), lam, inputs.device)
     inputs_clone = inputs.clone()
     inputs_clone[:, :, y1:y2, x1:x2] = inputs[perm, :, y1:y2, x1:x2]
     lam = 1 - ((y2 - y1) * (x2 - x1) / (inputs.size(-1) * inputs.size(-2)))
-    return inputs_clone, targets, targets[perm], lam, "cutmix"
+    return inputs_clone, targets, targets[perm], lam, "cutmix", perm
 
 
 def supervised_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
@@ -1382,8 +2065,6 @@ def evaluate_model(model: nn.Module,
             total += y.size(0)
     acc = correct / total
     if was_training:
-        if teacher_model is not None and distill_teacher_trainable:
-            teacher_model.train()
         model.train()
     return acc, preds
 
@@ -1542,7 +2223,7 @@ def build_distillation_teacher(
     num_classes: int,
     in_channels: int,
     device: torch.device,
-    img_size: Tuple[int, int],
+    img_size: Optional[Tuple[int, int]],
     *,
     trainable: bool = False,
 ) -> nn.Module:
@@ -1552,12 +2233,16 @@ def build_distillation_teacher(
         raise ImportError("timm is required for external teacher distillation.")
     if not timm_name:
         raise ValueError("A timm model name is required when loading an external teacher.")
+    model_kwargs: Dict[str, Any] = {
+        "pretrained": True,
+        "num_classes": num_classes,
+        "in_chans": in_channels,
+    }
+    if img_size is not None:
+        model_kwargs["img_size"] = img_size
     teacher = timm.create_model(
         timm_name,
-        pretrained=True,
-        num_classes=num_classes,
-        in_chans=in_channels,
-        img_size=img_size,
+        **model_kwargs,
     )
     if hasattr(teacher, "reset_classifier"):
         teacher.reset_classifier(num_classes)
@@ -1574,6 +2259,306 @@ def build_distillation_teacher(
         for param in teacher.parameters():
             param.requires_grad_(False)
     return teacher
+
+
+
+
+
+def _resolve_teacher_input_size(
+    override: Optional[Sequence[int]],
+    default_cfg: Dict[str, Any],
+    dataset_size: Tuple[int, int],
+) -> Tuple[int, int]:
+    if override:
+        values = [int(v) for v in override if v is not None]
+        if len(values) == 1:
+            return (values[0], values[0])
+        if len(values) >= 2:
+            return (values[0], values[1])
+    input_size = default_cfg.get("input_size")
+    if isinstance(input_size, (list, tuple)):
+        if len(input_size) >= 3:
+            return (int(input_size[-2]), int(input_size[-1]))
+        if len(input_size) == 2:
+            return (int(input_size[0]), int(input_size[1]))
+    if dataset_size and len(dataset_size) == 2:
+        return (int(dataset_size[0]), int(dataset_size[1]))
+    return (224, 224)
+
+
+def _build_teacher_baseline_transforms(
+    image_size: Tuple[int, int],
+    *,
+    mean: Sequence[float],
+    std: Sequence[float],
+    interpolation: str,
+    crop_pct: float,
+) -> Tuple[transforms.Compose, transforms.Compose]:
+    height, width = int(image_size[0]), int(image_size[1])
+    train_size: Union[int, Tuple[int, int]] = (height, width) if height != width else height
+    interp_name = (interpolation or "bicubic").upper()
+    interpolation_mode = getattr(InterpolationMode, interp_name, InterpolationMode.BICUBIC)
+    crop_pct = float(crop_pct) if crop_pct else 0.875
+    crop_pct = min(max(crop_pct, 0.1), 1.0)
+    if crop_pct < 1.0:
+        resize_h = max(1, math.ceil(height / crop_pct))
+        resize_w = max(1, math.ceil(width / crop_pct))
+    else:
+        resize_h, resize_w = height, width
+    resize_size = (resize_h, resize_w)
+    mean = tuple(mean) if mean else IMAGENET_MEAN
+    std = tuple(std) if std else IMAGENET_STD
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(train_size, interpolation=interpolation_mode),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize(resize_size, interpolation=interpolation_mode, antialias=True),
+            transforms.CenterCrop((height, width) if height != width else height),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+    return train_transform, eval_transform
+
+
+def run_teacher_baseline(
+    *,
+    args: argparse.Namespace,
+    dataset_key: str,
+    dataset_cfg: Dict[str, Any],
+    device: torch.device,
+    data_root: str,
+    download: bool,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    imagenet_mode: bool,
+    imagenet_train_dir: Optional[str],
+    imagenet_val_dir: Optional[str],
+) -> Dict[str, Any]:
+    if timm is None:
+        raise ImportError("Teacher baseline requires timm to be installed.")
+    teacher_name = args.teacher_baseline_model or args.distill_teacher_timm
+    teacher_checkpoint = args.teacher_baseline_checkpoint or args.distill_teacher_checkpoint
+    if not teacher_name:
+        raise ValueError("Teacher baseline requested but no timm model name provided.")
+    override_size = None
+    if args.teacher_baseline_img_size:
+        override_vals = [int(v) for v in args.teacher_baseline_img_size]
+        if len(override_vals) == 1:
+            override_size = (override_vals[0], override_vals[0])
+        elif len(override_vals) >= 2:
+            override_size = (override_vals[0], override_vals[1])
+    teacher_model = build_distillation_teacher(
+        teacher_name,
+        teacher_checkpoint,
+        args.num_classes,
+        dataset_cfg["input_channels"],
+        device,
+        override_size,
+        trainable=True,
+    )
+    default_cfg = getattr(teacher_model, "default_cfg", {}) or {}
+    image_size = _resolve_teacher_input_size(args.teacher_baseline_img_size, default_cfg, dataset_cfg["image_size"])
+    mean = default_cfg.get("mean", IMAGENET_MEAN)
+    std = default_cfg.get("std", IMAGENET_STD)
+    interpolation = default_cfg.get("interpolation", "bicubic")
+    crop_pct = default_cfg.get("crop_pct", 0.875)
+    train_transform, eval_transform = _build_teacher_baseline_transforms(
+        image_size,
+        mean=mean,
+        std=std,
+        interpolation=interpolation,
+        crop_pct=crop_pct,
+    )
+
+    if imagenet_mode:
+        if imagenet_train_dir is None or imagenet_val_dir is None:
+            raise ValueError("ImageNet paths are required for teacher baseline in ImageNet mode.")
+        train_dataset = dataset_cfg["train_class"](imagenet_train_dir, transform=train_transform)
+        test_dataset = dataset_cfg["test_class"](imagenet_val_dir, transform=eval_transform)
+    else:
+        train_dataset = dataset_cfg["train_class"](
+            root=data_root,
+            train=True,
+            download=download,
+            transform=train_transform,
+        )
+        test_dataset = dataset_cfg["test_class"](
+            root=data_root,
+            train=False,
+            download=download,
+            transform=eval_transform,
+        )
+
+    baseline_batch_size = args.teacher_baseline_batch_size or args.batch_size
+    test_batch_size = args.test_batch_size
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=baseline_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=test_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+
+    total_epochs = args.teacher_baseline_epochs
+    base_lr = args.teacher_baseline_lr
+    min_lr = args.teacher_baseline_min_lr if args.teacher_baseline_min_lr is not None else base_lr
+    weight_decay = args.teacher_baseline_weight_decay
+    label_smoothing = args.teacher_baseline_label_smoothing
+
+    optimizer = torch.optim.AdamW(teacher_model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    steps_per_epoch = max(1, len(train_loader))
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    writer = None
+    if args.teacher_baseline_log_dir:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(log_dir=args.teacher_baseline_log_dir)
+        except Exception as exc:  # pragma: no cover
+            print(f"[WARN] TensorBoard writer unavailable for teacher baseline: {exc}")
+            writer = None
+
+    start_time = time.time()
+    best_test_acc: Optional[float] = None
+    last_train_acc: Optional[float] = None
+
+    for epoch in range(total_epochs):
+        epoch_lr = update_cosine_warmup_lr(
+            optimizer,
+            epoch,
+            total_epochs,
+            base_lr,
+            min_lr,
+            args.teacher_baseline_warmup,
+        )
+        teacher_model.train()
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_total = 0
+        epoch_start = time.time()
+        for inputs, targets in train_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                logits = teacher_model(inputs)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                loss = F.cross_entropy(logits, targets, label_smoothing=label_smoothing)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(teacher_model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_loss += loss.item()
+            preds = logits.argmax(dim=1)
+            epoch_correct += (preds == targets).sum().item()
+            epoch_total += targets.size(0)
+        duration = time.time() - epoch_start
+        avg_loss = epoch_loss / max(1, len(train_loader))
+        train_acc = epoch_correct / max(1, epoch_total)
+        last_train_acc = train_acc
+        test_acc = evaluate_classifier(teacher_model, test_loader, device)
+        if best_test_acc is None or test_acc > best_test_acc:
+            best_test_acc = test_acc
+        log_msg = format_epoch_log(
+            label="TeacherBase",
+            epoch=epoch + 1,
+            total_epochs=total_epochs,
+            loss=avg_loss,
+            train_acc=train_acc,
+            test_acc=test_acc,
+            best_acc=best_test_acc,
+            lr=epoch_lr,
+            duration=duration,
+            extras=None,
+        )
+        print("  " + log_msg)
+        if writer is not None:
+            writer.add_scalar("train/loss", avg_loss, epoch)
+            writer.add_scalar("train/accuracy", train_acc, epoch)
+            writer.add_scalar("eval/accuracy", test_acc, epoch)
+            writer.add_scalar("lr", epoch_lr, epoch)
+
+    train_time = time.time() - start_time
+    final_test_acc = evaluate_classifier(teacher_model, test_loader, device)
+    if best_test_acc is None or final_test_acc > best_test_acc:
+        best_test_acc = final_test_acc
+    if writer is not None:
+        writer.add_scalar("eval/final_accuracy", final_test_acc, total_epochs)
+        writer.close()
+
+    total_samples = len(train_dataset)
+    profile = {
+        "num_samples": total_samples,
+        "epochs": total_epochs,
+        "total_steps": total_epochs * steps_per_epoch,
+        "samples_per_second": (total_samples * total_epochs) / train_time if train_time > 0 else None,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+
+    if args.teacher_baseline_save_path:
+        checkpoint_path = Path(args.teacher_baseline_save_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint = {
+            "model_state": teacher_model.state_dict(),
+            "model_name": teacher_name,
+            "default_cfg": default_cfg,
+            "image_size": image_size,
+            "train_args": {
+                "epochs": total_epochs,
+                "base_lr": base_lr,
+                "min_lr": min_lr,
+                "weight_decay": weight_decay,
+                "label_smoothing": label_smoothing,
+                "batch_size": baseline_batch_size,
+            },
+            "metrics": {
+                "train_accuracy": last_train_acc if last_train_acc is not None else 0.0,
+                "best_test_accuracy": best_test_acc,
+                "final_test_accuracy": final_test_acc,
+                "train_time": train_time,
+            },
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"  Saved teacher baseline checkpoint to {checkpoint_path}")
+
+    label = f"Teacher-{teacher_name}"
+    if last_train_acc is None:
+        last_train_acc = 0.0
+    result = {
+        "label": label,
+        "model_name": teacher_name,
+        "train_accuracy": last_train_acc,
+        "test_accuracy": final_test_acc,
+        "best_epoch_test_accuracy": best_test_acc,
+        "train_time_s": train_time,
+        "json": None,
+        "preds": [],
+        "profile": profile,
+        "image_size": image_size,
+    }
+    return result
 
 
 def _scale_clause_counts(
@@ -1671,7 +2656,12 @@ def train_tm_model(model: nn.Module,
                    weight_decay: float,
                    gradient_centralize: bool = False,
                    label_smoothing: float = 0.0,
-                   lr_cycle_steps: int = 0) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   lr_cycle_steps: int = 0,
+                   kd_scheduler: Optional["DistillationStageScheduler"] = None,
+                   ema_model: Optional[nn.Module] = None,
+                   teacher_aug_loader: Optional[DataLoader] = None,
+                   teacher_aug_batches: int = 0,
+                   teacher_logit_adapter: Optional[nn.Module] = None) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -1689,6 +2679,16 @@ def train_tm_model(model: nn.Module,
             epoch_lr = update_cosine_warmup_lr(opt, epoch, epochs, base_lr, min_lr, warmup_epochs)
         model.train()
         epoch_start = time.time()
+        teacher_kd_weight = 0.0
+        teacher_temp_epoch = 1.0
+        if kd_scheduler is not None:
+            weight_schedule, temp_schedule, tau_override = kd_scheduler.compute(epoch)
+            teacher_kd_weight = weight_schedule.get("teacher", 0.0)
+            teacher_temp_epoch = temp_schedule.get("teacher", 1.0)
+            if tau_override is not None:
+                anneal_ste_factor(model, tau_override)
+                if ema_model is not None:
+                    anneal_ste_factor(ema_model, tau_override)
         running_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
@@ -1719,6 +2719,45 @@ def train_tm_model(model: nn.Module,
                 epoch_correct += (preds == y).sum().item()
                 epoch_total += y.size(0)
             global_step += 1
+        if (
+            teacher_aug_loader is not None
+            and teacher_aug_batches > 0
+            and teacher_kd_weight > 0.0
+        ):
+            pseudo_iter = iter(teacher_aug_loader)
+            for _ in range(teacher_aug_batches):
+                try:
+                    px, plogits = next(pseudo_iter)
+                except StopIteration:
+                    pseudo_iter = iter(teacher_aug_loader)
+                    px, plogits = next(pseudo_iter)
+                px = px.to(device, non_blocking=True)
+                kd_targets = plogits.to(device, non_blocking=True)
+                opt.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                    outputs = model(
+                        px,
+                        use_ste=True,
+                        collect_diagnostics=False,
+                        return_features=False,
+                    )
+                    logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                    if teacher_logit_adapter is not None:
+                        kd_targets = teacher_logit_adapter(kd_targets)
+                    kd_loss = F.kl_div(
+                        F.log_softmax(logits / teacher_temp_epoch, dim=1),
+                        F.softmax(kd_targets / teacher_temp_epoch, dim=1),
+                        reduction="batchmean",
+                    ) * (teacher_temp_epoch ** 2)
+                    loss = teacher_kd_weight * kd_loss
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(opt)
+                scaler.update()
+                running_loss += loss.detach().item()
+                num_batches += 1
+                global_step += 1
         dur = time.time() - epoch_start
         avg_loss = running_loss / max(1, num_batches)
         epoch_acc = None
@@ -1818,8 +2857,15 @@ def run_variant_tm(train_loader,
                    gradient_centralize: bool = False,
                    label_smoothing: float = 0.0,
                    tm_prior_template: str = "none",
-                   lr_cycle_steps: int = 0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                   lr_cycle_steps: int = 0,
+                   tm_clause_dropout: float = 0.0,
+                   tm_literal_dropout: float = 0.0,
+                   stcm_operator: str = "capacity",
+                   stcm_ternary_voting: bool = False,
+                   stcm_ternary_band: float = 0.05,
+                   stcm_ste_temperature: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     tm_impl = tm_impl.lower()
+    use_ste_eval = True
     if tm_impl == "fptm":
         model = FuzzyPatternTMFPTM(
             n_features=n_features,
@@ -1835,6 +2881,28 @@ def run_variant_tm(train_loader,
         ).to(device)
         use_ste_train = True
         label = "FPTM"
+    elif tm_impl == "stcm":
+        model = FuzzyPatternTM_STCM(
+            n_features=n_features,
+            n_clauses=tm_n_clauses,
+            n_classes=n_classes,
+            tau=tm_tau,
+            input_shape=input_shape,
+            auto_expand_grayscale=auto_expand_grayscale,
+            allow_channel_reduce=allow_channel_reduce,
+            lf=tm_lf,
+            literal_budget=tm_literal_budget,
+            vote_clamp=tm_vote_clamp,
+            clause_dropout=tm_clause_dropout,
+            literal_dropout=tm_literal_dropout,
+            operator=stcm_operator,
+            ternary_voting=stcm_ternary_voting,
+            ternary_band=stcm_ternary_band,
+            ste_temperature=stcm_ste_temperature,
+        ).to(device)
+        use_ste_train = False
+        use_ste_eval = False
+        label = "STCM"
     else:
         model = FuzzyPatternTM_STE(
             n_features=n_features,
@@ -1844,6 +2912,8 @@ def run_variant_tm(train_loader,
             input_shape=input_shape,
             auto_expand_grayscale=auto_expand_grayscale,
             allow_channel_reduce=allow_channel_reduce,
+            clause_dropout=tm_clause_dropout,
+            literal_dropout=tm_literal_dropout,
         ).to(device)
         use_ste_train = False
         label = "STE-TM"
@@ -1860,7 +2930,7 @@ def run_variant_tm(train_loader,
         device,
         label,
         use_ste_train=use_ste_train,
-        use_ste_eval=True,
+        use_ste_eval=use_ste_eval,
         epochs=epochs,
         report_train_acc=report_train_acc,
         report_epoch_acc=report_epoch_acc,
@@ -1912,7 +2982,16 @@ def run_variant_deeptm(train_loader,
                        gradient_centralize: bool = False,
                        label_smoothing: float = 0.0,
                        tm_prior_template: str = "none",
-                       lr_cycle_steps: int = 0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                       lr_cycle_steps: int = 0,
+                       layer_cls: Type[nn.Module] = FuzzyPatternTM_STE,
+                       layer_operator: Optional[str] = None,
+                       layer_ternary_voting: Optional[bool] = None,
+                       layer_extra_kwargs: Optional[Dict[str, Any]] = None,
+                       label_override: Optional[str] = None,
+                       clause_dropout: float = 0.0,
+                       literal_dropout: float = 0.0,
+                       use_ste_train: bool = False,
+                       use_ste_eval: bool = True) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepTMNetwork(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -1923,9 +3002,15 @@ def run_variant_deeptm(train_loader,
         input_shape=input_shape,
         auto_expand_grayscale=auto_expand_grayscale,
         allow_channel_reduce=allow_channel_reduce,
+        clause_dropout=clause_dropout,
+        literal_dropout=literal_dropout,
+        layer_cls=layer_cls,
+        layer_operator=layer_operator,
+        layer_ternary_voting=layer_ternary_voting,
+        layer_extra_kwargs=layer_extra_kwargs,
     ).to(device)
     apply_tm_prior_template(model, tm_prior_template)
-    label = "Deep-TM"
+    label = label_override or "Deep-TM"
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
@@ -1935,8 +3020,8 @@ def run_variant_deeptm(train_loader,
         test_loader,
         device,
         label,
-        use_ste_train=False,
-        use_ste_eval=True,
+        use_ste_train=use_ste_train,
+        use_ste_eval=use_ste_eval,
         epochs=epochs,
         report_train_acc=report_train_acc,
         report_epoch_acc=report_epoch_acc,
@@ -2154,8 +3239,34 @@ def run_variant_transformer(train_loader,
                             tm_prior_template: str = "none",
                             self_distill_weight: float = 0.0,
                             self_distill_temp: float = 1.0,
+                            hint_distill_weight: float = 0.0,
+                            hint_distill_temp: float = 1.0,
+                            clause_align_weight: float = 0.0,
+                            clause_align_temp: float = 1.0,
+                            attn_guidance_weight: float = 0.0,
+                            attn_guidance_temp: float = 1.0,
+                            relational_weight: float = 0.0,
+                            kd_stage_epochs: int = 0,
+                            kd_stage2_teacher_scale: float = 1.0,
+                            kd_stage2_teacher_temp_scale: float = 1.0,
+                            kd_stage2_self_scale: float = 1.0,
+                            kd_stage2_self_temp_scale: float = 1.0,
+                            kd_stage2_hint_scale: float = 1.0,
+                            kd_stage2_hint_temp_scale: float = 1.0,
+                            kd_stage2_clause_scale: float = 1.0,
+                            kd_stage2_clause_temp_scale: float = 1.0,
+                            kd_stage2_attn_scale: float = 1.0,
+                            kd_stage2_attn_temp_scale: float = 1.0,
+                            kd_stage2_rel_scale: float = 1.0,
+                            kd_stage2_tau: Optional[float] = None,
+                            clause_init_batches: int = 0,
+                            clause_init_lr: float = 1e-3,
+                            clause_init_temp: float = 2.0,
                             contrastive_weight: float = 0.0,
                             contrastive_temp: float = 0.1,
+                            contrastive_use_teacher: bool = True,
+                            teacher_aug_path: str = "",
+                            teacher_aug_batches: int = 0,
                             use_flash_attention: bool = False,
                             use_residual_attention: bool = False,
                             log_dir: str = "",
@@ -2175,6 +3286,8 @@ def run_variant_transformer(train_loader,
                             distill_teacher_temp: float = 1.0,
                             distill_teacher_trainable: bool = False,
                             distill_teacher_lr: Optional[float] = None,
+                            distill_teacher_adapter: bool = False,
+                            distill_teacher_adapter_lr: float = 1e-3,
                             save_path: str = "",
                             ) -> Tuple[str, Optional[float], float, float, List[int], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     base_model_kwargs: Dict[str, Any] = {
@@ -2254,17 +3367,128 @@ def run_variant_transformer(train_loader,
         print(f"Loaded teacher model: {distill_teacher_timm or distill_teacher_checkpoint}")
     param_groups = build_param_groups_with_layer_decay(model, base_lr, weight_decay, layer_decay)
     opt = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
+    teacher_logit_adapter = None
+    teacher_contrastive_adapter = None
     if teacher_model is not None and distill_teacher_trainable:
         teacher_params = [p for p in teacher_model.parameters() if p.requires_grad]
         if teacher_params:
             opt.add_param_group({"params": teacher_params, "lr": teacher_lr_value, "weight_decay": weight_decay})
+    if (
+        teacher_model is not None
+        and not distill_teacher_trainable
+        and distill_teacher_adapter
+    ):
+        teacher_logit_adapter = TeacherLogitAdapter(num_classes).to(device)
+    if (
+        teacher_model is not None
+        and contrastive_weight > 0.0
+        and contrastive_use_teacher
+    ):
+        feature_dim = model.head.weight.shape[1] if hasattr(model.head, "weight") else num_classes
+        teacher_contrastive_adapter = TeacherContrastiveAdapter(num_classes, feature_dim).to(device)
+    if teacher_logit_adapter is not None:
+        opt.add_param_group(
+            {"params": teacher_logit_adapter.parameters(), "lr": distill_teacher_adapter_lr, "weight_decay": 0.0}
+        )
+    if teacher_contrastive_adapter is not None:
+        opt.add_param_group(
+            {"params": teacher_contrastive_adapter.parameters(), "lr": base_lr, "weight_decay": weight_decay}
+        )
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     ema_model = copy.deepcopy(model) if ema_decay > 0 else None
+    teacher_feature_collector = TeacherFeatureCollector(teacher_model) if teacher_model is not None else None
+    teacher_hint_adapter = (
+        TeacherHintAdapter(num_classes, device)
+        if teacher_feature_collector is not None and (hint_distill_weight > 0.0 or relational_weight > 0.0)
+        else None
+    )
+    clause_dims = infer_clause_dimensions(model)
+    teacher_clause_projector = (
+        TeacherClauseProjector(clause_dims, device)
+        if teacher_feature_collector is not None and clause_align_weight > 0.0
+        else None
+    )
+    registered_hint_layers: Set[int] = set()
+    registered_clause_layers: Set[int] = set()
+    base_weights = {
+        "teacher": distill_teacher_weight,
+        "self": self_distill_weight,
+        "hint": hint_distill_weight,
+        "clause": clause_align_weight,
+        "attn": attn_guidance_weight,
+        "relational": relational_weight,
+    }
+    base_temps = {
+        "teacher": distill_teacher_temp,
+        "self": self_distill_temp,
+        "hint": hint_distill_temp,
+        "clause": clause_align_temp,
+        "attn": attn_guidance_temp,
+    }
+    weight_scales = {
+        "teacher": kd_stage2_teacher_scale,
+        "self": kd_stage2_self_scale,
+        "hint": kd_stage2_hint_scale,
+        "clause": kd_stage2_clause_scale,
+        "attn": kd_stage2_attn_scale,
+        "relational": kd_stage2_rel_scale,
+    }
+    temp_scales = {
+        "teacher": kd_stage2_teacher_temp_scale,
+        "self": kd_stage2_self_temp_scale,
+        "hint": kd_stage2_hint_temp_scale,
+        "clause": kd_stage2_clause_temp_scale,
+        "attn": kd_stage2_attn_temp_scale,
+    }
+    kd_scheduler = DistillationStageScheduler(
+        stage_epoch=kd_stage_epochs,
+        total_epochs=epochs,
+        base_weights=base_weights,
+        base_temps=base_temps,
+        weight_scales=weight_scales,
+        temp_scales=temp_scales,
+        base_tau=tm_tau,
+        target_tau=kd_stage2_tau,
+    )
+    current_tau_value = tm_tau
+    teacher_aug_loader: Optional[DataLoader] = None
+    if teacher_aug_path:
+        pseudo_data = torch.load(teacher_aug_path, map_location="cpu")
+        images = pseudo_data.get("images")
+        logits_store = pseudo_data.get("logits")
+        if images is None or logits_store is None:
+            raise ValueError(f"Pseudo-label dataset at {teacher_aug_path} missing 'images' or 'logits'.")
+        pseudo_dataset = TensorDataset(images, logits_store)
+        teacher_aug_loader = DataLoader(
+            pseudo_dataset,
+            batch_size=train_loader.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
+    if clause_init_batches > 0 and teacher_feature_collector is not None:
+        print(f"  Warming clause parameters with teacher for {clause_init_batches} batches...")
+        warm_start_clauses_with_teacher(
+            model,
+            teacher_feature_collector,
+            train_loader,
+            device,
+            batches=clause_init_batches,
+            lr=clause_init_lr,
+            temperature=clause_init_temp,
+        )
+        if ema_model is not None:
+            ema_model.load_state_dict(model.state_dict())
     start = time.time()
     last_train_acc: Optional[float] = None
     best_test_acc: Optional[float] = None
     label = f"Transformer-{architecture.upper()}"
     collect_aux = aux_weight > 0
+    need_component_hints = hint_distill_weight > 0.0
+    need_relational = relational_weight > 0.0
+    need_attention_guidance = attn_guidance_weight > 0.0
+    collect_components = collect_aux or need_component_hints or need_relational
     component_history: List[Dict[str, Any]] = []
     writer = None
     if log_dir:
@@ -2284,6 +3508,23 @@ def run_variant_transformer(train_loader,
     cutmix_schedule = (cutmix_schedule or "constant").lower()
 
     for epoch in range(epochs):
+        weight_schedule, temp_schedule, tau_override = kd_scheduler.compute(epoch)
+        teacher_kd_weight = weight_schedule.get("teacher", distill_teacher_weight)
+        self_kd_weight = weight_schedule.get("self", self_distill_weight)
+        hint_weight_epoch = weight_schedule.get("hint", hint_distill_weight)
+        clause_align_weight_epoch = weight_schedule.get("clause", clause_align_weight)
+        attn_guidance_weight_epoch = weight_schedule.get("attn", attn_guidance_weight)
+        relational_weight_epoch = weight_schedule.get("relational", relational_weight)
+        teacher_temp_epoch = temp_schedule.get("teacher", distill_teacher_temp)
+        self_temp_epoch = temp_schedule.get("self", self_distill_temp)
+        hint_temp_epoch = temp_schedule.get("hint", hint_distill_temp)
+        clause_temp_epoch = temp_schedule.get("clause", clause_align_temp)
+        attn_temp_epoch = temp_schedule.get("attn", attn_guidance_temp)
+        if tau_override is not None:
+            anneal_ste_factor(model, tau_override)
+            if ema_model is not None:
+                anneal_ste_factor(ema_model, tau_override)
+            current_tau_value = tau_override
         mixup_epoch_alpha = schedule_scalar(epoch, epochs, mixup_alpha, mixup_schedule)
         cutmix_epoch_alpha = schedule_scalar(epoch, epochs, cutmix_alpha, cutmix_schedule)
         global_step = epoch * steps_per_epoch
@@ -2306,60 +3547,101 @@ def run_variant_transformer(train_loader,
         teacher_count = 0
         total_teacher_ce = 0.0
         teacher_ce_count = 0
+        total_hint = 0.0
+        hint_count = 0
+        hint_component_totals: Dict[str, float] = defaultdict(float)
+        hint_component_counts: Dict[str, int] = defaultdict(int)
+        total_clause_align = 0.0
+        clause_align_count = 0
+        clause_align_component_totals: Dict[str, float] = defaultdict(float)
+        clause_align_component_counts: Dict[str, int] = defaultdict(int)
+        total_attn_guidance = 0.0
+        attn_guidance_count = 0
+        attn_guidance_component_totals: Dict[str, float] = defaultdict(float)
+        attn_guidance_component_counts: Dict[str, int] = defaultdict(int)
+        total_relational = 0.0
+        relational_count = 0
+        relational_component_totals: Dict[str, float] = defaultdict(float)
+        relational_component_counts: Dict[str, int] = defaultdict(int)
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             if cycle_steps > 0:
                 current_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
                 set_optimizer_lr(opt, current_lr)
                 epoch_lr = current_lr
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            x_aug, targets_a, targets_b, lam, aug_mode = apply_mixup_cutmix(x, y, mixup_epoch_alpha, cutmix_epoch_alpha)
+            x_aug, targets_a, targets_b, lam, aug_mode, mix_perm = apply_mixup_cutmix(
+                x, y, mixup_epoch_alpha, cutmix_epoch_alpha
+            )
             teacher_inputs = x_aug if distill_teacher_trainable else x
             opt.zero_grad(set_to_none=True)
             distill_term: Optional[torch.Tensor] = None
             contrast_term: Optional[torch.Tensor] = None
             teacher_ce_term: Optional[torch.Tensor] = None
             external_teacher_logits: Optional[torch.Tensor] = None
+            teacher_features_batch: Dict[str, torch.Tensor] = {}
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 teacher_logits_for_loss: Optional[torch.Tensor] = None
-                if teacher_model is not None:
+                if teacher_model is not None and teacher_feature_collector is not None:
                     if distill_teacher_trainable:
-                        teacher_out = teacher_model(teacher_inputs)
-                        teacher_logits = teacher_out[0] if isinstance(teacher_out, tuple) else teacher_out
-                        teacher_logits_for_loss = teacher_logits
+                        teacher_logits, teacher_features_batch, teacher_logits_for_loss = teacher_feature_collector.collect(
+                            teacher_inputs, retain_logits_grad=True
+                        )
                         external_teacher_logits = teacher_logits.detach()
                     else:
                         with torch.no_grad():
-                            teacher_out = teacher_model(teacher_inputs)
-                            teacher_logits = teacher_out[0] if isinstance(teacher_out, tuple) else teacher_out
-                            external_teacher_logits = teacher_logits
+                            primary_logits, primary_features, primary_logits_for_loss = teacher_feature_collector.collect(
+                                x, retain_logits_grad=False
+                            )
+                            teacher_logits_for_loss = None
+                            if lam is not None and mix_perm is not None:
+                                secondary_logits, secondary_features, _ = teacher_feature_collector.collect(
+                                    x[mix_perm], retain_logits_grad=False
+                                )
+                                external_teacher_logits = lam * primary_logits_for_loss + (1 - lam) * secondary_logits
+                                teacher_features_batch = {}
+                                for name, feat_a in primary_features.items():
+                                    feat_b = secondary_features.get(name)
+                                    if feat_b is None:
+                                        teacher_features_batch[name] = feat_a
+                                    else:
+                                        teacher_features_batch[name] = lam * feat_a + (1 - lam) * feat_b
+                            else:
+                                external_teacher_logits = primary_logits_for_loss
+                                teacher_features_batch = primary_features
+                if teacher_logit_adapter is not None and external_teacher_logits is not None:
+                    external_teacher_logits = teacher_logit_adapter(external_teacher_logits)
                 outputs = model(
                     x_aug,
                     use_ste=True,
-                    collect_diagnostics=collect_aux,
+                    collect_diagnostics=collect_components,
                     return_features=need_features,
                 )
+                component_logits: Dict[str, torch.Tensor] = {}
                 features: Optional[torch.Tensor]
-                if collect_aux and need_features:
-                    logits, aux_outputs, features = outputs  # type: ignore[assignment]
-                elif collect_aux:
-                    logits, aux_outputs = outputs  # type: ignore[assignment]
+                if collect_components and need_features:
+                    logits, component_logits, features = outputs  # type: ignore[assignment]
+                elif collect_components:
+                    logits, component_logits = outputs  # type: ignore[assignment]
                     features = None
                 elif need_features:
                     logits, features = outputs  # type: ignore[assignment]
-                    aux_outputs = {}
                 else:
                     logits = outputs  # type: ignore[assignment]
-                    aux_outputs = {}
                     features = None
+                clause_output_map: Dict[str, torch.Tensor] = (
+                    collect_clause_outputs(model)
+                    if (clause_align_weight_epoch > 0.0 or attn_guidance_weight_epoch > 0.0)
+                    else {}
+                )
                 if lam is not None:
                     loss = lam * F.cross_entropy(logits, targets_a, label_smoothing=label_smoothing) + (
                         1 - lam
                     ) * F.cross_entropy(logits, targets_b, label_smoothing=label_smoothing)
                 else:
                     loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
-                if collect_aux and aux_outputs:
+                if collect_aux and component_logits:
                     aux_loss = 0.0
-                    for aux_logits in aux_outputs.values():
+                    for aux_logits in component_logits.values():
                         if lam is not None:
                             aux_loss += lam * F.cross_entropy(
                                 aux_logits, targets_a, label_smoothing=label_smoothing
@@ -2368,7 +3650,7 @@ def run_variant_transformer(train_loader,
                             )
                         else:
                             aux_loss += F.cross_entropy(aux_logits, y, label_smoothing=label_smoothing)
-                    aux_loss = aux_loss / max(len(aux_outputs), 1)
+                    aux_loss = aux_loss / max(len(component_logits), 1)
                     loss = loss + aux_weight * aux_loss
                 if teacher_logits_for_loss is not None:
                     if lam is not None:
@@ -2382,27 +3664,168 @@ def run_variant_transformer(train_loader,
                             teacher_logits_for_loss, y, label_smoothing=label_smoothing
                         )
                     loss = loss + teacher_ce_term
-                if self_distill_weight > 0.0 and ema_model is not None:
+                teacher_hint_logits_map: Dict[str, torch.Tensor] = {}
+                if (
+                    teacher_hint_adapter is not None
+                    and teacher_features_batch
+                    and component_logits
+                    and (need_component_hints or need_relational)
+                ):
+                    teacher_hint_logits_map = teacher_hint_adapter(teacher_features_batch)
+                    new_hint_layers = teacher_hint_adapter.consume_new_layers()
+                    for layer in new_hint_layers:
+                        layer_id = id(layer)
+                        if layer_id in registered_hint_layers:
+                            continue
+                        params = [p for p in layer.parameters() if p.requires_grad]
+                        if params:
+                            opt.add_param_group({"params": params, "lr": epoch_lr, "weight_decay": weight_decay})
+                        registered_hint_layers.add(layer_id)
+                hint_term_value: Optional[torch.Tensor] = None
+                if hint_weight_epoch > 0.0 and teacher_hint_logits_map:
+                    hint_losses: List[torch.Tensor] = []
+                    for name, student_component in component_logits.items():
+                        teacher_component = teacher_hint_logits_map.get(name)
+                        if teacher_component is None:
+                            continue
+                        hint_loss_component = F.kl_div(
+                            F.log_softmax(student_component / hint_temp_epoch, dim=1),
+                            F.softmax(teacher_component / hint_temp_epoch, dim=1),
+                            reduction="batchmean",
+                        ) * (hint_temp_epoch ** 2)
+                        hint_losses.append(hint_loss_component)
+                        hint_component_totals[name] += hint_loss_component.detach().item()
+                        hint_component_counts[name] += 1
+                    if hint_losses:
+                        hint_term_value = sum(hint_losses) / len(hint_losses)
+                        loss = loss + hint_weight_epoch * hint_term_value
+                relational_term: Optional[torch.Tensor] = None
+                if relational_weight_epoch > 0.0 and teacher_hint_logits_map and component_logits:
+                    relational_losses: List[torch.Tensor] = []
+                    for name, student_component in component_logits.items():
+                        teacher_component = teacher_hint_logits_map.get(name)
+                        if teacher_component is None or student_component.size(0) < 2:
+                            continue
+                        student_feat = F.normalize(student_component, dim=1)
+                        teacher_feat = F.normalize(teacher_component, dim=1)
+                        student_sim = torch.matmul(student_feat, student_feat.transpose(0, 1))
+                        teacher_sim = torch.matmul(teacher_feat, teacher_feat.transpose(0, 1))
+                        relational_loss_component = F.mse_loss(student_sim, teacher_sim)
+                        relational_losses.append(relational_loss_component)
+                        relational_component_totals[name] += relational_loss_component.detach().item()
+                        relational_component_counts[name] += 1
+                    if relational_losses:
+                        relational_term = sum(relational_losses) / len(relational_losses)
+                        loss = loss + relational_weight_epoch * relational_term
+                clause_align_term: Optional[torch.Tensor] = None
+                if (
+                    clause_align_weight_epoch > 0.0
+                    and teacher_clause_projector is not None
+                    and teacher_features_batch
+                    and clause_output_map
+                ):
+                    teacher_clause_logits = teacher_clause_projector(teacher_features_batch)
+                    new_clause_layers = teacher_clause_projector.consume_new_layers()
+                    for layer in new_clause_layers:
+                        layer_id = id(layer)
+                        if layer_id in registered_clause_layers:
+                            continue
+                        params = [p for p in layer.parameters() if p.requires_grad]
+                        if params:
+                            opt.add_param_group({"params": params, "lr": epoch_lr, "weight_decay": weight_decay})
+                        registered_clause_layers.add(layer_id)
+                    clause_losses: List[torch.Tensor] = []
+                    for name, student_clause in clause_output_map.items():
+                        teacher_clause = teacher_clause_logits.get(name)
+                        if teacher_clause is None:
+                            continue
+                        if student_clause.dim() == 3:
+                            student_clause_flat = student_clause.mean(dim=1)
+                        else:
+                            student_clause_flat = student_clause.view(student_clause.size(0), -1)
+                        student_probs = student_clause_flat.clamp_min(1e-6)
+                        student_probs = student_probs / student_probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                        student_log = torch.log(student_probs)
+                        teacher_probs = F.softmax(teacher_clause / clause_temp_epoch, dim=1)
+                        clause_loss_component = F.kl_div(
+                            student_log,
+                            teacher_probs,
+                            reduction="batchmean",
+                        ) * (clause_temp_epoch ** 2)
+                        clause_losses.append(clause_loss_component)
+                        clause_align_component_totals[name] += clause_loss_component.detach().item()
+                        clause_align_component_counts[name] += 1
+                    if clause_losses:
+                        clause_align_term = sum(clause_losses) / len(clause_losses)
+                        loss = loss + clause_align_weight_epoch * clause_align_term
+                attn_guidance_term: Optional[torch.Tensor] = None
+                if (
+                    attn_guidance_weight_epoch > 0.0
+                    and teacher_features_batch
+                    and clause_output_map
+                ):
+                    attn_losses: List[torch.Tensor] = []
+                    for name, student_clause in clause_output_map.items():
+                        teacher_tensor = teacher_features_batch.get(name)
+                        if teacher_tensor is None:
+                            continue
+                        teacher_attention = compute_teacher_token_attention(name, teacher_tensor)
+                        if teacher_attention is None or teacher_attention.size(1) == 0:
+                            continue
+                        drop_first = student_clause.size(1) == teacher_attention.size(1) + 1
+                        student_dist = compute_student_clause_token_distribution(
+                            student_clause, drop_first_token=drop_first
+                        )
+                        if student_dist.size(1) != teacher_attention.size(1):
+                            continue
+                        teacher_probs = teacher_attention.detach().clamp_min(1e-6)
+                        if attn_temp_epoch != 1.0:
+                            teacher_probs = teacher_probs.pow(1.0 / attn_temp_epoch)
+                            teacher_probs = teacher_probs / teacher_probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                        student_dist = student_dist.clamp_min(1e-6)
+                        student_log = torch.log(student_dist)
+                        attn_loss_component = F.kl_div(
+                            student_log,
+                            teacher_probs,
+                            reduction="batchmean",
+                        )
+                        attn_losses.append(attn_loss_component)
+                        attn_guidance_component_totals[name] += attn_loss_component.detach().item()
+                        attn_guidance_component_counts[name] += 1
+                    if attn_losses:
+                        attn_guidance_term = sum(attn_losses) / len(attn_losses)
+                        loss = loss + attn_guidance_weight_epoch * attn_guidance_term
+                if self_kd_weight > 0.0 and ema_model is not None:
                     with torch.no_grad():
                         teacher_out = ema_model(x_aug, use_ste=True)
                         teacher_logits = teacher_out[0] if isinstance(teacher_out, tuple) else teacher_out
                     distill_term = F.kl_div(
-                        F.log_softmax(logits / self_distill_temp, dim=1),
-                        F.softmax(teacher_logits / self_distill_temp, dim=1),
+                        F.log_softmax(logits / self_temp_epoch, dim=1),
+                        F.softmax(teacher_logits / self_temp_epoch, dim=1),
                         reduction="batchmean",
-                    ) * (self_distill_temp ** 2)
-                    loss = loss + self_distill_weight * distill_term
-                if external_teacher_logits is not None and distill_teacher_weight > 0.0:
+                    ) * (self_temp_epoch ** 2)
+                    loss = loss + self_kd_weight * distill_term
+                if external_teacher_logits is not None and teacher_kd_weight > 0.0:
                     kd_loss = F.kl_div(
-                        F.log_softmax(logits / distill_teacher_temp, dim=1),
-                        F.softmax(external_teacher_logits / distill_teacher_temp, dim=1),
+                        F.log_softmax(logits / teacher_temp_epoch, dim=1),
+                        F.softmax(external_teacher_logits / teacher_temp_epoch, dim=1),
                         reduction="batchmean",
-                    ) * (distill_teacher_temp ** 2)
-                    loss = loss + distill_teacher_weight * kd_loss
+                    ) * (teacher_temp_epoch ** 2)
+                    loss = loss + teacher_kd_weight * kd_loss
                     total_teacher_kd += kd_loss.item()
                     teacher_count += 1
                 if contrastive_weight > 0.0 and features is not None and features.numel() > 0:
-                    contrast_term = supervised_contrastive_loss(features, y, temperature=contrastive_temp)
+                    contrast_inputs = features
+                    contrast_labels = y
+                    if (
+                        teacher_contrastive_adapter is not None
+                        and external_teacher_logits is not None
+                        and (lam is None or lam <= 0.0 or lam >= 1.0)
+                    ):
+                        teacher_embeds = teacher_contrastive_adapter(external_teacher_logits)
+                        contrast_inputs = torch.cat([features, teacher_embeds], dim=0)
+                        contrast_labels = torch.cat([y, y], dim=0)
+                    contrast_term = supervised_contrastive_loss(contrast_inputs, contrast_labels, temperature=contrastive_temp)
                     loss = loss + contrastive_weight * contrast_term
                 reg_loss = model.pop_regularization_loss()
                 if reg_loss is not None:
@@ -2410,6 +3833,18 @@ def run_variant_transformer(train_loader,
             if teacher_ce_term is not None:
                 total_teacher_ce += teacher_ce_term.detach().item()
                 teacher_ce_count += 1
+            if hint_term_value is not None:
+                total_hint += hint_term_value.detach().item()
+                hint_count += 1
+            if clause_align_term is not None:
+                total_clause_align += clause_align_term.detach().item()
+                clause_align_count += 1
+            if attn_guidance_term is not None:
+                total_attn_guidance += attn_guidance_term.detach().item()
+                attn_guidance_count += 1
+            if relational_term is not None:
+                total_relational += relational_term.detach().item()
+                relational_count += 1
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -2453,9 +3888,49 @@ def run_variant_transformer(train_loader,
         avg_contrast = (total_contrast / contrast_count) if contrast_count > 0 else None
         avg_teacher_kd = (total_teacher_kd / teacher_count) if teacher_count > 0 else None
         avg_teacher_ce = (total_teacher_ce / teacher_ce_count) if teacher_ce_count > 0 else None
+        avg_hint = (total_hint / hint_count) if hint_count > 0 else None
+        hint_component_avg = {
+            name: hint_component_totals[name] / hint_component_counts[name]
+            for name in hint_component_totals
+            if hint_component_counts[name] > 0
+        }
+        avg_clause_align = (total_clause_align / clause_align_count) if clause_align_count > 0 else None
+        clause_align_component_avg = {
+            name: clause_align_component_totals[name] / clause_align_component_counts[name]
+            for name in clause_align_component_totals
+            if clause_align_component_counts[name] > 0
+        }
+        avg_attn_guidance = (total_attn_guidance / attn_guidance_count) if attn_guidance_count > 0 else None
+        attn_guidance_component_avg = {
+            name: attn_guidance_component_totals[name] / attn_guidance_component_counts[name]
+            for name in attn_guidance_component_totals
+            if attn_guidance_component_counts[name] > 0
+        }
+        avg_relational = (total_relational / relational_count) if relational_count > 0 else None
+        relational_component_avg = {
+            name: relational_component_totals[name] / relational_component_counts[name]
+            for name in relational_component_totals
+            if relational_component_counts[name] > 0
+        }
         teacher_eval_acc = None
         if teacher_model is not None:
             teacher_eval_acc = evaluate_classifier(teacher_model, test_loader, device)
+        stage_weights = {
+            "teacher": teacher_kd_weight,
+            "self": self_kd_weight,
+            "hint": hint_weight_epoch,
+            "clause": clause_align_weight_epoch,
+            "attn": attn_guidance_weight_epoch,
+            "relational": relational_weight_epoch,
+            "tau": current_tau_value,
+        }
+        stage_temps = {
+            "teacher": teacher_temp_epoch,
+            "self": self_temp_epoch,
+            "hint": hint_temp_epoch,
+            "clause": clause_temp_epoch,
+            "attn": attn_temp_epoch,
+        }
         component_history.append(
             {
                 "epoch": epoch + 1,
@@ -2465,20 +3940,41 @@ def run_variant_transformer(train_loader,
                 "cutmix_alpha": cutmix_epoch_alpha,
                 "distill_loss": avg_distill,
                 "contrastive_loss": avg_contrast,
+                "hint_loss": avg_hint,
+                "clause_align_loss": avg_clause_align,
+                "hint_components": hint_component_avg,
+                "clause_align_components": clause_align_component_avg,
+                "attn_guidance_loss": avg_attn_guidance,
+                "attn_guidance_components": attn_guidance_component_avg,
+                "relational_loss": avg_relational,
+                "relational_components": relational_component_avg,
                 "clause_usage": clause_usage,
                 "teacher_kd_loss": avg_teacher_kd,
                 "teacher_ce_loss": avg_teacher_ce,
                 "teacher_accuracy": teacher_eval_acc,
+                "stage_weights": stage_weights,
+                "stage_temps": stage_temps,
             }
         )
 
         extras = {f"{name}_acc": acc for name, acc in component_acc.items()}
         extras["mixup_alpha"] = mixup_epoch_alpha
         extras["cutmix_alpha"] = cutmix_epoch_alpha
+        extras["teacher_kd_weight"] = teacher_kd_weight
+        extras["self_kd_weight"] = self_kd_weight
+        extras["tau"] = current_tau_value
         if avg_distill is not None:
             extras["distill_loss"] = avg_distill
         if avg_contrast is not None:
             extras["contrast_loss"] = avg_contrast
+        if avg_hint is not None:
+            extras["hint_loss"] = avg_hint
+        if avg_clause_align is not None:
+            extras["clause_align_loss"] = avg_clause_align
+        if avg_attn_guidance is not None:
+            extras["attn_guidance_loss"] = avg_attn_guidance
+        if avg_relational is not None:
+            extras["relational_loss"] = avg_relational
         if avg_teacher_kd is not None:
             extras["teacher_kd_loss"] = avg_teacher_kd
         if avg_teacher_ce is not None:
@@ -2497,6 +3993,26 @@ def run_variant_transformer(train_loader,
                 writer.add_scalar(f"{label}/aux/distillation_loss", avg_distill, epoch)
             if avg_contrast is not None:
                 writer.add_scalar(f"{label}/aux/contrastive_loss", avg_contrast, epoch)
+            if avg_hint is not None:
+                writer.add_scalar(f"{label}/aux/hint_loss", avg_hint, epoch)
+            if hint_component_avg:
+                for name, value in hint_component_avg.items():
+                    writer.add_scalar(f"{label}/aux/hint_components/{name}", value, epoch)
+            if avg_clause_align is not None:
+                writer.add_scalar(f"{label}/aux/clause_align_loss", avg_clause_align, epoch)
+            if clause_align_component_avg:
+                for name, value in clause_align_component_avg.items():
+                    writer.add_scalar(f"{label}/aux/clause_align_components/{name}", value, epoch)
+            if avg_attn_guidance is not None:
+                writer.add_scalar(f"{label}/aux/attn_guidance_loss", avg_attn_guidance, epoch)
+            if attn_guidance_component_avg:
+                for name, value in attn_guidance_component_avg.items():
+                    writer.add_scalar(f"{label}/aux/attn_guidance_components/{name}", value, epoch)
+            if avg_relational is not None:
+                writer.add_scalar(f"{label}/aux/relational_loss", avg_relational, epoch)
+            if relational_component_avg:
+                for name, value in relational_component_avg.items():
+                    writer.add_scalar(f"{label}/aux/relational_components/{name}", value, epoch)
             if avg_teacher_kd is not None:
                 writer.add_scalar(f"{label}/aux/teacher_kd_loss", avg_teacher_kd, epoch)
             if avg_teacher_ce is not None:
@@ -2567,10 +4083,42 @@ def run_variant_transformer(train_loader,
             "mixup_schedule": mixup_schedule,
             "cutmix_schedule": cutmix_schedule,
             "self_distill_weight": self_distill_weight,
+            "hint_weight": hint_distill_weight,
+            "hint_temp": hint_distill_temp,
+            "clause_align_weight": clause_align_weight,
+            "clause_align_temp": clause_align_temp,
+            "attn_guidance_weight": attn_guidance_weight,
+            "attn_guidance_temp": attn_guidance_temp,
+            "relational_weight": relational_weight,
+            "kd_stage_epoch": kd_stage_epochs,
+            "kd_stage2_scales": {
+                "teacher": kd_stage2_teacher_scale,
+                "self": kd_stage2_self_scale,
+                "hint": kd_stage2_hint_scale,
+                "clause": kd_stage2_clause_scale,
+                "attn": kd_stage2_attn_scale,
+                "rel": kd_stage2_rel_scale,
+            },
+            "kd_stage2_temp_scales": {
+                "teacher": kd_stage2_teacher_temp_scale,
+                "self": kd_stage2_self_temp_scale,
+                "hint": kd_stage2_hint_temp_scale,
+                "clause": kd_stage2_clause_temp_scale,
+                "attn": kd_stage2_attn_temp_scale,
+            },
+            "kd_stage2_tau": kd_stage2_tau,
+            "clause_init_batches": clause_init_batches,
+            "clause_init_lr": clause_init_lr,
+            "clause_init_temp": clause_init_temp,
             "contrastive_weight": contrastive_weight,
+            "contrastive_use_teacher": contrastive_use_teacher,
             "teacher_model": distill_teacher_timm or distill_teacher_checkpoint,
             "teacher_weight": distill_teacher_weight,
             "teacher_temp": distill_teacher_temp,
+            "teacher_adapter": distill_teacher_adapter,
+            "teacher_adapter_lr": distill_teacher_adapter_lr if distill_teacher_adapter else None,
+            "teacher_aug_path": teacher_aug_path,
+            "teacher_aug_batches": teacher_aug_batches,
         },
         "eval_accuracy": eval_acc,
         "eval_component_accuracy": eval_component_acc,
@@ -2660,14 +4208,42 @@ def run_variant_transformer(train_loader,
                 "aux_weight": aux_weight,
                 "self_distill_weight": self_distill_weight,
                 "self_distill_temp": self_distill_temp,
+                "hint_distill_weight": hint_distill_weight,
+                "hint_distill_temp": hint_distill_temp,
+                "clause_align_weight": clause_align_weight,
+                "clause_align_temp": clause_align_temp,
+                "attn_guidance_weight": attn_guidance_weight,
+                "attn_guidance_temp": attn_guidance_temp,
+                "relational_weight": relational_weight,
+                "kd_stage_epoch": kd_stage_epochs,
+                "kd_stage2_teacher_scale": kd_stage2_teacher_scale,
+                "kd_stage2_teacher_temp_scale": kd_stage2_teacher_temp_scale,
+                "kd_stage2_self_scale": kd_stage2_self_scale,
+                "kd_stage2_self_temp_scale": kd_stage2_self_temp_scale,
+                "kd_stage2_hint_scale": kd_stage2_hint_scale,
+                "kd_stage2_hint_temp_scale": kd_stage2_hint_temp_scale,
+                "kd_stage2_clause_scale": kd_stage2_clause_scale,
+                "kd_stage2_clause_temp_scale": kd_stage2_clause_temp_scale,
+                "kd_stage2_attn_scale": kd_stage2_attn_scale,
+                "kd_stage2_attn_temp_scale": kd_stage2_attn_temp_scale,
+                "kd_stage2_rel_scale": kd_stage2_rel_scale,
+                "kd_stage2_tau": kd_stage2_tau,
+                "clause_init_batches": clause_init_batches,
+                "clause_init_lr": clause_init_lr,
+                "clause_init_temp": clause_init_temp,
                 "contrastive_weight": contrastive_weight,
                 "contrastive_temp": contrastive_temp,
+                "contrastive_use_teacher": contrastive_use_teacher,
+                "teacher_aug_path": teacher_aug_path,
+                "teacher_aug_batches": teacher_aug_batches,
                 "clause_specialize": clause_specialize,
                 "clause_specialize_strength": clause_specialize_strength,
                 "distill_teacher_timm": distill_teacher_timm,
                 "distill_teacher_checkpoint": distill_teacher_checkpoint,
                 "distill_teacher_weight": distill_teacher_weight,
                 "distill_teacher_temp": distill_teacher_temp,
+                "distill_teacher_adapter": distill_teacher_adapter,
+                "distill_teacher_adapter_lr": distill_teacher_adapter_lr if distill_teacher_adapter else None,
             },
             "train_metrics": {
                 "train_accuracy": last_train_acc,
@@ -2716,6 +4292,10 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
 
     device = current_device(args.device)
 
+    dataset_root = args.dataset_root
+    imagenet_train_dir: Optional[str] = None
+    imagenet_val_dir: Optional[str] = None
+
     pin_memory = args.pin_memory
     if pin_memory is None:
         pin_memory = device.type != "cpu"
@@ -2729,10 +4309,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
     target_channels = args.tm_target_channels if args.tm_target_channels is not None else dataset_cfg["input_channels"]
     target_size = tuple(args.tm_target_size) if args.tm_target_size is not None else tuple(dataset_cfg["image_size"])
     imagenet_mode = dataset_key == "imagenet"
-    if imagenet_mode and args.dataset_root == DEFAULT_DATA_ROOT:
-        args.dataset_root = DEFAULT_IMAGENET_ROOT
+    if imagenet_mode and dataset_root == DEFAULT_DATA_ROOT:
+        dataset_root = DEFAULT_IMAGENET_ROOT
+        args.dataset_root = dataset_root
     if imagenet_mode:
         target_size = (args.imagenet_crop, args.imagenet_crop)
+        imagenet_train_dir = args.imagenet_train_dir or os.path.join(dataset_root, "train")
+        imagenet_val_dir = args.imagenet_val_dir or os.path.join(dataset_root, "val")
         if args.write_bool_dataset:
             print("[WARN] Boolean dataset export disabled for ImageNet.")
             args.write_bool_dataset = False
@@ -2786,15 +4369,14 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
 
     with profile_block("load-dataset"):
         if imagenet_mode:
-            dataset_root = args.dataset_root or DEFAULT_IMAGENET_ROOT
-            train_dir = args.imagenet_train_dir or os.path.join(dataset_root, "train")
-            val_dir = args.imagenet_val_dir or os.path.join(dataset_root, "val")
-            if not os.path.isdir(train_dir):
-                raise FileNotFoundError(f"ImageNet train directory not found: {train_dir}")
-            if not os.path.isdir(val_dir):
-                raise FileNotFoundError(f"ImageNet validation directory not found: {val_dir}")
-            train_ds = dataset_cfg["train_class"](train_dir, transform=train_transform)
-            test_ds = dataset_cfg["test_class"](val_dir, transform=test_transform)
+            if imagenet_train_dir is None or imagenet_val_dir is None:
+                raise FileNotFoundError("ImageNet directories must be specified for training and validation.")
+            if not os.path.isdir(imagenet_train_dir):
+                raise FileNotFoundError(f"ImageNet train directory not found: {imagenet_train_dir}")
+            if not os.path.isdir(imagenet_val_dir):
+                raise FileNotFoundError(f"ImageNet validation directory not found: {imagenet_val_dir}")
+            train_ds = dataset_cfg["train_class"](imagenet_train_dir, transform=train_transform)
+            test_ds = dataset_cfg["test_class"](imagenet_val_dir, transform=test_transform)
         else:
             train_ds = dataset_cfg["train_class"](
                 root=args.dataset_root,
@@ -2982,10 +4564,32 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
 
     results: Dict[str, Dict[str, Any]] = {}
 
+    teacher_baseline_summary: Optional[Dict[str, Any]] = None
+    if args.teacher_baseline:
+        with profile_block("teacher-baseline"):
+            teacher_baseline_summary = run_teacher_baseline(
+                args=args,
+                dataset_key=dataset_key,
+                dataset_cfg=dataset_cfg,
+                device=device,
+                data_root=dataset_root,
+                download=args.download,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                imagenet_mode=imagenet_mode,
+                imagenet_train_dir=imagenet_train_dir,
+                imagenet_val_dir=imagenet_val_dir,
+            )
+        results["teacher_baseline"] = teacher_baseline_summary
+
     for model_key in selected_models:
         with profile_block(f"variant-{model_key}"):
             diagnostics: Optional[Dict[str, Any]] = None
             if model_key == "tm":
+                tm_variant_min_lr = tm_min_lr
+                if args.min_lr is None and args.tm_impl.lower() == "stcm":
+                    tm_variant_min_lr = tm_base_lr * 0.1
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_tm(
                     tm_train_loader,
                     tm_test_loader,
@@ -3007,13 +4611,59 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     allow_channel_reduce=tm_allow_reduce,
                     n_classes=args.num_classes,
                     base_lr=tm_base_lr,
-                    min_lr=tm_min_lr,
+                    min_lr=tm_variant_min_lr,
                     warmup_epochs=warmup_epochs,
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
                     label_smoothing=args.label_smoothing,
                     lr_cycle_steps=args.lr_cycle_steps,
                     tm_prior_template=args.tm_prior_template,
+                    tm_clause_dropout=args.tm_clause_dropout,
+                    tm_literal_dropout=args.tm_literal_dropout,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "stcm":
+                stcm_min_lr = tm_min_lr
+                if args.min_lr is None:
+                    stcm_min_lr = tm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_tm(
+                    tm_train_loader,
+                    tm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    n_features=tm_n_features,
+                    prepare_fn=tm_prepare_fn,
+                    tm_impl="stcm",
+                    tm_tau=args.tm_tau,
+                    tm_lf=args.tm_lf,
+                    tm_literal_budget=args.tm_literal_budget,
+                    tm_vote_clamp=args.tm_vote_clamp,
+                    tm_n_clauses=args.tm_n_clauses,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=tm_base_lr,
+                    min_lr=stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    tm_clause_dropout=args.tm_clause_dropout,
+                    tm_literal_dropout=args.tm_literal_dropout,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_tm":
@@ -3043,6 +4693,55 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     label_smoothing=args.label_smoothing,
                     lr_cycle_steps=args.lr_cycle_steps,
                     tm_prior_template=args.tm_prior_template,
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    use_ste_train=False,
+                    use_ste_eval=True,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "deep_stcm":
+                stcm_layer_kwargs = {
+                    "ternary_band": args.stcm_ternary_band,
+                    "ste_temperature": args.stcm_ste_temperature,
+                }
+                deep_stcm_min_lr = deeptm_min_lr
+                if args.min_lr is None:
+                    deep_stcm_min_lr = deeptm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deeptm(
+                    deeptm_train_loader,
+                    deeptm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    prepare_fn=deeptm_prepare_fn,
+                    input_dim=deeptm_input_dim,
+                    hidden_dims=hidden_dims,
+                    n_clauses=args.deeptm_n_clauses,
+                    dropout=args.deeptm_dropout,
+                    tau=args.deeptm_tau,
+                    input_shape=deeptm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=deeptm_base_lr,
+                    min_lr=deep_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    layer_cls=FuzzyPatternTM_STCM,
+                    layer_operator=args.stcm_operator,
+                    layer_ternary_voting=args.stcm_ternary_voting,
+                    layer_extra_kwargs=stcm_layer_kwargs,
+                    label_override="Deep-STCM",
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    use_ste_train=False,
+                    use_ste_eval=False,
                 )
                 variant_classes = args.num_classes
             elif model_key == "hybrid":
@@ -3137,8 +4836,34 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     tm_prior_template=args.tm_prior_template,
                     self_distill_weight=args.transformer_self_distill_weight,
                     self_distill_temp=args.transformer_self_distill_temp,
+                    hint_distill_weight=args.transformer_hint_weight,
+                    hint_distill_temp=args.transformer_hint_temp,
+                    clause_align_weight=args.transformer_clause_align_weight,
+                    clause_align_temp=args.transformer_clause_align_temp,
+                    attn_guidance_weight=args.transformer_attn_guidance_weight,
+                    attn_guidance_temp=args.transformer_attn_guidance_temp,
+                    relational_weight=args.transformer_relational_weight,
+                    kd_stage_epochs=args.transformer_kd_stage_epochs,
+                    kd_stage2_teacher_scale=args.transformer_kd_stage2_teacher_scale,
+                    kd_stage2_teacher_temp_scale=args.transformer_kd_stage2_teacher_temp_scale,
+                    kd_stage2_self_scale=args.transformer_kd_stage2_self_scale,
+                    kd_stage2_self_temp_scale=args.transformer_kd_stage2_self_temp_scale,
+                    kd_stage2_hint_scale=args.transformer_kd_stage2_hint_scale,
+                    kd_stage2_hint_temp_scale=args.transformer_kd_stage2_hint_temp_scale,
+                    kd_stage2_clause_scale=args.transformer_kd_stage2_clause_scale,
+                    kd_stage2_clause_temp_scale=args.transformer_kd_stage2_clause_temp_scale,
+                    kd_stage2_attn_scale=args.transformer_kd_stage2_attn_scale,
+                    kd_stage2_attn_temp_scale=args.transformer_kd_stage2_attn_temp_scale,
+                    kd_stage2_rel_scale=args.transformer_kd_stage2_rel_scale,
+                    kd_stage2_tau=args.transformer_kd_stage2_tau,
+                    clause_init_batches=args.transformer_clause_init_batches,
+                    clause_init_lr=args.transformer_clause_init_lr,
+                    clause_init_temp=args.transformer_clause_init_temp,
                     contrastive_weight=args.transformer_contrastive_weight,
                     contrastive_temp=args.transformer_contrastive_temp,
+                    contrastive_use_teacher=args.transformer_contrastive_use_teacher,
+                    teacher_aug_path=args.teacher_aug_path,
+                    teacher_aug_batches=args.teacher_aug_batches,
                     use_flash_attention=args.transformer_use_flash_attn,
                     use_residual_attention=args.transformer_residual_attn,
                     log_dir=args.transformer_log_dir,
@@ -3158,6 +4883,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     distill_teacher_temp=args.distill_teacher_temp,
                     distill_teacher_trainable=args.distill_teacher_trainable,
                     distill_teacher_lr=args.distill_teacher_lr,
+                    distill_teacher_adapter=args.distill_teacher_adapter,
+                    distill_teacher_adapter_lr=args.distill_teacher_adapter_lr,
                             save_path=args.transformer_save_path,
                 )
                 bundle = None
