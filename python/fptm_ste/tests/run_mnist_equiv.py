@@ -5015,6 +5015,14 @@ def run_variant_transformer(train_loader,
     return label, last_train_acc, test_acc, train_time, preds, diagnostics, best_test_acc, profile
 
 
+def ensure_list_length(lst: List[int], target_len: int) -> List[int]:
+    if not lst:
+        return lst
+    if len(lst) < target_len:
+        return lst + [lst[-1]] * (target_len - len(lst))
+    return lst[:target_len]
+
+
 def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
     maybe_set_seed(args.seed)
     if args.tm_L is None:
@@ -5507,7 +5515,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     use_ste_eval=True,
                 )
                 variant_classes = args.num_classes
-            elif model_key == "deep_stcm":
+            elif model_key == "deep_stcm" and not args.deepctm_channels:
                 stcm_layer_kwargs = {
                     "ternary_band": args.stcm_ternary_band,
                     "ste_temperature": args.stcm_ste_temperature,
@@ -5594,6 +5602,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128, 256]
                     dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 512
                 core_hidden = parse_int_list(args.deepctm_core_hidden_dims) if args.deepctm_core_hidden_dims else None
+                
+                target_len = len(dc_channels)
+                dc_kernels = ensure_list_length(dc_kernels, target_len)
+                dc_strides = ensure_list_length(dc_strides, target_len)
+                dc_pools = ensure_list_length(dc_pools, target_len)
+                dc_clauses = ensure_list_length(dc_clauses, target_len)
+                
                 ctm_schedule_cfg = _build_ctm_schedule_config(args, is_stcm=False)
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deepctm(
                     train_loader,
@@ -5634,7 +5649,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     label_smoothing=args.label_smoothing,
                 )
                 variant_classes = args.num_classes
-            elif model_key == "deep_cstcm":
+            elif model_key == "deep_cstcm" or (model_key == "deep_stcm" and args.deepctm_channels):
                 # Defaults per dataset
                 if dataset_key == "mnist":
                     dc_channels = parse_int_list(args.deepctm_channels) if args.deepctm_channels else [32, 64]
@@ -5651,6 +5666,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128, 256]
                     dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 512
                 core_hidden = parse_int_list(args.deepctm_core_hidden_dims) if args.deepctm_core_hidden_dims else None
+                
+                target_len = len(dc_channels)
+                dc_kernels = ensure_list_length(dc_kernels, target_len)
+                dc_strides = ensure_list_length(dc_strides, target_len)
+                dc_pools = ensure_list_length(dc_pools, target_len)
+                dc_clauses = ensure_list_length(dc_clauses, target_len)
+
                 stcm_min_lr = deeptm_min_lr
                 if args.min_lr is None:
                     stcm_min_lr = deeptm_base_lr * 0.1
