@@ -668,6 +668,132 @@ def _build_transform(
     return transforms.Compose(steps)
 
 
+def _parse_csv_floats(values: Optional[str]) -> Optional[Tuple[float, ...]]:
+    if values is None:
+        return None
+    vs = [v.strip() for v in values.split(",") if v.strip() != ""]
+    if not vs:
+        return None
+    return tuple(float(v) for v in vs)
+
+
+def _known_dataset_norm(dataset_key: str) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+    key = dataset_key.lower()
+    if key in {"cifar10"}:
+        return ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+    if key in {"cifar100"}:
+        return ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+    if key in {"mnist", "fashionmnist"}:
+        # Defaults near canonical; using ToTensor() [0,1] often sufficient, but include for completeness
+        return ((0.1307,), (0.3081,))
+    return None
+
+
+def _compute_dataset_stats(dataloader: DataLoader, batches: int) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+    if batches <= 0:
+        return None
+    n = 0
+    channel_sum = None
+    channel_sq_sum = None
+    for idx, (x, _) in enumerate(dataloader, start=1):
+        x = x.float()  # [B,C,H,W]
+        b, c, h, w = x.shape
+        x = x.view(b, c, -1)
+        if channel_sum is None:
+            channel_sum = x.sum(dim=(0, 2))
+            channel_sq_sum = (x ** 2).sum(dim=(0, 2))
+        else:
+            channel_sum += x.sum(dim=(0, 2))
+            channel_sq_sum += (x ** 2).sum(dim=(0, 2))
+        n += b * h * w
+        if idx >= batches:
+            break
+    if channel_sum is None or n == 0:
+        return None
+    mean = (channel_sum / n).tolist()
+    var = (channel_sq_sum / n - (channel_sum / n) ** 2).clamp_min(1e-12).tolist()
+    std = [float(v) ** 0.5 for v in var]
+    return (tuple(float(m) for m in mean), tuple(std))
+
+
+def _interp_schedule(epoch: int, sched: Dict[str, Any]) -> Optional[float]:
+    total = max(1, int(sched.get("epochs", 0)))
+    sched_type = sched.get("type", "none").lower()
+    if sched_type == "none" or total <= 0:
+        return None
+    start = float(sched.get("start"))
+    end = float(sched.get("end"))
+    t = min(1.0, max(0.0, (epoch + 1) / total))
+    if sched_type == "linear":
+        val = start + (end - start) * t
+    elif sched_type == "cosine":
+        val = start + (end - start) * 0.5 * (1 - math.cos(math.pi * t))
+    else:
+        val = None
+    if t >= 1.0:
+        # stick to end afterwards
+        val = end
+    return val
+
+
+def _build_ctm_schedule_config(args: argparse.Namespace, *, is_stcm: bool) -> Optional[Dict[str, Dict[str, Any]]]:
+    schedule: Dict[str, Dict[str, Any]] = {}
+    if args.deepctm_tau_schedule != "none" and args.deepctm_tau_epochs > 0 and args.deepctm_tau_end is not None:
+        start_val = args.deepctm_tau_start if args.deepctm_tau_start is not None else args.deepctm_tau
+        schedule["tau"] = {
+            "type": args.deepctm_tau_schedule,
+            "start": start_val,
+            "end": args.deepctm_tau_end,
+            "epochs": args.deepctm_tau_epochs,
+        }
+    if is_stcm and args.stcm_band_schedule != "none" and args.stcm_band_epochs > 0 and args.stcm_band_end is not None:
+        start_band = args.stcm_band_start if args.stcm_band_start is not None else args.stcm_ternary_band
+        schedule["band"] = {
+            "type": args.stcm_band_schedule,
+            "start": start_band,
+            "end": args.stcm_band_end,
+            "epochs": args.stcm_band_epochs,
+        }
+    if is_stcm and args.stcm_temp_schedule != "none" and args.stcm_temp_epochs > 0 and args.stcm_temp_end is not None:
+        start_temp = args.stcm_temp_start if args.stcm_temp_start is not None else args.stcm_ste_temperature
+        schedule["temp"] = {
+            "type": args.stcm_temp_schedule,
+            "start": start_temp,
+            "end": args.stcm_temp_end,
+            "epochs": args.stcm_temp_epochs,
+        }
+    return schedule or None
+
+
+def _apply_ctm_schedule(model: nn.Module, epoch: int, schedule_cfg: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    applied: Dict[str, float] = {}
+    if "tau" in schedule_cfg and hasattr(model, "set_tau"):
+        val = _interp_schedule(epoch, schedule_cfg["tau"])
+        if val is not None:
+            try:
+                getattr(model, "set_tau")(val)
+                applied["tau"] = float(val)
+            except Exception:
+                pass
+    if "band" in schedule_cfg and hasattr(model, "set_stcm_band"):
+        val = _interp_schedule(epoch, schedule_cfg["band"])
+        if val is not None:
+            try:
+                getattr(model, "set_stcm_band")(val)
+                applied["band"] = float(val)
+            except Exception:
+                pass
+    if "temp" in schedule_cfg and hasattr(model, "set_stcm_temperature"):
+        val = _interp_schedule(epoch, schedule_cfg["temp"])
+        if val is not None:
+            try:
+                getattr(model, "set_stcm_temperature")(val)
+                applied["temp"] = float(val)
+            except Exception:
+                pass
+    return applied
+
+
 def _extract_normalize(transform: transforms.Compose) -> Optional[Tuple[Sequence[float], Sequence[float]]]:
     if not isinstance(transform, transforms.Compose):
         return None
@@ -1112,6 +1238,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deepcstcm-core", choices=["stcm", "deepstcm"], default="stcm", help="Per-patch core for deep_cstcm (stcm or deepstcm).")
     parser.add_argument("--deepctm-core-hidden-dims", default=None, help="Comma-separated hidden dims for deep patch cores (deeptm/deepstcm).")
     parser.add_argument("--deepctm-aux-weight", type=float, default=0.0, help="Auxiliary CE weight for per-block CTM diagnostic heads.")
+    parser.add_argument("--deepctm-stem", action=argparse.BooleanOptionalAction, default=False, help="Enable conv stem before first CTM block.")
+    parser.add_argument("--deepctm-stem-channels", type=int, default=32, help="Channels used inside the conv stem when enabled.")
+    parser.add_argument("--deepctm-mix", choices=["none", "linear", "depthwise", "linear_depthwise"], default="none", help="Inter-block mixing type for Deep CTM.")
+    parser.add_argument("--deepctm-tau-schedule", choices=["none", "linear", "cosine"], default="none", help="Schedule type for CTM tau.")
+    parser.add_argument("--deepctm-tau-start", type=float, default=None, help="Override tau start value for scheduling (defaults to --deepctm-tau).")
+    parser.add_argument("--deepctm-tau-end", type=float, default=None, help="Tau value reached after --deepctm-tau-epochs.")
+    parser.add_argument("--deepctm-tau-epochs", type=int, default=0, help="Number of epochs over which to apply tau schedule.")
+    parser.add_argument("--ctm-ema-decay", type=float, default=0.0, help="EMA decay for Deep CTM weights (0 disables EMA).")
+    parser.add_argument("--ctm-self-distill-weight", type=float, default=0.0, help="KL weight for self-distillation against EMA teacher.")
+    parser.add_argument("--ctm-self-distill-temp", type=float, default=1.0, help="Temperature for EMA self-distillation KL.")
+    parser.add_argument("--stcm-band-schedule", choices=["none", "linear", "cosine"], default="none", help="Schedule for STCM ternary band.")
+    parser.add_argument("--stcm-band-start", type=float, default=None, help="Start value for STCM band schedule (defaults to --stcm-ternary-band).")
+    parser.add_argument("--stcm-band-end", type=float, default=None, help="End value for STCM band schedule.")
+    parser.add_argument("--stcm-band-epochs", type=int, default=0, help="Epoch span for STCM band schedule.")
+    parser.add_argument("--stcm-temp-schedule", choices=["none", "linear", "cosine"], default="none", help="Schedule for STCM STE temperature.")
+    parser.add_argument("--stcm-temp-start", type=float, default=None, help="Start value for STCM temperature schedule (defaults to --stcm-ste-temperature).")
+    parser.add_argument("--stcm-temp-end", type=float, default=None, help="End value for STCM temperature schedule.")
+    parser.add_argument("--stcm-temp-epochs", type=int, default=0, help="Epoch span for STCM temperature schedule.")
 
     # Hybrid options
     parser.add_argument("--hybrid-thresholds", type=int, default=32, help="Number of thresholds for CNN binarizer.")
@@ -1693,6 +1837,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["constant", "linear", "cosine"],
         default="cosine",
         help="Schedule for CutMix strength across epochs.",
+    )
+
+    # Normalization / dataset stats
+    parser.add_argument(
+        "--normalize",
+        choices=["auto", "none", "custom"],
+        default="auto",
+        help="Apply per-dataset normalization (auto), disable (none), or use custom mean/std (custom).",
+    )
+    parser.add_argument(
+        "--normalize-mean",
+        default=None,
+        help="Comma-separated mean values per channel when --normalize=custom (e.g., 0.4914,0.4822,0.4465).",
+    )
+    parser.add_argument(
+        "--normalize-std",
+        default=None,
+        help="Comma-separated std values per channel when --normalize=custom (e.g., 0.2470,0.2435,0.2616).",
+    )
+    parser.add_argument(
+        "--normalize-compute-batches",
+        type=int,
+        default=0,
+        help="If >0 and --normalize=auto without known defaults, compute mean/std from this many train batches.",
     )
     # Adapter learning-rate flag defined above with other KD controls.
     parser.add_argument(
@@ -2720,9 +2888,13 @@ def train_tm_model(model: nn.Module,
                    lr_cycle_steps: int = 0,
                    kd_scheduler: Optional["DistillationStageScheduler"] = None,
                    ema_model: Optional[nn.Module] = None,
+                   ema_decay_value: float = 0.0,
                    teacher_aug_loader: Optional[DataLoader] = None,
                    teacher_aug_batches: int = 0,
-                   teacher_logit_adapter: Optional[nn.Module] = None) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   teacher_logit_adapter: Optional[nn.Module] = None,
+                   ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
+                   base_self_kd_weight: float = 0.0,
+                   base_self_kd_temp: float = 1.0) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -2731,6 +2903,7 @@ def train_tm_model(model: nn.Module,
     steps_per_epoch = max(1, len(train_loader))
     warmup_steps = warmup_epochs * steps_per_epoch
     cycle_steps = max(0, lr_cycle_steps)
+    ema_ready = False
     for epoch in range(epochs):
         global_step = epoch * steps_per_epoch
         if cycle_steps > 0:
@@ -2742,18 +2915,27 @@ def train_tm_model(model: nn.Module,
         epoch_start = time.time()
         teacher_kd_weight = 0.0
         teacher_temp_epoch = 1.0
+        self_kd_weight = base_self_kd_weight
+        self_temp_epoch = base_self_kd_temp
         if kd_scheduler is not None:
             weight_schedule, temp_schedule, tau_override = kd_scheduler.compute(epoch)
             teacher_kd_weight = weight_schedule.get("teacher", 0.0)
             teacher_temp_epoch = temp_schedule.get("teacher", 1.0)
+            self_kd_weight = weight_schedule.get("self", base_self_kd_weight)
+            self_temp_epoch = temp_schedule.get("self", base_self_kd_temp)
             if tau_override is not None:
                 anneal_ste_factor(model, tau_override)
                 if ema_model is not None:
                     anneal_ste_factor(ema_model, tau_override)
+        schedule_updates = {}
+        if ctm_schedule is not None:
+            schedule_updates = _apply_ctm_schedule(model, epoch, ctm_schedule)
         running_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
         num_batches = 0
+        total_self_distill = 0.0
+        self_distill_count = 0
         for batch_idx, (x, y) in enumerate(train_loader, start=1):
             if cycle_steps > 0:
                 current_lr = cosine_with_restarts_lr(global_step, warmup_steps, base_lr, min_lr, cycle_steps)
@@ -2777,6 +2959,7 @@ def train_tm_model(model: nn.Module,
                     logits = outputs[0] if isinstance(outputs, tuple) else outputs
                     component_logits = {}
                 loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                distill_term = None
                 if collect_ctm_diag and component_logits:
                     aux_loss = 0.0
                     count_aux = 0
@@ -2786,6 +2969,14 @@ def train_tm_model(model: nn.Module,
                     if count_aux > 0:
                         aux_loss = aux_loss / count_aux
                         loss = loss + aux_weight_value * aux_loss
+                if self_kd_weight > 0.0 and ema_model is not None:
+                    with torch.no_grad():
+                        ema_out = ema_model(xb, use_ste=True)
+                        ema_logits = ema_out[0] if isinstance(ema_out, tuple) else ema_out
+                    log_student = F.log_softmax(logits / self_temp_epoch, dim=1)
+                    soft_teacher = F.softmax(ema_logits / self_temp_epoch, dim=1)
+                    distill_term = F.kl_div(log_student, soft_teacher, reduction="batchmean") * (self_temp_epoch ** 2)
+                    loss = loss + self_kd_weight * distill_term
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -2847,7 +3038,8 @@ def train_tm_model(model: nn.Module,
             epoch_acc = epoch_correct / epoch_total
             last_train_acc = epoch_acc
         if report_epoch_test:
-            epoch_test_acc, _ = evaluate_model(model, prepare_fn, test_loader, device, use_ste=use_ste_eval, collect_preds=False)
+            eval_model = ema_model if (ema_model is not None and ema_ready) else model
+            epoch_test_acc, _ = evaluate_model(eval_model, prepare_fn, test_loader, device, use_ste=use_ste_eval, collect_preds=False)
             if epoch_test_acc is not None:
                 best_test_acc = epoch_test_acc if best_test_acc is None else max(best_test_acc, epoch_test_acc)
         # Optional CTM component diagnostics
@@ -2857,11 +3049,12 @@ def train_tm_model(model: nn.Module,
             is_ctm = isinstance(model, _DeepCTMMarker)
         except Exception:
             is_ctm = False
+        eval_model = ema_model if (ema_model is not None and ema_ready) else model
         if is_ctm:
             # Test component accuracies
-            _, comp_test, _ = evaluate_ctm_components(model, test_loader, device, collect_preds=False)
+            _, comp_test, _ = evaluate_ctm_components(eval_model, test_loader, device, collect_preds=False)
             # Train component accuracies on a small sample to reduce overhead
-            _, comp_train, _ = evaluate_ctm_components(model, train_loader, device, collect_preds=False, max_batches=2)
+            _, comp_train, _ = evaluate_ctm_components(eval_model, train_loader, device, collect_preds=False, max_batches=2)
             # Merge into extras
             for name, val in comp_test.items():
                 key = f"{name}_te"
@@ -2869,6 +3062,13 @@ def train_tm_model(model: nn.Module,
             for name, val in comp_train.items():
                 key = f"{name}_tr"
                 ctm_extras[key] = float(val)
+        if schedule_updates:
+            for key, val in schedule_updates.items():
+                ctm_extras[f"sched_{key}"] = val
+        if self_distill_count > 0:
+            ctm_extras["self_kd_loss"] = total_self_distill / self_distill_count
+        if self_kd_weight > 0.0:
+            ctm_extras["self_kd_weight"] = self_kd_weight
         log_msg = format_epoch_log(
             label=label,
             epoch=epoch + 1,
@@ -2883,7 +3083,8 @@ def train_tm_model(model: nn.Module,
         )
         print("  " + log_msg)
     train_time = time.time() - start
-    test_acc, preds = evaluate_model(model, prepare_fn, test_loader, device, use_ste=use_ste_eval)
+    final_eval_model = ema_model if (ema_model is not None and ema_ready) else model
+    test_acc, preds = evaluate_model(final_eval_model, prepare_fn, test_loader, device, use_ste=use_ste_eval)
     if best_test_acc is None or test_acc > best_test_acc:
         best_test_acc = test_acc
     return last_train_acc, test_acc, train_time, preds, best_test_acc
@@ -3295,7 +3496,14 @@ def run_variant_deepctm(train_loader,
                         weight_decay: float,
                         gradient_centralize: bool,
                         label_smoothing: float,
-                        aux_weight: float = 0.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                        aux_weight: float = 0.0,
+                        mix_type: str = "none",
+                        use_stem: bool = False,
+                        stem_channels: Optional[int] = None,
+                        ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
+                        ctm_ema_decay: float = 0.0,
+                        ctm_self_distill_weight: float = 0.0,
+                        ctm_self_distill_temp: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepCTMNetwork(
         in_channels=in_channels,
         image_size=image_size,
@@ -3313,11 +3521,15 @@ def run_variant_deepctm(train_loader,
         clause_dropout=clause_dropout,
         literal_dropout=literal_dropout,
         aux_weight=aux_weight,
+        mix_type=mix_type,
+        use_stem=use_stem,
+        stem_channels=stem_channels,
         layer_cls=FuzzyPatternTM_STE,
     ).to(device)
     label = "Deep-CTM"
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    ema_model = copy.deepcopy(model) if ctm_ema_decay > 0 else None
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
         lambda t: t,
@@ -3338,6 +3550,11 @@ def run_variant_deepctm(train_loader,
         gradient_centralize=gradient_centralize,
         label_smoothing=label_smoothing,
         lr_cycle_steps=0,
+        ctm_schedule=ctm_schedule,
+        ema_model=ema_model,
+        ema_decay_value=ctm_ema_decay,
+        base_self_kd_weight=ctm_self_distill_weight,
+        base_self_kd_temp=ctm_self_distill_temp,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     total_samples = len(train_loader.dataset)
@@ -3386,7 +3603,14 @@ def run_variant_deepcstcm(train_loader,
                           weight_decay: float,
                           gradient_centralize: bool,
                           label_smoothing: float,
-                          aux_weight: float = 0.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                          aux_weight: float = 0.0,
+                          mix_type: str = "none",
+                          use_stem: bool = False,
+                          stem_channels: Optional[int] = None,
+                          ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
+                          ctm_ema_decay: float = 0.0,
+                          ctm_self_distill_weight: float = 0.0,
+                          ctm_self_distill_temp: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepCTMNetwork(
         in_channels=in_channels,
         image_size=image_size,
@@ -3404,6 +3628,9 @@ def run_variant_deepcstcm(train_loader,
         clause_dropout=clause_dropout,
         literal_dropout=literal_dropout,
         aux_weight=aux_weight,
+        mix_type=mix_type,
+        use_stem=use_stem,
+        stem_channels=stem_channels,
         layer_cls=FuzzyPatternTM_STCM,
         stcm_operator=stcm_operator,
         stcm_ternary_voting=stcm_ternary_voting,
@@ -3413,6 +3640,7 @@ def run_variant_deepcstcm(train_loader,
     label = "Deep-CSTCM"
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    ema_model = copy.deepcopy(model) if ctm_ema_decay > 0 else None
     train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
         model,
         lambda t: t,
@@ -3433,6 +3661,11 @@ def run_variant_deepcstcm(train_loader,
         gradient_centralize=gradient_centralize,
         label_smoothing=label_smoothing,
         lr_cycle_steps=0,
+        ctm_schedule=ctm_schedule,
+        ema_model=ema_model,
+        ema_decay_value=ctm_ema_decay,
+        base_self_kd_weight=ctm_self_distill_weight,
+        base_self_kd_temp=ctm_self_distill_temp,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     total_samples = len(train_loader.dataset)
@@ -4126,10 +4359,14 @@ def run_variant_transformer(train_loader,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(opt)
             scaler.update()
+            if distill_term is not None:
+                total_self_distill += distill_term.detach().item()
+                self_distill_count += 1
             if ema_model is not None:
                 with torch.no_grad():
                     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-                        ema_param.data.mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
+                        ema_param.data.mul_(ema_decay_value).add_(param.data, alpha=1 - ema_decay_value)
+                ema_ready = True
             running_loss += loss.item()
             num_batches += 1
             if distill_term is not None:
@@ -4623,13 +4860,42 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
         base_train_transform = dataset_cfg.get("train_transform", dataset_cfg.get("transform"))
         base_test_transform = dataset_cfg.get("test_transform", dataset_cfg.get("transform"))
         resize_target = target_size if tuple(dataset_cfg["image_size"]) != target_size else None
+        # Resolve normalization per dataset
+        normalize_choice = (args.normalize or "auto").lower()
+        add_norm: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]] = None
+        if normalize_choice == "custom":
+            mean = _parse_csv_floats(args.normalize_mean)
+            std = _parse_csv_floats(args.normalize_std)
+            if not mean or not std:
+                raise ValueError("Custom normalization requires --normalize-mean and --normalize-std (comma-separated).")
+            add_norm = (mean, std)
+        elif normalize_choice == "auto":
+            add_norm = _known_dataset_norm(dataset_key)
+            if add_norm is None and args.normalize_compute_batches > 0:
+                # Compute stats using a temporary DataLoader on the raw ToTensor pipeline
+                temp_transform = _build_transform(base_train_transform, target_size=resize_target, apply_randaugment=False, randaugment_n=args.randaugment_n, randaugment_m=args.randaugment_m, add_normalize=None)
+                temp_train_ds = dataset_cfg["train_class"](
+                    root=args.dataset_root,
+                    train=True,
+                    download=args.download,
+                    transform=temp_transform,
+                )
+                temp_loader = DataLoader(
+                    temp_train_ds,
+                    batch_size=min(256, args.batch_size),
+                    shuffle=True,
+                    num_workers=args.num_workers,
+                    pin_memory=pin_memory,
+                    persistent_workers=persistent_workers,
+                )
+                add_norm = _compute_dataset_stats(temp_loader, args.normalize_compute_batches)
         train_transform = _build_transform(
             base_train_transform,
             target_size=resize_target,
             apply_randaugment=args.randaugment,
             randaugment_n=args.randaugment_n,
             randaugment_m=args.randaugment_m,
-            add_normalize=None,
+            add_normalize=add_norm,
         )
         test_transform = _build_transform(
             base_test_transform,
@@ -4637,7 +4903,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             apply_randaugment=False,
             randaugment_n=args.randaugment_n,
             randaugment_m=args.randaugment_m,
-            add_normalize=None,
+            add_normalize=add_norm,
         )
         test_normalize_stats = _extract_normalize(test_transform)
 
@@ -5060,6 +5326,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     dc_clauses = parse_int_list(args.deepctm_clauses) if args.deepctm_clauses else [128, 128, 256]
                     dc_head = args.deepctm_head_clauses if args.deepctm_head_clauses is not None else 512
                 core_hidden = parse_int_list(args.deepctm_core_hidden_dims) if args.deepctm_core_hidden_dims else None
+                ctm_schedule_cfg = _build_ctm_schedule_config(args, is_stcm=False)
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deepctm(
                     train_loader,
                     test_loader,
@@ -5084,6 +5351,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     clause_dropout=args.tm_clause_dropout,
                     literal_dropout=args.tm_literal_dropout,
                     aux_weight=args.deepctm_aux_weight,
+                    use_stem=args.deepctm_stem,
+                    stem_channels=args.deepctm_stem_channels,
+                    mix_type=args.deepctm_mix,
+                    ctm_schedule=ctm_schedule_cfg,
+                    ctm_ema_decay=args.ctm_ema_decay,
+                    ctm_self_distill_weight=args.ctm_self_distill_weight,
+                    ctm_self_distill_temp=args.ctm_self_distill_temp,
                     base_lr=deeptm_base_lr,
                     min_lr=deeptm_min_lr,
                     warmup_epochs=warmup_epochs,
@@ -5112,6 +5386,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                 stcm_min_lr = deeptm_min_lr
                 if args.min_lr is None:
                     stcm_min_lr = deeptm_base_lr * 0.1
+                ctm_schedule_cfg = _build_ctm_schedule_config(args, is_stcm=True)
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deepcstcm(
                     train_loader,
                     test_loader,
@@ -5140,6 +5415,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     stcm_ternary_band=args.stcm_ternary_band,
                     stcm_ste_temperature=args.stcm_ste_temperature,
                     aux_weight=args.deepctm_aux_weight,
+                    use_stem=args.deepctm_stem,
+                    stem_channels=args.deepctm_stem_channels,
+                    mix_type=args.deepctm_mix,
+                    ctm_schedule=ctm_schedule_cfg,
+                    ctm_ema_decay=args.ctm_ema_decay,
+                    ctm_self_distill_weight=args.ctm_self_distill_weight,
+                    ctm_self_distill_temp=args.ctm_self_distill_temp,
                     base_lr=deeptm_base_lr,
                     min_lr=stcm_min_lr,
                     warmup_epochs=warmup_epochs,
