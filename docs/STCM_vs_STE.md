@@ -12,6 +12,21 @@ Balanced-ternary Setun Tsetlin Machines (STCM) collapse the positive/negative li
 | Voting head | Dense floating-point matrix only | Optional ternary voting with STE (`--stcm-ternary-voting`) | Hardware-friendly exports without retraining |
 | Deep integration | `DeepTMNetwork` stacks STE clauses only | `DeepTMNetwork` now accepts `layer_cls=FuzzyPatternTM_STCM` and extra kwargs (operator, ternary band, temperature) [[python/fptm_ste/deep_tm.py]] | Deep-STCM reuses the same ternary semantics in every layer |
 
+## New in this iteration – ternary operator suite
+
+The STCM implementation now exposes a pluggable operator registry via
+`fptm_ste/operators.py` and `fptm_ste/tm_integrated.py`. In addition to the
+original capacity/product modes you can set `operator` to:
+
+- `tqand`: quantum-normalized ternary AND (`TernaryQuantumAND`)
+- `txor`: ternary XOR that highlights disagreement between literal groups
+- `tmaj`: balanced ternary majority gate leveraging median aggregation
+
+All operators share the same STE-friendly gradients and can be selected from the
+CLI using `--stcm-operator`. Unit tests (`python/tests/test_operators.py`) cover
+their mathematical definitions, while `python/tests/test_stcm_e2e.py` validates
+that each option learns synthetic classification tasks without accuracy loss.
+
 ## Empirical Comparison (MNIST, 10 epochs, conv features, batch 256)
 
 | Model | Test Accuracy | Train Accuracy | Notes |

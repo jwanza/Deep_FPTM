@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 try:
     import timm
 except ImportError:  # pragma: no cover - timm is an optional dependency
     timm = None
 
-from .tm import FuzzyPatternTM_STE
+from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM
 from .binarizers import SwinDualBinarizer, CNNSingleBinarizer
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
 from .tm_positional import RelativePositionBias2D, RotaryEmbedding, apply_rotary_pos_emb
@@ -618,7 +618,9 @@ class MultiScaleTMEnsemble(nn.Module):
                  use_learnable_scale_attention: bool = False,
                  scale_attention_hidden: int = 128,
                  use_anti_collapse_gate: bool = False,
-                 gate_entropy_weight: float = 0.01):
+                 gate_entropy_weight: float = 0.01,
+                 tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+                 tm_kwargs: Optional[Dict[str, Any]] = None):
         """
         head_configs: list of dicts, each like:
           { "stages": [0,1], "n_clauses": 200, "binarizer": "auto", "thresholds": 16, "pool": "gap" }
@@ -627,6 +629,15 @@ class MultiScaleTMEnsemble(nn.Module):
         self.feature_dims = feature_dims
         self.n_classes = n_classes
         self.backbone_type = backbone_type
+        if tm_kwargs is None:
+            tm_kwargs = {}
+        self.tm_cls = tm_cls
+        if isinstance(self.tm_cls, str):
+             if self.tm_cls == "FuzzyPatternTM_STCM":
+                 self.tm_cls = FuzzyPatternTM_STCM
+             else:
+                 self.tm_cls = FuzzyPatternTM_STE
+        self.tm_kwargs = tm_kwargs
         self.heads = nn.ModuleList()
         self.gate = nn.Parameter(torch.ones(len(head_configs)) / max(1, len(head_configs)))
         self.stage_resolutions = list(stage_resolutions) if stage_resolutions is not None else None
@@ -711,7 +722,7 @@ class MultiScaleTMEnsemble(nn.Module):
                 nn.Sigmoid()
             )
 
-            tm = FuzzyPatternTM_STE(max(16, fused_dim // 4), n_clauses, n_classes, tau=0.5)
+            tm = self.tm_cls(max(16, fused_dim // 4), n_clauses, n_classes, tau=0.5, **self.tm_kwargs)
             head = nn.Module()
             head.stages = adapters
             head.projector = projector
@@ -837,6 +848,8 @@ class SwinTMStageConfig:
     tau: float = 0.5
     clause_pool: str = "mean"
     drop_path_schedule: Optional[Tuple[float, ...]] = None
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE
+    tm_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 def build_swin_stage_configs(
@@ -850,7 +863,11 @@ def build_swin_stage_configs(
     dropout: float = 0.0,
     drop_path: float = 0.0,
     clause_pool: str = "mean",
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+    tm_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[SwinTMStageConfig, ...]:
+    if tm_kwargs is None:
+        tm_kwargs = {}
     preset = preset.lower()
     if preset not in {"tiny", "small", "base", "large"}:
         raise ValueError(f"Unknown Swin TM preset '{preset}'")
@@ -898,6 +915,8 @@ def build_swin_stage_configs(
                 tau=tau,
                 clause_pool=clause_pool,
                 drop_path_schedule=stage_rates,
+                tm_cls=tm_cls,
+                tm_kwargs=tm_kwargs,
             )
         )
     return tuple(configs)
@@ -943,13 +962,24 @@ class WindowTMFeedForward(nn.Module):
         tau: float,
         dropout: float,
         clause_pool: str,
+        tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+        tm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.window_size = window_size
         self.norm = nn.LayerNorm(embed_dim)
         in_dim = window_size * window_size * embed_dim
         self.pre_tm = nn.Sequential(nn.Linear(in_dim, tm_hidden_dim), nn.Sigmoid())
-        self.tm = FuzzyPatternTM_STE(tm_hidden_dim, tm_clauses, embed_dim, tau=tau)
+        
+        if isinstance(tm_cls, str):
+            # Simple resolution if passed as string
+            if tm_cls == "FuzzyPatternTM_STCM":
+                tm_cls = FuzzyPatternTM_STCM
+            else:
+                tm_cls = FuzzyPatternTM_STE
+        
+        kwargs = tm_kwargs or {}
+        self.tm = tm_cls(tm_hidden_dim, tm_clauses, embed_dim, tau=tau, **kwargs)
         self.post_tm = nn.Sequential(nn.Linear(embed_dim, in_dim), nn.Sigmoid())
         self.dropout = nn.Dropout(dropout)
         self.gate = nn.Parameter(torch.tensor(0.5))
@@ -993,6 +1023,8 @@ class SwinTMBlock(nn.Module):
             tau=config.tau,
             dropout=config.dropout,
             clause_pool=config.clause_pool,
+            tm_cls=config.tm_cls,
+            tm_kwargs=config.tm_kwargs,
         )
         self.drop_path2 = DropPath(config.drop_path)
 
@@ -1062,13 +1094,22 @@ class SwinTMStage(nn.Module):
                 drop_path=schedule[i],
                 tau=config.tau,
                 clause_pool=config.clause_pool,
+                tm_cls=config.tm_cls,
+                tm_kwargs=config.tm_kwargs,
             )
             blocks.append(SwinTMBlock(block_cfg))
         self.blocks = nn.ModuleList(blocks)
         self.patch_merge = PatchMerging(config.embed_dim, config.embed_dim * 2) if downsample else None
         self.head_norm = nn.LayerNorm(config.embed_dim)
         self.head_proj = nn.Sequential(nn.Linear(config.embed_dim, config.tm_hidden_dim), nn.Sigmoid())
-        self.head_tm = FuzzyPatternTM_STE(config.tm_hidden_dim, config.head_clauses, num_classes, tau=config.tau)
+        
+        tm_cls = config.tm_cls
+        if isinstance(tm_cls, str):
+             if tm_cls == "FuzzyPatternTM_STCM":
+                 tm_cls = FuzzyPatternTM_STCM
+             else:
+                 tm_cls = FuzzyPatternTM_STE
+        self.head_tm = tm_cls(config.tm_hidden_dim, config.head_clauses, num_classes, tau=config.tau, **config.tm_kwargs)
 
     def forward(self, x: torch.Tensor, H: int, W: int, *, use_ste: bool = True,
                 collect_diagnostics: bool = False,
@@ -1105,14 +1146,23 @@ class SwinTM(nn.Module):
         num_classes: int = 10,
         in_channels: int = 3,
         image_size: Tuple[int, int] = (224, 224),
+        patch_size: int = 4,
+        tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+        tm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
+        if tm_kwargs is None:
+            tm_kwargs = {}
         if stage_configs is None:
-            stage_configs = build_swin_stage_configs(preset)
+            stage_configs = build_swin_stage_configs(
+                preset, 
+                tm_cls=tm_cls, 
+                tm_kwargs=tm_kwargs
+            )
         self.stage_configs = tuple(stage_configs)
         self.num_classes = num_classes
         self.image_size = image_size
-        self.patch_embed = nn.Conv2d(in_channels, self.stage_configs[0].embed_dim, kernel_size=4, stride=4)
+        self.patch_embed = nn.Conv2d(in_channels, self.stage_configs[0].embed_dim, kernel_size=patch_size, stride=patch_size)
         stages = []
         for idx, cfg in enumerate(self.stage_configs):
             downsample = idx < len(self.stage_configs) - 1
@@ -1121,11 +1171,19 @@ class SwinTM(nn.Module):
         final_dim = self.stage_configs[-1].embed_dim
         self.final_norm = nn.LayerNorm(final_dim)
         self.final_proj = nn.Sequential(nn.Linear(final_dim, self.stage_configs[-1].tm_hidden_dim), nn.Sigmoid())
-        self.final_tm = FuzzyPatternTM_STE(
+        
+        if isinstance(tm_cls, str):
+             if tm_cls == "FuzzyPatternTM_STCM":
+                 tm_cls = FuzzyPatternTM_STCM
+             else:
+                 tm_cls = FuzzyPatternTM_STE
+        
+        self.final_tm = tm_cls(
             self.stage_configs[-1].tm_hidden_dim,
             self.stage_configs[-1].head_clauses,
             num_classes,
             tau=self.stage_configs[-1].tau,
+            **tm_kwargs
         )
         self.last_stage_logits: List[torch.Tensor] = []
         self.last_clause_summaries: List[List[torch.Tensor]] = []

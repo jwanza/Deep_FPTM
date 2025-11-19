@@ -6,11 +6,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .tm import FuzzyPatternTM_STE
+from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM
 from .deep_tm import DeepTMNetwork
 from .swin_tm import DropPath, WindowAttention, InstrumentedMultiheadAttention
 from .tm_positional import RelativePositionBias2D, RotaryEmbedding
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
+
+
+class ClauseSelfAttention(nn.Module):
+    """
+    Allows active clauses to attend to each other across the sequence (token) dimension
+    before voting, effectively adding global context to the otherwise local TM logic.
+    """
+    def __init__(self, n_clauses: int):
+        super().__init__()
+        self.n_clauses = n_clauses
+        self.scale = n_clauses ** -0.5
+        # Optional: learnable scaling or projection? 
+        # For now, parameter-free dot-product attention on scalar activations.
+
+    def forward(self, clauses: torch.Tensor) -> torch.Tensor:
+        # clauses: [B, T, C]
+        # Attention scores: [B, T, C] @ [B, C, T] -> [B, T, T]
+        scores = torch.matmul(clauses, clauses.transpose(-2, -1)) * self.scale
+        attn = torch.softmax(scores, dim=-1)
+        
+        # Refined: [B, T, T] @ [B, T, C] -> [B, T, C]
+        refined = torch.matmul(attn, clauses)
+        return clauses + refined
 
 
 def _to_sequence(value: Union[int, float, Sequence[Union[int, float]]], length: int) -> Tuple[Union[int, float], ...]:
@@ -124,11 +147,15 @@ class TMFeedForward(nn.Module):
         tau_max: float = 0.95,
         tau_ema_beta: Optional[float] = None,
         clause_attention: bool = False,
+        clause_attention_type: str = "none",
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
         use_flash_attention: bool = False,
         use_residual_attention: bool = False,
+        tm_operator: str = "capacity",
+        ternary_voting: bool = False,
+        ternary_band: float = 0.1,
     ) -> None:
         super().__init__()
         self.backend = backend.lower()
@@ -143,6 +170,9 @@ class TMFeedForward(nn.Module):
         self.tau_max = tau_max
         self.tau_ema_beta = tau_ema_beta
         self.clause_attention = clause_attention
+        self.clause_attention_type = clause_attention_type.lower()
+        if self.clause_attention and self.clause_attention_type == "none":
+             self.clause_attention_type = "proj" # Backwards compatibility
         self.clause_routing = clause_routing
         self.continuous_bypass = continuous_bypass
         self.norm = build_norm(norm_type, dim)
@@ -179,8 +209,11 @@ class TMFeedForward(nn.Module):
             self.register_buffer("tau_ema", torch.tensor(tm_tau))
         else:
             self.register_buffer("tau_ema", None)
+        
         self.clause_attn_proj: Optional[nn.Module] = None
-        if self.clause_attention:
+        self.clause_self_attn: Optional[nn.Module] = None
+        
+        if self.clause_attention_type == "proj":
             self.clause_attn_proj = nn.Sequential(
                 nn.LayerNorm(n_clauses),
                 nn.Linear(n_clauses, hidden_dim),
@@ -190,6 +223,9 @@ class TMFeedForward(nn.Module):
             for layer in self.clause_attn_proj:
                 if isinstance(layer, nn.Linear):
                     _init_linear(layer)
+        elif self.clause_attention_type == "self":
+            self.clause_self_attn = ClauseSelfAttention(n_clauses)
+
         self.clause_gate: Optional[nn.Module] = None
         if self.clause_routing:
             self.clause_gate = nn.Sequential(
@@ -225,6 +261,19 @@ class TMFeedForward(nn.Module):
                 literal_dropout=literal_dropout,
                 clause_bias_init=clause_bias_init,
             )
+        elif self.backend == "stcm":
+            self.core = FuzzyPatternTM_STCM(
+                hidden_dim,
+                n_clauses,
+                dim,
+                tau=tm_tau,
+                clause_dropout=clause_dropout,
+                literal_dropout=literal_dropout,
+                clause_bias_init=clause_bias_init,
+                operator=tm_operator,
+                ternary_voting=ternary_voting,
+                ternary_band=ternary_band,
+            )
         elif self.backend in {"deep", "deeptm"}:
             self.core = DeepTMNetwork(
                 input_dim=hidden_dim,
@@ -240,6 +289,25 @@ class TMFeedForward(nn.Module):
                 literal_dropout=literal_dropout,
                 clause_bias_init=clause_bias_init,
             )
+        elif self.backend == "deep_stcm":
+             self.core = DeepTMNetwork(
+                input_dim=hidden_dim,
+                hidden_dims=[hidden_dim],
+                n_classes=dim,
+                n_clauses=n_clauses,
+                dropout=dropout,
+                tau=tm_tau,
+                input_shape=None,
+                auto_expand_grayscale=False,
+                allow_channel_reduce=False,
+                clause_dropout=clause_dropout,
+                literal_dropout=literal_dropout,
+                clause_bias_init=clause_bias_init,
+                layer_cls=FuzzyPatternTM_STCM,
+                layer_operator=tm_operator,
+                layer_ternary_voting=ternary_voting,
+                layer_extra_kwargs={"ternary_band": ternary_band},
+             )
         else:
             raise ValueError(f"Unsupported TM backend '{backend}'.")
         self.gate_core: Optional[nn.Module] = None
@@ -346,6 +414,36 @@ class TMFeedForward(nn.Module):
         self.last_clause_outputs = reshaped_clauses.detach()
         self.last_clause_outputs_raw = reshaped_clauses
         logits = logits.view(B, T, C)
+
+        if self.clause_self_attn is not None:
+            # [B, T, n_clauses]
+            refined = self.clause_self_attn(reshaped_clauses)
+            self.last_clause_outputs = refined.detach()
+            
+            # Recalculate logits with refined clauses
+            refined_flat = refined.view(B * T, -1)
+            
+            # Resolve voting weights and bias from core or deep core classifier
+            voting_weight = None
+            clause_bias = None
+            target_module = self.core
+            if hasattr(target_module, "classifier"):
+                target_module = target_module.classifier
+            
+            if hasattr(target_module, "_voting_matrix"):
+                voting_weight = target_module._voting_matrix(use_ste)
+            elif hasattr(target_module, "voting") and target_module.voting is not None:
+                voting_weight = target_module.voting
+            
+            if hasattr(target_module, "clause_bias"):
+                clause_bias = target_module.clause_bias
+
+            if voting_weight is not None:
+                if clause_bias is not None:
+                    refined_flat = refined_flat + clause_bias.view(1, -1)
+                logits = refined_flat @ voting_weight
+                logits = logits.view(B, T, C)
+
         if self.clause_attn_proj is not None:
             clause_ctx = self.clause_attn_proj(clause_outputs).view(B, T, C)
             logits = logits + clause_ctx
@@ -394,6 +492,7 @@ class TMEncoderBlock(nn.Module):
         tau_max: float = 0.95,
         tau_ema_beta: Optional[float] = None,
         clause_attention: bool = False,
+        clause_attention_type: str = "none",
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
@@ -402,6 +501,9 @@ class TMEncoderBlock(nn.Module):
         grid_size: Optional[Tuple[int, int]] = None,
         include_cls_token: bool = False,
         relative_position_type: str = "none",
+        tm_operator: str = "capacity",
+        ternary_voting: bool = False,
+        ternary_band: float = 0.1,
     ) -> None:
         super().__init__()
         self.norm1 = build_norm(norm_type, dim)
@@ -449,9 +551,13 @@ class TMEncoderBlock(nn.Module):
             tau_max=tau_max,
             tau_ema_beta=tau_ema_beta,
             clause_attention=clause_attention,
+            clause_attention_type=clause_attention_type,
             clause_routing=clause_routing,
             continuous_bypass=continuous_bypass,
             bypass_scale=bypass_scale,
+            tm_operator=tm_operator,
+            ternary_voting=ternary_voting,
+            ternary_band=ternary_band,
         )
         self.norm2 = build_norm(norm_type, dim)
         self.num_heads = num_heads
@@ -526,12 +632,16 @@ class TMSwinBlock(nn.Module):
         tau_max: float = 0.95,
         tau_ema_beta: Optional[float] = None,
         clause_attention: bool = False,
+        clause_attention_type: str = "none",
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
         use_flash_attention: bool = False,
         use_residual_attention: bool = False,
         relative_position_type: str = "none",
+        tm_operator: str = "capacity",
+        ternary_voting: bool = False,
+        ternary_band: float = 0.1,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -579,9 +689,13 @@ class TMSwinBlock(nn.Module):
             tau_max=tau_max,
             tau_ema_beta=tau_ema_beta,
             clause_attention=clause_attention,
+            clause_attention_type=clause_attention_type,
             clause_routing=clause_routing,
             continuous_bypass=continuous_bypass,
             bypass_scale=bypass_scale,
+            tm_operator=tm_operator,
+            ternary_voting=ternary_voting,
+            ternary_band=ternary_band,
         )
         self.norm2 = build_norm(norm_type, dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
@@ -689,12 +803,16 @@ class TMSwinStage(nn.Module):
         tau_max: float = 0.95,
         tau_ema_beta: Optional[float] = None,
         clause_attention: bool = False,
+        clause_attention_type: str = "none",
         clause_routing: bool = False,
         continuous_bypass: bool = False,
         bypass_scale: float = 1.0,
         use_flash_attention: bool = False,
         use_residual_attention: bool = False,
         relative_position_type: str = "none",
+        tm_operator: str = "capacity",
+        ternary_voting: bool = False,
+        ternary_band: float = 0.1,
     ) -> None:
         super().__init__()
         blocks = []
@@ -729,12 +847,16 @@ class TMSwinStage(nn.Module):
                     tau_max=tau_max,
                     tau_ema_beta=tau_ema_beta,
                     clause_attention=clause_attention,
+                    clause_attention_type=clause_attention_type,
                     clause_routing=clause_routing,
                     continuous_bypass=continuous_bypass,
                     bypass_scale=bypass_scale,
                     use_flash_attention=use_flash_attention,
                     use_residual_attention=use_residual_attention,
                     relative_position_type=relative_position_type,
+                    tm_operator=tm_operator,
+                    ternary_voting=ternary_voting,
+                    ternary_band=ternary_band,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -827,6 +949,9 @@ class UnifiedTMTransformer(nn.Module):
         use_flash_attention: bool = False,
         use_residual_attention: bool = False,
         relative_position_type: str = "none",
+        tm_operator: str = "capacity",
+        ternary_voting: bool = False,
+        ternary_band: float = 0.1,
     ) -> None:
         super().__init__()
         self.architecture = architecture.lower()
@@ -1003,6 +1128,9 @@ class UnifiedTMTransformer(nn.Module):
                     use_flash_attention=self.use_flash_attention,
                     use_residual_attention=self.use_residual_attention,
                     relative_position_type=self.relative_position_type,
+                    tm_operator=tm_operator,
+                    ternary_voting=ternary_voting,
+                    ternary_band=ternary_band,
                 )
                 stages.append(stage)
                 dp_offset += depth

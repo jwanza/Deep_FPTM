@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .tm import FuzzyPatternTM_STE
+from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM
 
 
 def conv3x3(in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv2d:
@@ -26,6 +26,8 @@ class ResNetTMConfig:
     tm_clauses: int = 128
     tau: float = 0.5
     tau_schedule: Optional[Sequence[float]] = None
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE
+    tm_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 class BasicTMBlock(nn.Module):
@@ -40,6 +42,8 @@ class BasicTMBlock(nn.Module):
         tm_clauses: int,
         tau: float,
         downsample: Optional[nn.Module] = None,
+        tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+        tm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.conv1 = conv3x3(in_channels, out_channels, stride)
@@ -48,7 +52,15 @@ class BasicTMBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.downsample = downsample
         self.pre_tm = nn.Sequential(nn.Linear(out_channels, tm_hidden), nn.Sigmoid())
-        self.tm = FuzzyPatternTM_STE(tm_hidden, tm_clauses, out_channels, tau=tau)
+
+        if isinstance(tm_cls, str):
+             if tm_cls == "FuzzyPatternTM_STCM":
+                 tm_cls = FuzzyPatternTM_STCM
+             else:
+                 tm_cls = FuzzyPatternTM_STE
+        
+        kwargs = tm_kwargs or {}
+        self.tm = tm_cls(tm_hidden, tm_clauses, out_channels, tau=tau, **kwargs)
         self.post_tm = nn.Sequential(nn.Linear(out_channels, out_channels), nn.Sigmoid())
 
     def forward(self, x: torch.Tensor, *, use_ste: bool = True) -> torch.Tensor:
@@ -82,6 +94,8 @@ class BottleneckTMBlock(nn.Module):
         tm_clauses: int,
         tau: float,
         downsample: Optional[nn.Module] = None,
+        tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+        tm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         width = out_channels
@@ -93,7 +107,15 @@ class BottleneckTMBlock(nn.Module):
         self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
         self.downsample = downsample
         self.pre_tm = nn.Sequential(nn.Linear(out_channels * self.expansion, tm_hidden), nn.Sigmoid())
-        self.tm = FuzzyPatternTM_STE(tm_hidden, tm_clauses, out_channels * self.expansion, tau=tau)
+
+        if isinstance(tm_cls, str):
+             if tm_cls == "FuzzyPatternTM_STCM":
+                 tm_cls = FuzzyPatternTM_STCM
+             else:
+                 tm_cls = FuzzyPatternTM_STE
+        
+        kwargs = tm_kwargs or {}
+        self.tm = tm_cls(tm_hidden, tm_clauses, out_channels * self.expansion, tau=tau, **kwargs)
         self.post_tm = nn.Sequential(
             nn.Linear(out_channels * self.expansion, out_channels * self.expansion),
             nn.Sigmoid(),
@@ -154,12 +176,22 @@ class ResNetTM(nn.Module):
         self.stage_proj = nn.ModuleList(
             nn.Sequential(nn.Linear(dim, config.tm_hidden), nn.Sigmoid()) for dim in self.stage_dims
         )
+        
+        tm_cls = config.tm_cls
+        if isinstance(tm_cls, str):
+             if tm_cls == "FuzzyPatternTM_STCM":
+                 tm_cls = FuzzyPatternTM_STCM
+             else:
+                 tm_cls = FuzzyPatternTM_STE
+        
+        tm_kwargs = config.tm_kwargs or {}
+
         self.stage_heads = nn.ModuleList(
-            FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=tau)
+            tm_cls(config.tm_hidden, config.tm_clauses, num_classes, tau=tau, **tm_kwargs)
             for tau in self.stage_taus
         )
         self.final_proj = nn.Sequential(nn.Linear(self.stage_dims[-1], config.tm_hidden), nn.Sigmoid())
-        self.final_tm = FuzzyPatternTM_STE(config.tm_hidden, config.tm_clauses, num_classes, tau=self.final_tau)
+        self.final_tm = tm_cls(config.tm_hidden, config.tm_clauses, num_classes, tau=self.final_tau, **tm_kwargs)
         self.last_stage_logits: List[torch.Tensor] = []
         self.last_stage_clauses: List[torch.Tensor] = []
         self._reset_parameters()
@@ -226,11 +258,14 @@ class ResNetTM(nn.Module):
                 config.tm_clauses,
                 tau,
                 downsample,
+                tm_cls=config.tm_cls,
+                tm_kwargs=config.tm_kwargs,
             )
         )
         self.in_channels = out_channels
         for _ in range(1, blocks):
-            layers.append(block(self.in_channels, planes, 1, config.tm_hidden, config.tm_clauses, tau))
+            layers.append(block(self.in_channels, planes, 1, config.tm_hidden, config.tm_clauses, tau, 
+                                tm_cls=config.tm_cls, tm_kwargs=config.tm_kwargs))
         return nn.Sequential(*layers), out_channels
 
     def forward(self, x: torch.Tensor, *, use_ste: bool = True):
@@ -263,6 +298,8 @@ def resnet_tm18(
     tau: float = 0.5,
     tau_schedule: Optional[Sequence[float]] = None,
     input_norm: Optional[str] = None,
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+    tm_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ResNetTM:
     config = ResNetTMConfig(
         layers=(2, 2, 2, 2),
@@ -271,6 +308,8 @@ def resnet_tm18(
         tm_clauses=tm_clauses,
         tau=tau,
         tau_schedule=tau_schedule,
+        tm_cls=tm_cls,
+        tm_kwargs=tm_kwargs or {},
     )
     return ResNetTM(
         config,
@@ -290,6 +329,8 @@ def resnet_tm34(
     tau: float = 0.5,
     tau_schedule: Optional[Sequence[float]] = None,
     input_norm: Optional[str] = None,
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+    tm_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ResNetTM:
     config = ResNetTMConfig(
         layers=(3, 4, 6, 3),
@@ -298,6 +339,8 @@ def resnet_tm34(
         tm_clauses=tm_clauses,
         tau=tau,
         tau_schedule=tau_schedule,
+        tm_cls=tm_cls,
+        tm_kwargs=tm_kwargs or {},
     )
     return ResNetTM(
         config,
@@ -317,6 +360,8 @@ def resnet_tm50(
     tau: float = 0.5,
     tau_schedule: Optional[Sequence[float]] = None,
     input_norm: Optional[str] = None,
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+    tm_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ResNetTM:
     config = ResNetTMConfig(
         layers=(3, 4, 6, 3),
@@ -325,6 +370,8 @@ def resnet_tm50(
         tm_clauses=tm_clauses,
         tau=tau,
         tau_schedule=tau_schedule,
+        tm_cls=tm_cls,
+        tm_kwargs=tm_kwargs or {},
     )
     return ResNetTM(
         config,
@@ -344,6 +391,8 @@ def resnet_tm101(
     tau: float = 0.5,
     tau_schedule: Optional[Sequence[float]] = None,
     input_norm: Optional[str] = None,
+    tm_cls: Union[Type[nn.Module], str] = FuzzyPatternTM_STE,
+    tm_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ResNetTM:
     config = ResNetTMConfig(
         layers=(3, 4, 23, 3),
@@ -352,6 +401,8 @@ def resnet_tm101(
         tm_clauses=tm_clauses,
         tau=tau,
         tau_schedule=tau_schedule,
+        tm_cls=tm_cls,
+        tm_kwargs=tm_kwargs or {},
     )
     return ResNetTM(
         config,

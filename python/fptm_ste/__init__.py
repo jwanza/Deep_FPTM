@@ -4,6 +4,8 @@ from .tm import (
     FuzzyPatternTM_STCM,
     prepare_tm_input,
 )
+from .tm_integrated import IntegratedSTCM, build_stcm
+from .operators import available_ternary_operators
 from .deep_tm import DeepTMNetwork
 from .swin_tm import (
     SwinTM,

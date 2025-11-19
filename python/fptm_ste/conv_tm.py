@@ -346,3 +346,105 @@ class ConvSTCM2d(ConvTM2d):
         )
 
 
+
+
+class ConvTM2dOptimized(ConvTM2d):
+    """
+    Optimized Convolutional TM that uses F.conv2d instead of Unfold+MatMul.
+    Significantly faster and more memory efficient for STE/STCM backends.
+    """
+
+    def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
+        # Fallback for deep backends or unsupported cores
+        if self.core_backend not in {"tm", "stcm"} or not hasattr(self.core, "get_masks"):
+            return super().forward(x, use_ste=use_ste)
+
+        # Retrieve masks from core
+        masks = self.core.get_masks(use_ste=use_ste)
+        
+        C_in = self.in_channels
+        K_h, K_w = self.kernel_size
+        
+        # Helper to reshape [Half, Features] -> [Half, C_in, K_h, K_w]
+        def reshape_mask(m):
+            # n_features = C_in * K_h * K_w
+            return m.view(-1, C_in, K_h, K_w)
+
+        clause_outputs = None
+
+        if isinstance(self.core, FuzzyPatternTM_STE):
+            p_pos, p_neg, p_pos_inv, p_neg_inv = [reshape_mask(m) for m in masks]
+            
+            # Score = scale * (conv(x, inv - pos) + sum(pos))
+            scale = 4.0 / self.core.n_features
+            
+            # Positive Bank
+            w_pos = p_pos_inv - p_pos
+            b_pos = p_pos.sum(dim=(1, 2, 3))
+            conv_pos = F.conv2d(x, w_pos, bias=b_pos, stride=self.stride, padding=self.padding, dilation=self.dilation)
+            pos_score = scale * conv_pos
+            pos_prod = torch.exp(-torch.clamp(pos_score, min=0.0, max=10.0))
+            
+            # Negative Bank
+            w_neg = p_neg_inv - p_neg
+            b_neg = p_neg.sum(dim=(1, 2, 3))
+            conv_neg = F.conv2d(x, w_neg, bias=b_neg, stride=self.stride, padding=self.padding, dilation=self.dilation)
+            neg_score = scale * conv_neg
+            neg_prod = torch.exp(-torch.clamp(neg_score, min=0.0, max=10.0))
+            
+            clause_outputs = torch.cat([pos_prod, neg_prod], dim=1)
+
+        elif isinstance(self.core, FuzzyPatternTM_STCM):
+            pos_pos_flat, neg_pos_flat, pos_inv_flat, neg_inv_flat = masks
+            
+            def compute_strength(m_pos_flat, m_inv_flat):
+                # Capacity constraint is calculated on flat vectors
+                capacity = self.core._clause_capacity(m_pos_flat, m_inv_flat).squeeze(0) # [Half]
+                
+                m_pos = reshape_mask(m_pos_flat)
+                m_inv = reshape_mask(m_inv_flat)
+                
+                # mismatch = conv(x, mask_inv - mask_pos) + sum(mask_pos)
+                w = m_inv - m_pos
+                b = m_pos.sum(dim=(1, 2, 3))
+                
+                mismatch = F.conv2d(x, w, bias=b, stride=self.stride, padding=self.padding, dilation=self.dilation)
+                
+                if self.core.operator == "capacity":
+                    # raw = capacity - mismatch
+                    raw = capacity.view(1, -1, 1, 1) - mismatch
+                    return self.core._straight_relu(raw)
+                elif self.core.operator == "product":
+                     scaled = torch.clamp(mismatch * self.core.product_scale, min=0.0, max=10.0)
+                     return torch.exp(-scaled)
+                else:
+                    raw = capacity.view(1, -1, 1, 1) - mismatch
+                    return self.core._straight_relu(raw)
+
+            pos_strength = compute_strength(pos_pos_flat, pos_inv_flat)
+            neg_strength = compute_strength(neg_pos_flat, neg_inv_flat)
+            
+            clause_outputs = torch.cat([pos_strength, -neg_strength], dim=1)
+            
+            if self.core.vote_clamp is not None:
+                clause_outputs = clause_outputs.clamp(-self.core.vote_clamp, self.core.vote_clamp)
+
+        else:
+             return super().forward(x, use_ste=use_ste)
+
+        if self.training and self.core.clause_dropout > 0.0:
+             clause_outputs = F.dropout(clause_outputs, p=self.core.clause_dropout, training=True)
+             
+        # Voting
+        # self.core.voting is [n_clauses, n_classes]
+        # We need [n_classes, n_clauses, 1, 1] for conv
+        
+        voting_weight = self.core._voting_matrix(use_ste) if hasattr(self.core, "_voting_matrix") else self.core.voting
+        w_vote = voting_weight.t().unsqueeze(2).unsqueeze(3) # [n_classes, n_clauses, 1, 1]
+        
+        # Clause bias
+        if hasattr(self.core, "clause_bias"):
+             clause_outputs = clause_outputs + self.core.clause_bias.view(1, -1, 1, 1)
+        
+        logits = F.conv2d(clause_outputs, w_vote)
+        return logits

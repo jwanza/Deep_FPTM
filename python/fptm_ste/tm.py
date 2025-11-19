@@ -181,6 +181,17 @@ class FuzzyPatternTM_STE(nn.Module):
         # Voting weights per clause per class
         self.voting = nn.Parameter(torch.randn(n_clauses, n_classes) * 0.1)
 
+    def prune(self, threshold: float = 0.1):
+        """
+        Prunes low-magnitude literal weights to zero.
+        """
+        with torch.no_grad():
+            for param in [self.ta_pos, self.ta_neg, self.ta_pos_inv, self.ta_neg_inv]:
+                if 0 < threshold < 1:
+                    logit_thresh = torch.log(torch.tensor(threshold / (1 - threshold)))
+                    mask = param > logit_thresh
+                    param.data = torch.where(mask, param.data, torch.tensor(-10.0, device=param.device))
+
     @staticmethod
     def _ste_binary(p: torch.Tensor, tau: float) -> torch.Tensor:
         with torch.no_grad():
@@ -316,6 +327,7 @@ class FuzzyPatternTMFPTM(nn.Module):
         n_clauses: int,
         n_classes: int,
         tau: float = 0.5,
+        T: float = 1.0,
         *,
         input_shape: Optional[Tuple[int, int, int]] = None,
         auto_expand_grayscale: bool = False,
@@ -323,12 +335,14 @@ class FuzzyPatternTMFPTM(nn.Module):
         lf: int = 4,
         literal_budget: Optional[int] = None,
         vote_clamp: Optional[float] = None,
+        team_per_class: bool = False,
     ):
         super().__init__()
         self.n_features = n_features
         self.n_clauses = n_clauses
         self.n_classes = n_classes
         self.tau = tau
+        self.T = T
         self.input_shape = tuple(input_shape) if input_shape is not None else None
         self.auto_expand_grayscale = auto_expand_grayscale
         self.allow_channel_reduce = allow_channel_reduce
@@ -342,14 +356,22 @@ class FuzzyPatternTMFPTM(nn.Module):
         self.lf = lf
         self.literal_budget = literal_budget
         self.vote_clamp = vote_clamp
+        self.team_per_class = team_per_class
 
         half = n_clauses // 2
-        self.ta_pos = nn.Parameter(torch.randn(half, n_features) * 0.05)
-        self.ta_neg = nn.Parameter(torch.randn(half, n_features) * 0.05)
-        self.ta_pos_inv = nn.Parameter(torch.randn(half, n_features) * 0.05)
-        self.ta_neg_inv = nn.Parameter(torch.randn(half, n_features) * 0.05)
-        # Votes are ±1 style; keep them learnable but small.
-        self.voting = nn.Parameter(torch.randn(n_clauses, n_classes) * 0.05)
+        # Initialize to -2.0 to encourage sparsity (prob ~0.12) instead of 0.0 (prob ~0.5)
+        self.ta_pos = nn.Parameter(torch.randn(half, n_features) * 0.05 + 0.1)
+        self.ta_neg = nn.Parameter(torch.randn(half, n_features) * 0.05 + 0.1)
+        self.ta_pos_inv = nn.Parameter(torch.randn(half, n_features) * 0.05 + 0.1)
+        self.ta_neg_inv = nn.Parameter(torch.randn(half, n_features) * 0.05 + 0.1)
+        
+        if self.team_per_class:
+            if half % n_classes != 0:
+                 raise ValueError(f"Half clauses ({half}) must be divisible by n_classes ({n_classes}) for team split.")
+            self.voting = None
+        else:
+            # Votes are ±1 style; keep them learnable but small.
+            self.voting = nn.Parameter(torch.randn(n_clauses, n_classes) * 0.05)
 
     @staticmethod
     def _ste_mask(p: torch.Tensor, tau: float, use_ste: bool) -> torch.Tensor:
@@ -369,7 +391,8 @@ class FuzzyPatternTMFPTM(nn.Module):
 
     @staticmethod
     def _straight_relu(x: torch.Tensor) -> torch.Tensor:
-        clamped = torch.relu(x)
+        # Use Leaky ReLU with a very small negative slope to allow gradient flow for "dead" clauses
+        clamped = F.leaky_relu(x, negative_slope=0.01)
         return x + (clamped - x).detach()
 
     def _strength(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
@@ -395,9 +418,36 @@ class FuzzyPatternTMFPTM(nn.Module):
         neg_strength = self._strength(x, mask_neg, mask_neg_inv)
 
         clause_votes = torch.cat([pos_strength, -neg_strength], dim=1)
-        if self.vote_clamp is not None:
-            clause_votes = clause_votes.clamp(-self.vote_clamp, self.vote_clamp)
-        logits = clause_votes @ self.voting
+        if self.team_per_class:
+            # clause_votes: [B, n_clauses] where n_clauses = half_pos + half_neg
+            # We assume half_pos is interleaved or concatenated?
+            # In __init__, ta_pos and ta_neg have size `half`.
+            # _strength returns [B, half].
+            # torch.cat([pos, -neg], dim=1) -> [B, half + half].
+            #
+            # We want to split into n_classes groups.
+            # We enforced half % n_classes == 0.
+            # k_half = half // n_classes
+            #
+            # Pos clauses for class c are indices [c*k_half : (c+1)*k_half] in pos_strength.
+            # Neg clauses for class c are indices [c*k_half : (c+1)*k_half] in neg_strength.
+            #
+            # Reshape pos_strength to [B, n_classes, k_half]
+            # Reshape neg_strength to [B, n_classes, k_half]
+            
+            B = clause_votes.shape[0]
+            half = self.n_clauses // 2
+            k_half = half // self.n_classes
+            
+            pos_votes = pos_strength.view(B, self.n_classes, k_half).sum(dim=2)
+            neg_votes = neg_strength.view(B, self.n_classes, k_half).sum(dim=2)
+            
+            # Net score per class = Sum(Pos) - Sum(Neg)
+            # Note that clause_votes contained -neg_strength, but here we work with raw strengths
+            logits = pos_votes - neg_votes
+        else:
+            logits = clause_votes @ self.voting
+        
         return logits, clause_votes
 
     @torch.no_grad()
@@ -512,6 +562,16 @@ class FuzzyPatternTM_STCM(nn.Module):
             self.voting = nn.Parameter(torch.randn(n_clauses, n_classes) * 0.1)
             self.vote_logits = None
 
+    def prune(self, threshold: float = 0.1):
+        """
+        Prunes low-magnitude literal weights to zero.
+        """
+        with torch.no_grad():
+            for param in [self.pos_logits, self.neg_logits]:
+                if threshold > 0:
+                    mask = torch.abs(param) < threshold
+                    param.data.masked_fill_(mask, 0.0)
+
     def _mask_from_logits(self, logits: torch.Tensor, use_ste: bool) -> torch.Tensor:
         if use_ste:
             return _ste_ternary(logits, self.ternary_band, self.ste_temperature)
@@ -542,6 +602,9 @@ class FuzzyPatternTM_STCM(nn.Module):
     def _strength(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
         mask_pos = mask_pos.to(x.dtype)
         mask_inv = mask_inv.to(x.dtype)
+        if hasattr(self, 'operator_impl') and self.operator_impl is not None:
+            matches = self._match_triplet(x, mask_pos, mask_inv)
+            return self.operator_impl(*matches)
         if self.operator == "capacity":
             return self._capacity_strength(x, mask_pos, mask_inv)
         return self._product_strength(x, mask_pos, mask_inv)
@@ -571,7 +634,7 @@ class FuzzyPatternTM_STCM(nn.Module):
 
     @staticmethod
     def _straight_relu(x: torch.Tensor) -> torch.Tensor:
-        clamped = torch.relu(x)
+        clamped = F.leaky_relu(x, negative_slope=0.01)
         return x + (clamped - x).detach()
 
     def _apply_literal_constraints(self, included: torch.Tensor) -> torch.Tensor:

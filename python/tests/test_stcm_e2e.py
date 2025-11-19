@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+import pytest
+
 from fptm_ste import DeepTMNetwork, FuzzyPatternTM_STCM
 
 
@@ -82,4 +84,55 @@ def test_deep_tm_network_uses_stcm_layers():
     assert torch.isfinite(logits).all()
     losses, logits = _train_simple(model, x, y, steps=6, lr=0.05)
     assert torch.isfinite(torch.tensor(losses[-1]))
+
+
+@pytest.mark.parametrize(
+    "operator,feature_dim,target_fn,threshold,n_clauses,steps,lr",
+    [
+        (
+            "tqand",
+            4,
+            lambda x: ((x[:, 0] > 0.5) & (x[:, 1] > 0.5)).long(),
+            0.84,
+            40,
+            20,
+            0.07,
+        ),
+        (
+            "txor",
+            4,
+            lambda x: (x[:, 0] != x[:, 1]).long(),
+            0.75,
+            32,
+            30,
+            0.08,
+        ),
+        (
+            "tmaj",
+            5,
+            lambda x: ((x[:, 0] + x[:, 1] + x[:, 2]) > 1.5).long(),
+            0.8,
+            24,
+            18,
+            0.06,
+        ),
+    ],
+)
+def test_custom_operators_learn_boolean_rules(
+    operator, feature_dim, target_fn, threshold, n_clauses, steps, lr
+):
+    torch.manual_seed(8)
+    x = (torch.rand(96, feature_dim) > 0.5).float()
+    y = target_fn(x)
+    model = FuzzyPatternTM_STCM(
+        n_features=feature_dim,
+        n_clauses=n_clauses,
+        n_classes=2,
+        operator=operator,
+        ternary_band=0.1,
+    )
+    losses, logits = _train_simple(model, x, y, steps=steps, lr=lr)
+    assert losses[-1] < losses[0]
+    acc = (logits.argmax(1) == y).float().mean()
+    assert acc >= threshold
 

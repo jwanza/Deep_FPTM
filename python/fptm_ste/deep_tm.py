@@ -94,7 +94,7 @@ class DeepTMNetwork(nn.Module):
 
         classifier_kwargs = dict(
             n_features=prev,
-            n_clauses=n_clauses * 2,
+            n_clauses=n_clauses ,
             n_classes=n_classes,
             tau=tau,
             clause_dropout=clause_dropout,

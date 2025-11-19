@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -17,6 +18,34 @@ def anneal_ste_factor(module, new_tau: float):
             m.anneal_temperature(new_tau)
         if hasattr(m, "anneal_binarizers"):
             m.anneal_binarizers(new_tau)
+
+
+class TsetlinMarginLoss(nn.Module):
+    """
+    Differentiable approximation of the Tsetlin Machine margin feedback.
+    Loss = ReLU(T - score_correct) + Sum(ReLU(T + score_incorrect))
+    """
+    def __init__(self, T: float = 1.0):
+        super().__init__()
+        self.T = T
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        B, C = logits.shape
+        # Extract score of correct class
+        correct_scores = logits.gather(1, target.view(-1, 1)).squeeze()
+        
+        # Loss for correct class: max(0, T - score)
+        loss_correct = F.relu(self.T - correct_scores)
+        
+        # Loss for incorrect classes: max(0, T + score)
+        loss_incorrect = F.relu(self.T + logits)
+        
+        # Mask out correct class from incorrect loss
+        mask = torch.ones_like(logits, dtype=torch.bool)
+        mask.scatter_(1, target.view(-1, 1), False)
+        loss_incorrect = loss_incorrect[mask].view(B, C - 1)
+        
+        return (loss_correct + loss_incorrect.sum(dim=1)).mean()
 
 
 class EMAWrapper:
@@ -82,7 +111,16 @@ def update_attention_ema(module):
             m.update_attention_ema()
 
 
-def train_step(model, data, target, optimizer, use_ste: bool = True, clip_grad: float = 1.0):
+def train_step(
+    model, 
+    data, 
+    target, 
+    optimizer, 
+    use_ste: bool = True, 
+    clip_grad: float = 1.0, 
+    margin_loss: bool = False, 
+    l1_lambda: float = 0.0
+):
     model.train()
     optimizer.zero_grad()
     out = model(data, use_ste=use_ste)
@@ -90,7 +128,26 @@ def train_step(model, data, target, optimizer, use_ste: bool = True, clip_grad: 
         logits = out[0]
     else:
         logits = out
-    loss = F.cross_entropy(logits, target)
+    
+    if margin_loss:
+        # Attempt to get T from model
+        T = getattr(model, 'T', 1.0)
+        if hasattr(model, 'module') and hasattr(model.module, 'T'):
+            T = model.module.T
+        loss_fn = TsetlinMarginLoss(T=T)
+        loss = loss_fn(logits, target)
+    else:
+        loss = F.cross_entropy(logits, target)
+
+    # L1 Regularization
+    if l1_lambda > 0.0:
+        l1_reg = torch.tensor(0.0, device=logits.device)
+        for name, param in model.named_parameters():
+            # Heuristic to find literal inclusion logits
+            if 'ta_' in name or ('logits' in name and 'vote' not in name):
+                 l1_reg += torch.abs(param).sum()
+        loss = loss + l1_lambda * l1_reg
+
     aux_loss = gather_auxiliary_losses(model)
     if aux_loss is not None:
         loss = loss + aux_loss

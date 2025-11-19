@@ -51,7 +51,7 @@ from fptm_ste.datasets import (
 from fptm_ste.visualization import generate_transformer_overlay
 from fptm_ste.trainers import anneal_ste_factor
 
-AVAILABLE_MODELS = ("tm", "stcm", "deep_tm", "deep_stcm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
+AVAILABLE_MODELS = ("tm", "stcm", "fptm_equiv", "deep_tm", "deep_stcm", "deep_fptm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
     "tm": "tm",
@@ -946,6 +946,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["none", "symmetric", "zero"],
         help="Optional TM prior template applied to clause initialisation.",
     )
+    parser.add_argument("--tm-T", type=float, default=100.0, help="Margin T for Tsetlin Machine loss.")
     parser.add_argument("--lr-layer-decay", type=float, default=1.0, help="Layer-wise LR decay factor (set <1 to scale deeper layers).")
     parser.add_argument("--gradient-centralize", action=argparse.BooleanOptionalAction, default=False, help="Apply gradient centralization before optimizer step.")
     parser.add_argument("--num-classes", type=int, default=None, help="Number of target classes.")
@@ -1342,7 +1343,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--transformer-backend",
-        choices=["ste", "deeptm"],
+        choices=["ste", "deeptm", "stcm", "deep_stcm"],
         default="ste",
         help="Choose TM backend for transformer feed-forward replacements.",
     )
@@ -1942,7 +1943,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional checkpoint path for saving the fine-tuned teacher baseline.",
     )
+    # Add new arguments for FPTM Parity
+    parser.add_argument(
+        "--margin-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Tsetlin Margin Loss instead of CrossEntropy.",
+    )
+    parser.add_argument(
+        "--l1-lambda",
+        type=float,
+        default=0.0,
+        help="L1 regularization strength for literal pruning.",
+    )
+    parser.add_argument(
+        "--prune-threshold",
+        type=float,
+        default=0.0,
+        help="Threshold for pruning weights at the end of each epoch.",
+    )
 
+
+    parser.add_argument(
+        "--distill-contrastive-weight",
+        type=float,
+        default=0.0,
+        help="Weight for contrastive feature distillation (student clauses vs teacher features).",
+    )
+    parser.add_argument(
+        "--distill-contrastive-temp",
+        type=float,
+        default=0.07,
+        help="Temperature for contrastive feature distillation.",
+    )
     return parser
 
 
@@ -2808,12 +2841,15 @@ def _scale_clause_counts(
             usage_factor = 1.0 + (target_usage - usage_val)
             usage_factor = max(0.7, min(1.3, usage_factor))
         combined = factor * usage_factor
-        new_counts.append(max(8, int(round(base * combined))))
+        val = max(8, int(round(base * combined)))
+        if val % 2 != 0: val += 1
+        new_counts.append(val)
     if clause_target > 0:
         total = sum(new_counts)
         if total > 0:
             scale = clause_target / total
             new_counts = [max(8, int(round(c * scale))) for c in new_counts]
+            new_counts = [c + 1 if c % 2 != 0 else c for c in new_counts]
     return new_counts
 
 
@@ -2894,7 +2930,7 @@ def train_tm_model(model: nn.Module,
                    teacher_logit_adapter: Optional[nn.Module] = None,
                    ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
                    base_self_kd_weight: float = 0.0,
-                   base_self_kd_temp: float = 1.0) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   base_self_kd_temp: float = 1.0, margin_loss: bool = False, l1_lambda: float = 0.0, prune_threshold: float = 0.0, contrastive_matcher: Optional["ContrastiveFeatureMatcher"] = None, teacher_feature_collector: Optional["TeacherFeatureCollector"] = None) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -2958,7 +2994,27 @@ def train_tm_model(model: nn.Module,
                     outputs = model(xb, use_ste=use_ste_train)
                     logits = outputs[0] if isinstance(outputs, tuple) else outputs
                     component_logits = {}
-                loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                if margin_loss:
+                    T = getattr(model, "T", 1.0)
+                    if hasattr(model, "module"):
+                        T = getattr(model.module, "T", T)
+                    B_size, C_num = logits.shape
+                    correct_scores = logits.gather(1, y.view(-1, 1)).squeeze()
+                    loss_correct = F.relu(T - correct_scores)
+                    loss_incorrect = F.relu(T + logits)
+                    mask = torch.ones_like(logits, dtype=torch.bool)
+                    mask.scatter_(1, y.view(-1, 1), False)
+                    loss_incorrect = loss_incorrect[mask].view(B_size, C_num - 1)
+                    loss = (loss_correct + loss_incorrect.sum(dim=1)).mean()
+                else:
+                    loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                
+                if l1_lambda > 0.0:
+                    l1_reg = torch.tensor(0.0, device=device)
+                    for name, param in model.named_parameters():
+                         if "ta_" in name or ("logits" in name and "vote" not in name):
+                             l1_reg += torch.abs(param).sum()
+                    loss = loss + l1_lambda * l1_reg
                 distill_term = None
                 if collect_ctm_diag and component_logits:
                     aux_loss = 0.0
@@ -3082,6 +3138,12 @@ def train_tm_model(model: nn.Module,
             extras=ctm_extras if ctm_extras else None,
         )
         print("  " + log_msg)
+        # Pruning step at end of epoch if requested
+        if isinstance(prune_threshold, (float, int)) and prune_threshold > 0.0:
+             if hasattr(model, "prune"):
+                 model.prune(prune_threshold)
+             elif hasattr(model, "module") and hasattr(model.module, "prune"):
+                 model.module.prune(prune_threshold)
     train_time = time.time() - start
     final_eval_model = ema_model if (ema_model is not None and ema_ready) else model
     test_acc, preds = evaluate_model(final_eval_model, prepare_fn, test_loader, device, use_ste=use_ste_eval)
@@ -3250,6 +3312,181 @@ def run_variant_tm(train_loader,
     }
     return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
 
+
+def run_variant_fptm_equiv(
+    train_loader,
+    test_loader,
+    device,
+    *,
+    epochs: int,
+    report_train_acc: bool,
+    report_epoch_acc: bool,
+    report_epoch_test: bool,
+    n_features: int,
+    prepare_fn: Callable[[torch.Tensor], torch.Tensor],
+    tm_tau: float,
+    tm_lf: int,
+    tm_n_clauses: int,
+    input_shape: Optional[Tuple[int, int, int]],
+    auto_expand_grayscale: bool,
+    allow_channel_reduce: bool,
+    n_classes: int = 10,
+    base_lr: float = 1e-3,
+    min_lr: float = 1e-3,
+    warmup_epochs: int = 0,
+    weight_decay: float = 1e-5,
+    margin_loss: bool = False,
+    l1_lambda: float = 0.0,
+    prune_threshold: float = 0.0,
+    tm_T: float = 100.0,
+    lr_cycle_steps: int = 0,
+) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+    # Instantiate FPTM with Team-Per-Class
+    # If team_per_class is True, tm_n_clauses is interpreted as clauses PER CLASS in this script context,
+    # but the model expects total clauses.
+    # Or rather, FPTM expects total clauses and splits them.
+    # To get N clauses per class, we pass N * n_classes.
+    
+    total_clauses = tm_n_clauses * n_classes
+
+    model = FuzzyPatternTMFPTM(
+        n_features=n_features,
+        n_clauses=total_clauses,
+        n_classes=n_classes,
+        tau=tm_tau,
+        input_shape=input_shape,
+        auto_expand_grayscale=auto_expand_grayscale,
+        allow_channel_reduce=allow_channel_reduce,
+        lf=tm_lf,
+        team_per_class=True,
+        T=1.0, # Default T for margin loss if not specified
+    ).to(device)
+    
+    label = "FPTM-Equiv"
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
+        model,
+        prepare_fn,
+        train_loader,
+        test_loader,
+        device,
+        label,
+        use_ste_train=True,
+        use_ste_eval=True,
+        epochs=epochs,
+        report_train_acc=report_train_acc,
+        report_epoch_acc=report_epoch_acc,
+        report_epoch_test=report_epoch_test,
+        base_lr=base_lr,
+        min_lr=min_lr,
+        warmup_epochs=warmup_epochs,
+        weight_decay=weight_decay,
+        lr_cycle_steps=lr_cycle_steps,
+        margin_loss=margin_loss,
+        l1_lambda=l1_lambda,
+        prune_threshold=prune_threshold
+    )
+    bundle = model.discretize(threshold=0.5)
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / ttrain if ttrain > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
+
+def run_variant_deepfptm(
+    train_loader,
+    test_loader,
+    device,
+    *,
+    epochs: int,
+    report_train_acc: bool,
+    report_epoch_acc: bool,
+    report_epoch_test: bool,
+    prepare_fn: Callable[[torch.Tensor], torch.Tensor],
+    input_dim: int,
+    hidden_dims: List[int],
+    n_clauses: int,
+    dropout: float,
+    tau: float,
+    input_shape: Optional[Tuple[int, int, int]],
+    auto_expand_grayscale: bool,
+    allow_channel_reduce: bool,
+    n_classes: int = 10,
+    base_lr: float = 1e-3,
+    min_lr: float = 1e-3,
+    warmup_epochs: int = 0,
+    weight_decay: float = 1e-5,
+    lr_cycle_steps: int = 0,
+    clause_dropout: float = 0.0,
+    literal_dropout: float = 0.0,
+) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+    # Using FuzzyPatternTMFPTM layers in Deep Network
+    # Note: team_per_class=False for intermediate layers usually, but can be True.
+    # DeepTMNetwork logic assumes standard layers.
+    # We pass FuzzyPatternTMFPTM as layer_cls.
+    model = DeepTMNetwork(
+        input_dim=input_dim,
+        hidden_dims=hidden_dims,
+        n_classes=n_classes,
+        n_clauses=n_clauses,
+        dropout=dropout,
+        tau=tau,
+        input_shape=input_shape,
+        auto_expand_grayscale=auto_expand_grayscale,
+        allow_channel_reduce=allow_channel_reduce,
+        clause_dropout=clause_dropout,
+        literal_dropout=literal_dropout,
+        layer_cls=FuzzyPatternTMFPTM,
+        layer_extra_kwargs={"lf": 4} # Default LF
+    ).to(device)
+    
+    label = "Deep-FPTM"
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        
+    train_acc, test_acc, ttrain, preds, best_test_acc = train_tm_model(
+        model,
+        prepare_fn,
+        train_loader,
+        test_loader,
+        device,
+        label,
+        use_ste_train=True,
+        use_ste_eval=True,
+        epochs=epochs,
+        report_train_acc=report_train_acc,
+        report_epoch_acc=report_epoch_acc,
+        report_epoch_test=report_epoch_test,
+        base_lr=base_lr,
+        min_lr=min_lr,
+        warmup_epochs=warmup_epochs,
+        weight_decay=weight_decay,
+        lr_cycle_steps=lr_cycle_steps,
+    )
+    bundle = None
+    classifier = getattr(model, "classifier", None)
+    if classifier is not None and hasattr(classifier, "discretize"):
+        bundle = classifier.discretize(threshold=0.5)
+    
+    total_samples = len(train_loader.dataset)
+    total_steps = epochs * max(1, len(train_loader))
+    throughput = (total_samples * epochs) / ttrain if ttrain > 0 else None
+    profile = {
+        "num_samples": total_samples,
+        "epochs": epochs,
+        "total_steps": total_steps,
+        "samples_per_second": throughput,
+        "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+    }
+    return label, train_acc, test_acc, ttrain, preds, bundle, best_test_acc, profile
 
 def run_variant_deeptm(train_loader,
                        test_loader,
@@ -4043,6 +4280,8 @@ def run_variant_transformer(train_loader,
         model.train()
         epoch_start = time.time()
         running_loss = 0.0
+        total_self_distill = 0.0
+        self_distill_count = 0
         epoch_correct = 0
         epoch_total = 0
         num_batches = 0
@@ -4365,7 +4604,7 @@ def run_variant_transformer(train_loader,
             if ema_model is not None:
                 with torch.no_grad():
                     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-                        ema_param.data.mul_(ema_decay_value).add_(param.data, alpha=1 - ema_decay_value)
+                        ema_param.data.mul_(ema_decay).add_(param.data, alpha=1 - ema_decay)
                 ema_ready = True
             running_loss += loss.item()
             num_batches += 1
@@ -5206,6 +5445,34 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     stcm_ste_temperature=args.stcm_ste_temperature,
                 )
                 variant_classes = args.num_classes
+            elif model_key == "fptm_equiv":
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_fptm_equiv(
+                    tm_train_loader,
+                    tm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    n_features=tm_n_features,
+                    prepare_fn=tm_prepare_fn,
+                    tm_tau=args.tm_tau,
+                    tm_lf=args.tm_lf,
+                    tm_n_clauses=args.tm_n_clauses,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=tm_base_lr,
+                    min_lr=tm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    margin_loss=args.margin_loss,
+                    l1_lambda=args.l1_lambda,
+                    prune_threshold=args.prune_threshold,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                )
+                variant_classes = args.num_classes
             elif model_key == "deep_tm":
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deeptm(
                     deeptm_train_loader,
@@ -5232,6 +5499,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     gradient_centralize=args.gradient_centralize,
                     label_smoothing=args.label_smoothing,
                     lr_cycle_steps=args.lr_cycle_steps,
+                    tm_T=args.tm_T,
                     tm_prior_template=args.tm_prior_template,
                     clause_dropout=args.tm_clause_dropout,
                     literal_dropout=args.tm_literal_dropout,
@@ -5627,8 +5895,12 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
         if max_mem:
             acc_parts.append(f"max_mem={max_mem / (1024**2):.1f}MB")
         acc_str = " ".join(acc_parts)
-        label = info.get("label", key.upper())
-        print(f"{label:12s} {acc_str} train_time={info['train_time_s']:.1f}s json={info['json']}")
+        
+        # Use the label from info if available, otherwise use key
+        # If label variable is not in scope here, we rely on info['label']
+        # Fix: 'label' variable was causing UnboundLocalError if loop wasn't entered properly or scope issue
+        label_str = info.get("label", key.upper())
+        print(f"{label_str:12s} {acc_str} train_time={info['train_time_s']:.1f}s json={info['json']}")
 
     if args.write_bool_dataset:
         print("Boolean datasets:", args.bool_train_path, args.bool_test_path)

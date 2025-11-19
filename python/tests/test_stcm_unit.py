@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import pytest
 from fptm_ste import FuzzyPatternTM_STCM, FuzzyPatternTMFPTM
 
 
@@ -85,4 +86,21 @@ def test_capacity_and_product_operators_are_stable():
     assert torch.all(cap_clauses[:, half:] <= 0)
     assert torch.all(prod_clauses[:, :half] >= 0)
     assert torch.all(prod_clauses[:, half:] <= 0)
+
+
+@pytest.mark.parametrize("operator", ["tqand", "txor", "tmaj"])
+def test_custom_ternary_operators_forward(operator: str):
+    torch.manual_seed(9)
+    model = FuzzyPatternTM_STCM(
+        n_features=10,
+        n_clauses=14,
+        n_classes=2,
+        operator=operator,
+        ternary_band=0.2,
+    )
+    x = torch.rand(6, 10)
+    logits, clauses = model(x, use_ste=False)
+    assert logits.shape == (6, 2)
+    assert clauses.shape == (6, 14)
+    assert torch.isfinite(logits).all()
 
