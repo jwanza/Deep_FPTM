@@ -1191,6 +1191,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Feature preprocessing pipeline for TM variants.",
     )
     parser.add_argument(
+        "--tm-aug-mode",
+        default="default",
+        choices=["default", "julia"],
+        help="Augmentation recipe to use for TM features (if augmentations enabled).",
+    )
+    parser.add_argument(
         "--tm-feature-cache",
         default=os.environ.get("TM_FEATURE_CACHE_DIR", "/tmp/fptm_features"),
         help="Directory used to cache booleanised TM feature datasets.",
@@ -3638,7 +3644,14 @@ def run_variant_deeptm(train_loader,
                        clause_dropout: float = 0.0,
                        literal_dropout: float = 0.0,
                        use_ste_train: bool = False,
-                       use_ste_eval: bool = True) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                       use_ste_eval: bool = True,
+                       # Ignore unexpected kwargs for compatibility if passed from generic call sites
+                       **kwargs: Any) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+    if "tm_T" in kwargs:
+        # tm_T might be passed but DeepTM often uses tau instead of T, or uses it internally differently
+        # If DeepTMNetwork needed T, we'd pass it. Here we just swallow it to fix the crash.
+        pass
+    
     model = DeepTMNetwork(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
@@ -5331,6 +5344,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     raise ImportError("MedMNIST datasets require the 'medmnist' package. Install with 'pip install medmnist'.")
                 
                 info = INFO[dataset_key]
+                # Resolve class from module dynamically to avoid linter errors with direct attribute access if not typed stubs
                 DataClass = getattr(medmnist, info['python_class'])
                 
                 train_ds = DataClass(
@@ -5484,6 +5498,13 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             base_config = replace(base_config, image_size=tuple(args.tm_feature_size))
         if args.tm_feature_grayscale is not None:
             base_config = replace(base_config, to_grayscale=args.tm_feature_grayscale)
+        
+        # Apply augmentation overrides
+        if args.tm_augment and args.tm_aug_mode == "julia":
+             # Import from fashion_augmented only if needed to avoid circular imports at top level if refactored badly
+             from fptm_ste.datasets.fashion_augmented import JULIA_FMNIST_AUGMENTATIONS
+             base_config = replace(base_config, augmentations=JULIA_FMNIST_AUGMENTATIONS)
+        
         cache_dir = Path(args.tm_feature_cache)
         with profile_block("prepare-fashion-augmented-features"):
             tm_bundle = prepare_boolean_feature_bundle(

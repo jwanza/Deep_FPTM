@@ -10,6 +10,9 @@ __pycache__/
 venv/
 env/
 
+#data
+tmp_features_rgb_new/
+
 # Python packaging
 *.egg-info/
 dist/

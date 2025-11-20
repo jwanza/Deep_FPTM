@@ -27,28 +27,68 @@ def _identity(img: Tensor) -> Tensor:
     return img
 
 
+def _crop_size(h: int, w: int) -> Callable[[Tensor], Tensor]:
+    def _apply(img: Tensor) -> Tensor:
+        return TF.center_crop(img, [h, w])
+    return _apply
+
+
 def _zoom(scale: float) -> Callable[[Tensor], Tensor]:
     def _apply(img: Tensor) -> Tensor:
-        tensor = img.unsqueeze(0)
-        transformed = TF.affine(tensor, angle=0.0, translate=[0, 0], scale=scale, shear=[0.0, 0.0])
-        return transformed.squeeze(0)
+        # Expect img shape [C, H, W]
+        # TF.affine expects [..., H, W]
+        transformed = TF.affine(img, angle=0.0, translate=[0, 0], scale=scale, shear=[0.0, 0.0])
+        return transformed
+    return _apply
 
+
+def _rotate_crop(deg: float, crop_h: int, crop_w: int) -> Callable[[Tensor], Tensor]:
+    def _apply(img: Tensor) -> Tensor:
+        rotated = TF.rotate(img, angle=deg, fill=0.0)
+        cropped = TF.center_crop(rotated, [crop_h, crop_w])
+        return cropped
     return _apply
 
 
 def _rotate(deg: float) -> Callable[[Tensor], Tensor]:
     def _apply(img: Tensor) -> Tensor:
-        tensor = img.unsqueeze(0)
-        rotated = TF.rotate(tensor, angle=deg, fill=0.0)
-        cropped = TF.center_crop(rotated, [img.size(-2), img.size(-1)])
-        return cropped.squeeze(0)
-
+        # TF.rotate works on [C, H, W]
+        rotated = TF.rotate(img, angle=deg, fill=0.0)
+        # The original _rotate also did a center crop to original size, but TF.rotate preserves size by default
+        # However, if rotation introduces black borders, we might want to keep them or crop.
+        # Julia code: Rotate(-6) |> CropSize(28, 28) implies rotation then crop.
+        # Our previous implementation did explicit crop. Let's keep it consistent with "rotate maintains size" unless composed.
+        # But wait, previous implementation:
+        # tensor = img.unsqueeze(0) -> rotated -> TF.center_crop(rotated, [img.size(-2), img.size(-1)])
+        # We should make this cleaner.
+        return rotated
     return _apply
 
 
 def _flip_vertical(img: Tensor) -> Tensor:
     return TF.vflip(img)
 
+
+# Julia parity recipe
+# Note: Julia crops to 28x28. If we apply this to CIFAR10 (32x32), we might unintentionally crop to 28x28
+# if we use the fixed recipe.
+# We should probably make the Julia recipe relative or context aware, but for now let's fix the crash.
+# The crash happens because _rotate_-6_crop is hardcoded to 28x28 but CIFAR is 32x32, so concatenation fails 
+# because some augmentations (like zoom) return 32x32 (input size) while rotate_crop returns 28x28.
+
+# We need "adaptive" crop or just use standard rotate which preserves size.
+# In Julia, FashionMNIST is 28x28, so cropping to 28x28 is a no-op/safety.
+# For CIFAR (32x32), we should probably stick to preserving size.
+
+JULIA_FMNIST_AUGMENTATIONS: Tuple[AugmentationRecipe, ...] = (
+    AugmentationRecipe("identity", _identity),
+    AugmentationRecipe("zoom_0.9", _zoom(0.9)),
+    AugmentationRecipe("zoom_1.1", _zoom(1.1)),
+    # Use standard rotate which preserves dimensions, matching identity/zoom behavior for non-28x28 images too
+    AugmentationRecipe("rotate_-6", _rotate(-6.0)), 
+    AugmentationRecipe("rotate_6", _rotate(6.0)),
+    AugmentationRecipe("flip_y", _flip_vertical),
+)
 
 DEFAULT_AUGMENTATIONS: Tuple[AugmentationRecipe, ...] = (
     AugmentationRecipe("identity", _identity),
@@ -67,6 +107,10 @@ class PreprocessConfig:
     in_channels: int
     to_grayscale: bool = True
     augmentations: Tuple[AugmentationRecipe, ...] = DEFAULT_AUGMENTATIONS
+    
+    # If true, we treat input as "already correct depth" and don't force channel repetition/reduction
+    # unless explicitly needed.
+    preserve_channels: bool = False
 
 
 DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
@@ -76,6 +120,13 @@ DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
         in_channels=1,
         to_grayscale=True,
         augmentations=DEFAULT_AUGMENTATIONS,
+    ),
+    "fashionmnist_julia": PreprocessConfig(
+        name="fashionmnist_julia",
+        image_size=(28, 28),
+        in_channels=1,
+        to_grayscale=True,
+        augmentations=JULIA_FMNIST_AUGMENTATIONS,
     ),
     "mnist": PreprocessConfig(
         name="mnist",
@@ -90,6 +141,7 @@ DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
         in_channels=3,
         to_grayscale=False,
         augmentations=DEFAULT_AUGMENTATIONS,
+        preserve_channels=True,
     ),
     # Generic fallback for any new dataset using 32x32 RGB
     "generic_32_rgb": PreprocessConfig(
@@ -98,6 +150,7 @@ DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
         in_channels=3,
         to_grayscale=False,
         augmentations=DEFAULT_AUGMENTATIONS,
+        preserve_channels=True,
     ),
     # Generic fallback for 224x224 RGB
     "generic_224_rgb": PreprocessConfig(
@@ -106,6 +159,7 @@ DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
         in_channels=3,
         to_grayscale=False,
         augmentations=DEFAULT_AUGMENTATIONS,
+        preserve_channels=True,
     ),
     # Generic fallback for 28x28 grayscale
     "generic_28_gray": PreprocessConfig(
@@ -114,6 +168,15 @@ DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
         in_channels=1,
         to_grayscale=True,
         augmentations=DEFAULT_AUGMENTATIONS,
+    ),
+    # 3D volume support (e.g. OrganMNIST3D)
+    "generic_28_3d": PreprocessConfig(
+        name="generic_28_3d",
+        image_size=(28, 28),
+        in_channels=28,  # 28 slices
+        to_grayscale=False,
+        augmentations=DEFAULT_AUGMENTATIONS, # We might want to restrict this for 3D to avoid invalid warps
+        preserve_channels=True,
     ),
 }
 
@@ -135,26 +198,44 @@ def _dataset_to_tensor(ds: VisionDataset, config: PreprocessConfig) -> Tuple[Ten
 
         channels = tensor_img.size(0)
 
-        if config.to_grayscale and channels > 1:
-            tensor_img = TF.rgb_to_grayscale(tensor_img)
-            channels = 1
+        if config.preserve_channels:
+             # Trust the input channels, just resize if needed
+             pass
+        else:
+            if config.to_grayscale and channels > 1:
+                tensor_img = TF.rgb_to_grayscale(tensor_img)
+                channels = 1
 
-        if channels == 1 and config.in_channels > 1:
-            tensor_img = tensor_img.repeat(config.in_channels, 1, 1)
-        elif channels > 1 and config.in_channels == 1:
-            tensor_img = TF.rgb_to_grayscale(tensor_img)
-        elif channels != config.in_channels:
-            raise ValueError(
-                f"Input tensor has {channels} channels but config expects {config.in_channels}."
-            )
+            if channels == 1 and config.in_channels > 1:
+                tensor_img = tensor_img.repeat(config.in_channels, 1, 1)
+            elif channels > 1 and config.in_channels == 1:
+                tensor_img = TF.rgb_to_grayscale(tensor_img)
+            elif channels != config.in_channels:
+                 # If we have mismatch (e.g. 3 channels but expect 28), this is likely wrong
+                 # unless we are doing something special.
+                 # For now, error out to be safe.
+                raise ValueError(
+                    f"Input tensor has {channels} channels but config expects {config.in_channels}."
+                )
 
         if tensor_img.size(-2) != config.image_size[0] or tensor_img.size(-1) != config.image_size[1]:
             tensor_img = TF.resize(tensor_img, config.image_size, antialias=True)
 
         xs.append(tensor_img)
-        ys.append(int(label))
+        ys.append(int(label) if not isinstance(label, (list, tuple, np.ndarray, torch.Tensor)) else label)
+    
+    # Handle multi-label targets properly
+    if isinstance(ys[0], (list, tuple, np.ndarray, torch.Tensor)):
+         # Stack if they are tensors/arrays
+         if isinstance(ys[0], torch.Tensor):
+              ys_tensor = torch.stack(ys).long()
+         else:
+              ys_tensor = torch.tensor(np.array(ys), dtype=torch.int64)
+    else:
+         ys_tensor = torch.tensor(ys, dtype=torch.int64)
+         
     stacked = torch.stack(xs, dim=0).float()
-    return stacked, torch.tensor(ys, dtype=torch.int64)
+    return stacked, ys_tensor
 
 
 def _apply_augmentations(images: Tensor, augmentations: Sequence[AugmentationRecipe]) -> Tensor:
