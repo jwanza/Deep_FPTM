@@ -124,9 +124,10 @@ class DeepTMNetwork(nn.Module):
             x = x + torch.randn_like(x) * self.noise_std
         for layer, norm, res in zip(self.layers, self.norms, self.residuals):
             identity = res(x)
-            logits, _ = layer(x, use_ste=use_ste)
+            # Bypass internal normalization checks for speed
+            logits, _ = layer(x, use_ste=use_ste, skip_norm=True)
             x = norm(self.dropout(torch.sigmoid(logits)) + identity)
-        logits, clauses = self.classifier(x, use_ste=use_ste)
+        logits, clauses = self.classifier(x, use_ste=use_ste, skip_norm=True)
         return logits, clauses
 
     def set_tau(self, tau: float) -> None:

@@ -205,8 +205,9 @@ class FuzzyPatternTM_STE(nn.Module):
         use_ste: bool = True,
         *,
         already_flat: bool = False,
+        skip_norm: bool = False,
     ):
-        if not already_flat:
+        if not skip_norm and not already_flat:
             x = prepare_tm_input(
                 x,
                 n_features=self.n_features,
@@ -214,45 +215,50 @@ class FuzzyPatternTM_STE(nn.Module):
                 auto_expand_grayscale=self.auto_expand_grayscale,
                 allow_channel_reduce=self.allow_channel_reduce,
             )
-        B, F_ = x.shape
-        assert F_ == self.n_features
+        # Skip assert for speed if skip_norm is True
 
         if self.training and self.literal_dropout > 0.0:
             x = F.dropout(x, p=self.literal_dropout, training=True)
 
-        sig_pos = torch.sigmoid(self.ta_pos)
-        sig_neg = torch.sigmoid(self.ta_neg)
-        sig_pos_inv = torch.sigmoid(self.ta_pos_inv)
-        sig_neg_inv = torch.sigmoid(self.ta_neg_inv)
-
-        hard_pos_zero = sig_pos >= self.tau
-        hard_neg_zero = sig_neg >= self.tau
-        hard_pos_one = sig_pos_inv >= self.tau
-        hard_neg_one = sig_neg_inv >= self.tau
-
+        # Use cached sigmoids/masks if not training? No, weights change.
+        # But we can batch the sigmoid/STE calculation for all 4 parameters.
+        # Concatenate weights first: [pos, neg, pos_inv, neg_inv]
+        # Shape: [4 * half, n_features]
+        
+        all_logits = torch.cat([self.ta_pos, self.ta_neg, self.ta_pos_inv, self.ta_neg_inv], dim=0)
+        
         if use_ste:
-            p_pos = self._ste_binary(self.ta_pos, self.tau)
-            p_neg = self._ste_binary(self.ta_neg, self.tau)
-            p_pos_inv = self._ste_binary(self.ta_pos_inv, self.tau)
-            p_neg_inv = self._ste_binary(self.ta_neg_inv, self.tau)
+             all_p = self._ste_binary(all_logits, self.tau)
         else:
-            p_pos = sig_pos
-            p_neg = sig_neg
-            p_pos_inv = sig_pos_inv
-            p_neg_inv = sig_neg_inv
-
-        p_pos = p_pos.clamp(0.0, 1.0)
-        p_neg = p_neg.clamp(0.0, 1.0)
-        p_pos_inv = p_pos_inv.clamp(0.0, 1.0)
-        p_neg_inv = p_neg_inv.clamp(0.0, 1.0)
-
+             all_p = torch.sigmoid(all_logits)
+             
+        all_p = all_p.clamp(0.0, 1.0)
+        
+        # Split back
+        half = self.n_clauses // 2
+        p_pos = all_p[0:half]
+        p_neg = all_p[half:2*half]
+        p_pos_inv = all_p[2*half:3*half]
+        p_neg_inv = all_p[3*half:4*half]
+        
         x_neg = 1.0 - x
-
-        # Approximate product t-norm with exponential of summed penalties for speed and stability.
+        X_combined = torch.cat([x_neg, x], dim=1) # [B, 2F]
+        
+        # W_pos = [p_pos, p_pos_inv] -> [half, 2F] (concatenation along feature dim)
+        W_pos = torch.cat([p_pos, p_pos_inv], dim=1)
+        W_neg = torch.cat([p_neg, p_neg_inv], dim=1)
+        
+        # W_total = [W_pos; W_neg] -> [n_clauses, 2F]
+        W_total = torch.cat([W_pos, W_neg], dim=0)
+        
         scale = 4.0 / self.n_features
-        pos_score = scale * (torch.matmul(x_neg, p_pos.t()) + torch.matmul(x, p_pos_inv.t()))  # [B, half]
-        neg_score = scale * (torch.matmul(x_neg, p_neg.t()) + torch.matmul(x, p_neg_inv.t()))  # [B, half]
-
+        
+        # The Big MatMul
+        scores = F.linear(X_combined, W_total) * scale
+        
+        pos_score = scores[:, :half]
+        neg_score = scores[:, half:]
+        
         pos_soft = torch.exp(-torch.clamp(pos_score, min=0.0, max=10.0))
         neg_soft = torch.exp(-torch.clamp(neg_score, min=0.0, max=10.0))
 
@@ -264,21 +270,23 @@ class FuzzyPatternTM_STE(nn.Module):
             clause_outputs = F.dropout(clause_outputs, p=self.clause_dropout, training=True)
         return pos_prod, neg_prod, clause_outputs
 
-    def forward(self, x: torch.Tensor, use_ste: bool = True):
+    def forward(self, x: torch.Tensor, use_ste: bool = True, skip_norm: bool = False):
         """
-        x: [batch, features] in [0,1] or image tensor convertible to flattened form.
-        Returns:
-            logits: [batch, n_classes]
-            clause_outputs: [batch, n_clauses]
+        x: [batch, features]
+        skip_norm: If True, assumes x is already flattened and normalized to [0,1] with correct dim.
         """
-        flat_x = prepare_tm_input(
-            x,
-            n_features=self.n_features,
-            input_shape=self.input_shape,
-            auto_expand_grayscale=self.auto_expand_grayscale,
-            allow_channel_reduce=self.allow_channel_reduce,
-        )
-        _, _, clause_outputs = self._clause_products(flat_x, use_ste=use_ste, already_flat=True)
+        if not skip_norm:
+             flat_x = prepare_tm_input(
+                x,
+                n_features=self.n_features,
+                input_shape=self.input_shape,
+                auto_expand_grayscale=self.auto_expand_grayscale,
+                allow_channel_reduce=self.allow_channel_reduce,
+            )
+        else:
+             flat_x = x
+             
+        _, _, clause_outputs = self._clause_products(flat_x, use_ste=use_ste, already_flat=True, skip_norm=True)
         logits = (clause_outputs + self.clause_bias.view(1, -1)) @ self.voting
         return logits, clause_outputs
 
@@ -401,21 +409,66 @@ class FuzzyPatternTMFPTM(nn.Module):
         raw = capacity - mismatch
         return self._straight_relu(raw)
 
-    def forward(self, x: torch.Tensor, use_ste: bool = True):
-        x = prepare_tm_input(
-            x,
-            n_features=self.n_features,
-            input_shape=self.input_shape,
-            auto_expand_grayscale=self.auto_expand_grayscale,
-            allow_channel_reduce=self.allow_channel_reduce,
-        )
-        mask_pos = self._ste_mask(self.ta_pos, self.tau, use_ste)
-        mask_neg = self._ste_mask(self.ta_neg, self.tau, use_ste)
-        mask_pos_inv = self._ste_mask(self.ta_pos_inv, self.tau, use_ste)
-        mask_neg_inv = self._ste_mask(self.ta_neg_inv, self.tau, use_ste)
-
-        pos_strength = self._strength(x, mask_pos, mask_pos_inv)
-        neg_strength = self._strength(x, mask_neg, mask_neg_inv)
+    def forward(self, x: torch.Tensor, use_ste: bool = True, skip_norm: bool = False):
+        if not skip_norm:
+            x = prepare_tm_input(
+                x,
+                n_features=self.n_features,
+                input_shape=self.input_shape,
+                auto_expand_grayscale=self.auto_expand_grayscale,
+                allow_channel_reduce=self.allow_channel_reduce,
+            )
+            
+        # Fuse mask calculation
+        # [ta_pos; ta_neg; ta_pos_inv; ta_neg_inv] -> [4*half, F]
+        all_logits = torch.cat([self.ta_pos, self.ta_neg, self.ta_pos_inv, self.ta_neg_inv], dim=0)
+        all_masks = self._ste_mask(all_logits, self.tau, use_ste)
+        
+        half = self.n_clauses // 2
+        mask_pos = all_masks[0:half]
+        mask_neg = all_masks[half:2*half]
+        mask_pos_inv = all_masks[2*half:3*half]
+        mask_neg_inv = all_masks[3*half:4*half]
+        
+        # Enforce capacity constraints?
+        # _strength calls _clause_capacity then _straight_relu(capacity - mismatch)
+        # mismatch = (1-x)@mask_pos.t() + x@mask_inv.t()
+        
+        # We can fuse mismatch calculation!
+        # X_combined = [1-x, x] -> [B, 2F]
+        # W_pos = [mask_pos, mask_pos_inv] -> [half, 2F]
+        # W_neg = [mask_neg, mask_neg_inv] -> [half, 2F]
+        # W_total = [W_pos; W_neg] -> [n_clauses, 2F]
+        
+        x_neg = 1.0 - x
+        X_combined = torch.cat([x_neg, x], dim=1)
+        
+        W_pos = torch.cat([mask_pos, mask_pos_inv], dim=1)
+        W_neg = torch.cat([mask_neg, mask_neg_inv], dim=1)
+        W_total = torch.cat([W_pos, W_neg], dim=0)
+        
+        mismatch = F.linear(X_combined, W_total) # [B, n_clauses]
+        
+        # Capacity = sum(mask_pos + mask_inv)
+        # W_total rows are [mask_pos, mask_pos_inv] etc.
+        # So sum(row) is exactly included capacity!
+        
+        capacity = W_total.sum(dim=1).unsqueeze(0) # [1, n_clauses]
+        
+        # Apply literal budget constraints to capacity
+        if self.literal_budget is not None:
+            limit = torch.as_tensor(float(self.literal_budget), device=capacity.device)
+            capacity = torch.minimum(capacity, limit)
+        if self.lf > 0:
+            limit = torch.as_tensor(float(self.lf), device=capacity.device)
+            capacity = torch.minimum(capacity, limit)
+            
+        # Strength = ReLU(capacity - mismatch)
+        raw = capacity - mismatch
+        strength = self._straight_relu(raw)
+        
+        pos_strength = strength[:, :half]
+        neg_strength = strength[:, half:]
 
         clause_votes = torch.cat([pos_strength, -neg_strength], dim=1)
         if self.team_per_class:
@@ -610,21 +663,128 @@ class FuzzyPatternTM_STCM(nn.Module):
         return self._product_strength(x, mask_pos, mask_inv)
 
     def _clause_outputs(self, x: torch.Tensor, use_ste: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mask_pos = self._mask_from_logits(self.pos_logits, use_ste)
-        mask_neg = self._mask_from_logits(self.neg_logits, use_ste)
-        pos_pos, pos_inv = self._split_masks(mask_pos, self.pos_logits)
-        neg_pos, neg_inv = self._split_masks(mask_neg, self.neg_logits)
+        # Batch calculate masks
+        # Stack logits: [4*half, n_features]
+        # Note: self.pos_logits is [half, F], self.neg_logits is [half, F]
+        # Masks required: pos_pos, pos_inv, neg_pos, neg_inv
+        # STCM only stores pos_logits and neg_logits.
+        # _split_masks splits one logit set into (pos, inv).
+        
+        # We can stack pos_logits and neg_logits -> [2*half, F]
+        # Calculate mask -> [2*half, F]
+        # Then split -> [4*half, F] effectively? No, split logic is inside _split_masks.
+        
+        # Let's optimize _split_masks first.
+        # It does sigmoid(logits) and sigmoid(-logits).
+        # sigmoid(-x) = 1 - sigmoid(x).
+        
+        all_logits = torch.cat([self.pos_logits, self.neg_logits], dim=0) # [2*half, F]
+        
+        temp = max(self.ste_temperature, 1e-6)
+        
+        if use_ste:
+             mask_all = _ste_ternary(all_logits, self.ternary_band, self.ste_temperature)
+        else:
+             mask_all = torch.tanh(all_logits / self.ste_temperature)
+             
+        # Split back
+        half = self.n_clauses // 2
+        mask_pos = mask_all[:half]
+        mask_neg = mask_all[half:]
+        
+        # Now _split_masks logic:
+        # hard_pos = clamp(mask, min=0)
+        # hard_inv = clamp(-mask, min=0)
+        # soft_pos = sigmoid(logits/temp)
+        # soft_inv = sigmoid(-logits/temp)
+        
+        # Optimize soft calculation:
+        soft_all = torch.sigmoid(all_logits / temp)
+        soft_pos_all = soft_all
+        soft_inv_all = 1.0 - soft_all # sigmoid(-x) == 1 - sigmoid(x)
+        
+        # Optimize hard calculation:
+        hard_pos_all = torch.clamp(mask_all, min=0.0)
+        hard_inv_all = torch.clamp(-mask_all, min=0.0)
+        
+        # Apply STE-like pass-through if needed (mask_all already has it if use_ste? No, _split_masks adds another layer?)
+        # _mask_from_logits returns values in [-1, 1].
+        # _split_masks splits -1 -> inv=1, 1 -> pos=1.
+        # And adds soft gradients.
+        
+        pos_all = hard_pos_all + (soft_pos_all - soft_pos_all.detach())
+        inv_all = hard_inv_all + (soft_inv_all - soft_inv_all.detach())
+        
+        # Split into pos/neg halves
+        pos_pos = pos_all[:half]
+        pos_inv = inv_all[:half]
+        neg_pos = pos_all[half:]
+        neg_inv = inv_all[half:]
+        
+        # Enforce budget
+        # We can optimize enforce_budget later if needed, it's elementwise/sum.
         pos_pos, pos_inv = self._enforce_literal_budget(pos_pos, pos_inv)
         neg_pos, neg_inv = self._enforce_literal_budget(neg_pos, neg_inv)
+        
+        # Calculate strengths
+        # Similar to STE optimization: Fuse into single linear call?
+        # _strength uses either capacity or product.
+        # Capacity: relu(capacity - mismatch)
+        # Mismatch = (1-x) @ mask_pos.t() + x @ mask_inv.t()
+        
+        # We can reuse the [1-x, x] concatenation trick!
+        
+        x_neg = 1.0 - x
+        X_combined = torch.cat([x_neg, x], dim=1) # [B, 2F]
+        
+        # Weights:
+        # W_pos = [mask_pos, mask_inv] (concatenated along F dim)
+        # W_neg = [mask_neg, mask_neg_inv]
+        
+        # But wait, mask_pos is [half, F].
+        # We need [mask_pos; mask_inv] -> [half, 2F].
+        
+        W_pos = torch.cat([pos_pos, pos_inv], dim=1)
+        W_neg = torch.cat([neg_pos, neg_inv], dim=1)
+        W_total = torch.cat([W_pos, W_neg], dim=0) # [n_clauses, 2F]
+        
+        # Mismatches / Penalties
+        # For Capacity: mismatch = X_combined @ W_total.t()
+        # For Product: penalties = X_combined @ W_total.t()
+        # Both are just linear projection!
+        
+        raw_outputs = F.linear(X_combined, W_total) # [B, n_clauses]
+        
+        if self.operator == "capacity":
+            # Need capacity per clause
+            # capacity = sum(mask_pos + mask_inv)
+            # W_total is [mask_pos, mask_inv] per row.
+            # So sum(W_total, dim=1) is exactly capacity!
+            capacity = W_total.sum(dim=1).unsqueeze(0) # [1, n_clauses]
+            
+            # Apply literal budget constraints to capacity (moved here from mask)
+            capacity = self._apply_literal_constraints(capacity)
 
-        pos_strength = self._strength(x, pos_pos, pos_inv)
-        neg_strength = self._strength(x, neg_pos, neg_inv)
+            # Raw strength = capacity - mismatch
+            # mismatch = raw_outputs
+            strength = self._straight_relu(capacity - raw_outputs)
+            
+        else: # Product
+            # strength = exp(-clamp(raw_outputs * scale))
+            scaled = torch.clamp(raw_outputs * self.product_scale, min=0.0, max=10.0)
+            strength = torch.exp(-scaled)
+            
+        # Split back to pos/neg strength for voting
+        pos_strength = strength[:, :half]
+        neg_strength = strength[:, half:]
+        
         clause_votes = torch.cat([pos_strength, -neg_strength], dim=1)
 
         if self.vote_clamp is not None:
             clause_votes = clause_votes.clamp(-self.vote_clamp, self.vote_clamp)
         if self.training and self.clause_dropout > 0.0:
             clause_votes = F.dropout(clause_votes, p=self.clause_dropout, training=True)
+            
         return pos_strength, neg_strength, clause_votes
 
     def _clause_capacity(self, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
@@ -665,21 +825,26 @@ class FuzzyPatternTM_STCM(nn.Module):
         mask_inv = mask_inv * scale
         return mask_pos, mask_inv
 
-    def forward(self, x: torch.Tensor, use_ste: bool = True):
+    def forward(self, x: torch.Tensor, use_ste: bool = True, skip_norm: bool = False):
         """
         Args:
             x: Tensor in [0,1] with shape [batch, features] or image tensor convertible
                via prepare_tm_input.
             use_ste: Whether to use STE-based ternary masks (default True). If False,
                      hard ternary masks (no gradient) are used.
+            skip_norm: If True, bypass prepare_tm_input checks.
         """
-        flat_x = prepare_tm_input(
-            x,
-            n_features=self.n_features,
-            input_shape=self.input_shape,
-            auto_expand_grayscale=self.auto_expand_grayscale,
-            allow_channel_reduce=self.allow_channel_reduce,
-        )
+        if not skip_norm:
+            flat_x = prepare_tm_input(
+                x,
+                n_features=self.n_features,
+                input_shape=self.input_shape,
+                auto_expand_grayscale=self.auto_expand_grayscale,
+                allow_channel_reduce=self.allow_channel_reduce,
+            )
+        else:
+            flat_x = x
+            
         if self.training and self.literal_dropout > 0.0:
             flat_x = F.dropout(flat_x, p=self.literal_dropout, training=True)
 

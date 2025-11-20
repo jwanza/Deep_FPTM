@@ -376,40 +376,101 @@ def _compute_thresholds(
     return thresholds_all, caches_all
 
 
+def _prepare_batched_kernels(device: torch.device = torch.device("cpu")) -> Dict[str, Tuple[Tensor, int]]:
+    kernels_by_size: Dict[int, List[Tensor]] = {}
+    kernel_names: Dict[int, List[str]] = {}
+    
+    # Helper to add kernel
+    def add_k(name, k, pad):
+        if k.shape[-1] not in kernels_by_size:
+            kernels_by_size[k.shape[-1]] = []
+            kernel_names[k.shape[-1]] = []
+        kernels_by_size[k.shape[-1]].append(k)
+        kernel_names[k.shape[-1]].append(name)
+
+    base_kernels = _prepare_kernels(device)
+    for name, (k, pad) in base_kernels.items():
+        add_k(name, k, pad)
+        
+    # Stack kernels of same size
+    # Returns: {size: (stacked_kernels [N, 1, K, K], padding, names)}
+    batched_kernels = {}
+    for size, k_list in kernels_by_size.items():
+        stacked = torch.stack(k_list, dim=0).unsqueeze(1) # [N, 1, K, K]
+        # Padding is size//2
+        pad = size // 2
+        batched_kernels[size] = (stacked, pad, kernel_names[size])
+        
+    return batched_kernels
+
+
 def _booleanize_batch(
     raw: Tensor,
-    kernels: Dict[str, Tuple[Tensor, int]],
+    kernels: Dict[str, Tuple[Tensor, int]], # Legacy argument kept for compatibility but ignored/refetched inside if optimizing
     thresholds: Sequence[Dict[str, Dict[str, Dict[str, float]]]],
 ) -> Tensor:
+    # Re-fetch batched kernels on correct device
+    device = raw.device
+    batched_kernels = _prepare_batched_kernels(device)
+    
     features: List[Tensor] = []
     batch = raw.size(0)
+    
     for channel in range(raw.size(1)):
         channel_tensor = raw[:, channel, :, :]
         channel_thresholds = thresholds[channel]
-
+        
+        # 1. Raw features
         raw_flat = channel_tensor.reshape(batch, -1)
         features.append((raw_flat > 0).to(torch.uint8))
+        
+        # Parallelize threshold checks for raw
+        # raw_thresholds: [3] -> [1, 3] -> broadcast against [B, H*W] -> [B, H*W, 3] ?
+        # Actually simpler to just loop the 3 thresholds, overhead is minimal compared to convs
         for key in ("0.25", "0.50", "0.75"):
             thresh = channel_thresholds["raw"]["pos"][key]
             features.append((raw_flat > thresh).to(torch.uint8))
 
-        for name_order in ("x3", "y3", "x5", "y5", "x7", "y7", "x9", "y9"):
-            kernel, crop = kernels[name_order]
-            conv = _full_convolution(channel_tensor, kernel, crop)
-            conv_flat = conv.reshape(batch, -1)
-            features.extend(
-                [
-                    (conv_flat > 0).to(torch.uint8),
-                    (conv_flat > channel_thresholds[name_order]["pos"]["0.25"]).to(torch.uint8),
-                    (conv_flat > channel_thresholds[name_order]["pos"]["0.34"]).to(torch.uint8),
-                    (conv_flat > channel_thresholds[name_order]["pos"]["0.50"]).to(torch.uint8),
-                    (conv_flat > channel_thresholds[name_order]["pos"]["0.75"]).to(torch.uint8),
-                    (conv_flat < channel_thresholds[name_order]["neg"]["0.75"]).to(torch.uint8),
-                    (conv_flat < channel_thresholds[name_order]["neg"]["0.66"]).to(torch.uint8),
-                    (conv_flat < channel_thresholds[name_order]["neg"]["0.50"]).to(torch.uint8),
-                    (conv_flat < channel_thresholds[name_order]["neg"]["0.25"]).to(torch.uint8),
-                ]
-            )
+        # 2. Convolutional features (Batched)
+        for size, (kernel_stack, pad, names) in batched_kernels.items():
+             # Kernel stack: [N_kernels, 1, K, K]
+             # Input: [B, H, W] -> unsqueeze -> [B, 1, H, W]
+             # Conv output: [B, N_kernels, H, W]
+             
+             # F.conv2d supports grouped convolution, but here we just want to apply N kernels to 1 input channel
+             # effectively treating input as 1 channel and output as N_kernels channels.
+             
+             conv_out = F.conv2d(channel_tensor.unsqueeze(1), kernel_stack, padding=pad)
+             # conv_out: [B, N_kernels, H, W]
+             
+             # Flatten spatial dims: [B, N_kernels, H*W]
+             conv_flat = conv_out.view(batch, len(names), -1)
+             
+             for i, name in enumerate(names):
+                 c_flat = conv_flat[:, i, :]
+                 
+                 # Apply all 8 threshold checks
+                 # Pre-fetching thresholds to avoid dict lookup in loop?
+                 # pos: 0.25, 0.34, 0.50, 0.75
+                 # neg: 0.75, 0.66, 0.50, 0.25
+                 
+                 # Base features
+                 features.append((c_flat > 0).to(torch.uint8))
+                 
+                 # Pos checks
+                 t_pos = channel_thresholds[name]["pos"]
+                 features.append((c_flat > t_pos["0.25"]).to(torch.uint8))
+                 features.append((c_flat > t_pos["0.34"]).to(torch.uint8))
+                 features.append((c_flat > t_pos["0.50"]).to(torch.uint8))
+                 features.append((c_flat > t_pos["0.75"]).to(torch.uint8))
+                 
+                 # Neg checks
+                 t_neg = channel_thresholds[name]["neg"]
+                 features.append((c_flat < t_neg["0.75"]).to(torch.uint8))
+                 features.append((c_flat < t_neg["0.66"]).to(torch.uint8))
+                 features.append((c_flat < t_neg["0.50"]).to(torch.uint8))
+                 features.append((c_flat < t_neg["0.25"]).to(torch.uint8))
+
     return torch.cat(features, dim=1)
 
 
