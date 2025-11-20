@@ -73,6 +73,33 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 DEFAULT_IMAGENET_ROOT = os.environ.get("TM_IMAGENET_ROOT", "/datasets/imagenet")
 
+DATASET_STATS = {
+    "cifar10": ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+    "cifar100": ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    "mnist": ((0.1307,), (0.3081,)),
+    "fashionmnist": ((0.1307,), (0.3081,)),  # Approximate, using MNIST stats often sufficient
+    "svhn": ((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
+    "stl10": ((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713)),
+    "gtsrb": ((0.3337, 0.3064, 0.3171), (0.2672, 0.2564, 0.2629)),
+    "imagenet": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    # MedMNIST 2D Datasets
+    "pneumoniamnist": ((0.5719,), (0.1448,)),
+    "pathmnist": ((0.7405, 0.5334, 0.7059), (0.0723, 0.1035, 0.0729)),
+    "dermamnist": ((0.7625, 0.5378, 0.5613), (0.0884, 0.1149, 0.1261)),
+    "octmnist": ((0.1887,), (0.1696,)),
+    "retinamnist": ((0.3984, 0.2447, 0.1558), (0.2597, 0.1757, 0.1194)),
+    "breastmnist": ((0.3276,), (0.1829,)),
+    "bloodmnist": ((0.7935, 0.6589, 0.6959), (0.2033, 0.2277, 0.1131)),
+    "tissuemnist": ((0.1011,), (0.0791,)),
+    "organamnist": ((0.4686,), (0.2468,)),
+    "organcmnist": ((0.4917,), (0.2362,)),
+    "organsmnist": ((0.4969,), (0.2295,)),
+    "chestmnist": ((0.4941,), (0.2174,)),
+}
+# Aliases for datasets using ImageNet stats
+for ds in ["food101", "stanforddogs", "caltech256"]:
+    DATASET_STATS[ds] = DATASET_STATS["imagenet"]
+
 DATASET_CONFIGS = {
     "mnist": {
         "train_class": datasets.MNIST,
@@ -81,6 +108,7 @@ DATASET_CONFIGS = {
         "input_channels": 1,
         "image_size": (28, 28),
         "num_classes": 10,
+        "split_mode": "train_kw",
     },
     "fashionmnist": {
         "train_class": datasets.FashionMNIST,
@@ -89,6 +117,7 @@ DATASET_CONFIGS = {
         "input_channels": 1,
         "image_size": (28, 28),
         "num_classes": 10,
+        "split_mode": "train_kw",
     },
     "cifar10": {
         "train_class": datasets.CIFAR10,
@@ -97,6 +126,62 @@ DATASET_CONFIGS = {
         "input_channels": 3,
         "image_size": (32, 32),
         "num_classes": 10,
+        "split_mode": "train_kw",
+    },
+    "cifar100": {
+        "train_class": datasets.CIFAR100,
+        "test_class": datasets.CIFAR100,
+        "transform": transforms.ToTensor(),
+        "input_channels": 3,
+        "image_size": (32, 32),
+        "num_classes": 100,
+        "split_mode": "train_kw",
+    },
+    "svhn": {
+        "train_class": datasets.SVHN,
+        "test_class": datasets.SVHN,
+        "transform": transforms.ToTensor(),
+        "input_channels": 3,
+        "image_size": (32, 32),
+        "num_classes": 10,
+        "split_mode": "split_str",
+    },
+    "gtsrb": {
+        "train_class": datasets.GTSRB,
+        "test_class": datasets.GTSRB,
+        "transform": transforms.Resize((32, 32)),
+        "input_channels": 3,
+        "image_size": (32, 32),
+        "num_classes": 43,
+        "split_mode": "split_str",
+    },
+    "stl10": {
+        "train_class": datasets.STL10,
+        "test_class": datasets.STL10,
+        "transform": transforms.ToTensor(),
+        "input_channels": 3,
+        "image_size": (96, 96),
+        "num_classes": 10,
+        "split_mode": "split_str",
+    },
+    "food101": {
+        "train_class": datasets.Food101,
+        "test_class": datasets.Food101,
+        "transform": transforms.Resize((224, 224)),
+        "input_channels": 3,
+        "image_size": (224, 224),
+        "num_classes": 101,
+        "split_mode": "split_str",
+    },
+    # StanfordDogs removed as it is not available in current torchvision
+    "caltech256": {
+        "train_class": datasets.Caltech256,
+        "test_class": datasets.Caltech256,
+        "transform": transforms.Resize((224, 224)),
+        "input_channels": 3,
+        "image_size": (224, 224),
+        "num_classes": 257,
+        "split_mode": "none",
     },
     "imagenet": {
         "train_class": datasets.ImageFolder,
@@ -106,8 +191,37 @@ DATASET_CONFIGS = {
         "input_channels": 3,
         "image_size": (224, 224),
         "num_classes": 1000,
+        "split_mode": "train_kw",
     },
 }
+
+# Add MedMNIST datasets to config
+# Note: MedMNIST dataset class is resolved at runtime if installed
+MEDMNIST_METADATA = {
+    "pneumoniamnist": {"input_channels": 1, "num_classes": 2},
+    "pathmnist": {"input_channels": 3, "num_classes": 9},
+    "dermamnist": {"input_channels": 3, "num_classes": 7},
+    "octmnist": {"input_channels": 1, "num_classes": 4},
+    "retinamnist": {"input_channels": 3, "num_classes": 5},
+    "breastmnist": {"input_channels": 1, "num_classes": 2},
+    "bloodmnist": {"input_channels": 3, "num_classes": 8},
+    "tissuemnist": {"input_channels": 1, "num_classes": 8},
+    "organamnist": {"input_channels": 1, "num_classes": 11},
+    "organcmnist": {"input_channels": 1, "num_classes": 11},
+    "organsmnist": {"input_channels": 1, "num_classes": 11},
+    "chestmnist": {"input_channels": 1, "num_classes": 14},
+}
+
+for med_key, meta in MEDMNIST_METADATA.items():
+    DATASET_CONFIGS[med_key] = {
+        "train_class": "MedMNIST",  # Special marker
+        "test_class": "MedMNIST",
+        "transform": transforms.ToTensor(),
+        "input_channels": meta["input_channels"],
+        "image_size": (28, 28),
+        "num_classes": meta["num_classes"],
+        "split_mode": "medmnist",
+    }
 
 BASELINE_SCENARIOS: Dict[str, Dict[str, Any]] = {
     "mnist_vit_patch4": {
@@ -678,15 +792,7 @@ def _parse_csv_floats(values: Optional[str]) -> Optional[Tuple[float, ...]]:
 
 
 def _known_dataset_norm(dataset_key: str) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
-    key = dataset_key.lower()
-    if key in {"cifar10"}:
-        return ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-    if key in {"cifar100"}:
-        return ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
-    if key in {"mnist", "fashionmnist"}:
-        # Defaults near canonical; using ToTensor() [0,1] often sufficient, but include for completeness
-        return ((0.1307,), (0.3081,))
-    return None
+    return DATASET_STATS.get(dataset_key.lower())
 
 
 def _compute_dataset_stats(dataloader: DataLoader, batches: int) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
@@ -1235,7 +1341,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deepctm-head-clauses", type=int, default=None, help="Clause count in final TM classifier head.")
     parser.add_argument("--deepctm-dropout", type=float, default=0.1, help="Dropout in Deep CTM blocks (Dropout2d).")
     parser.add_argument("--deepctm-tau", type=float, default=0.5, help="Tau for Deep CTM blocks and head.")
-    parser.add_argument("--deepctm-core", choices=["tm", "deeptm"], default="tm", help="Per-patch core for deep_ctm (tm or deeptm).")
+    parser.add_argument("--deepctm-core", choices=["tm", "deeptm", "stcm", "deepstcm"], default="tm", help="Per-patch core for deep_ctm.")
     parser.add_argument("--deepcstcm-core", choices=["stcm", "deepstcm"], default="stcm", help="Per-patch core for deep_cstcm (stcm or deepstcm).")
     parser.add_argument("--deepctm-core-hidden-dims", default=None, help="Comma-separated hidden dims for deep patch cores (deeptm/deepstcm).")
     parser.add_argument("--deepctm-aux-weight", type=float, default=0.0, help="Auxiliary CE weight for per-block CTM diagnostic heads.")
@@ -3007,7 +3113,17 @@ def train_tm_model(model: nn.Module,
                     loss_incorrect = loss_incorrect[mask].view(B_size, C_num - 1)
                     loss = (loss_correct + loss_incorrect.sum(dim=1)).mean()
                 else:
-                    loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                    if y.dim() > 1:
+                        # Multi-label case (e.g., ChestMNIST) or one-hot encoded
+                        if y.size(1) > 1:
+                             if label_smoothing > 0.0:
+                                  y = y * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                             loss = F.binary_cross_entropy_with_logits(logits, y.float())
+                        else:
+                             # It's [B, 1] which is just a squeezed class index
+                             loss = F.cross_entropy(logits, y.squeeze(1), label_smoothing=label_smoothing)
+                    else:
+                        loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
                 
                 if l1_lambda > 0.0:
                     l1_reg = torch.tensor(0.0, device=device)
@@ -3740,7 +3856,11 @@ def run_variant_deepctm(train_loader,
                         ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
                         ctm_ema_decay: float = 0.0,
                         ctm_self_distill_weight: float = 0.0,
-                        ctm_self_distill_temp: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                        ctm_self_distill_temp: float = 1.0,
+                        stcm_operator: str = "capacity",
+                        stcm_ternary_voting: bool = False,
+                        stcm_ternary_band: float = 0.05,
+                        stcm_ste_temperature: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepCTMNetwork(
         in_channels=in_channels,
         image_size=image_size,
@@ -3761,7 +3881,11 @@ def run_variant_deepctm(train_loader,
         mix_type=mix_type,
         use_stem=use_stem,
         stem_channels=stem_channels,
-        layer_cls=FuzzyPatternTM_STE,
+        layer_cls=FuzzyPatternTM_STCM if core_backend in {"stcm", "deepstcm"} else FuzzyPatternTM_STE,
+        stcm_operator=stcm_operator,
+        stcm_ternary_voting=stcm_ternary_voting,
+        stcm_ternary_band=stcm_ternary_band,
+        stcm_ste_temperature=stcm_ste_temperature,
     ).to(device)
     label = "Deep-CTM"
     if device.type == "cuda":
@@ -3845,9 +3969,10 @@ def run_variant_deepcstcm(train_loader,
                           use_stem: bool = False,
                           stem_channels: Optional[int] = None,
                           ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
-                          ctm_ema_decay: float = 0.0,
-                          ctm_self_distill_weight: float = 0.0,
-                          ctm_self_distill_temp: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                        ctm_ema_decay: float = 0.0,
+                        ctm_self_distill_weight: float = 0.0,
+                        ctm_self_distill_temp: float = 1.0,
+                        ) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepCTMNetwork(
         in_channels=in_channels,
         image_size=image_size,
@@ -4380,11 +4505,30 @@ def run_variant_transformer(train_loader,
                     else {}
                 )
                 if lam is not None:
-                    loss = lam * F.cross_entropy(logits, targets_a, label_smoothing=label_smoothing) + (
-                        1 - lam
-                    ) * F.cross_entropy(logits, targets_b, label_smoothing=label_smoothing)
+                    if y.dim() > 1 and y.size(1) > 1:
+                        # Multilabel mixup
+                        if label_smoothing > 0.0:
+                             targets_a = targets_a * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                             targets_b = targets_b * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                        loss = lam * F.binary_cross_entropy_with_logits(logits, targets_a.float()) + (
+                            1 - lam
+                        ) * F.binary_cross_entropy_with_logits(logits, targets_b.float())
+                    else:
+                        # Multiclass mixup
+                        loss = lam * F.cross_entropy(logits, targets_a, label_smoothing=label_smoothing) + (
+                            1 - lam
+                        ) * F.cross_entropy(logits, targets_b, label_smoothing=label_smoothing)
                 else:
-                    loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                    if y.dim() > 1 and y.size(1) > 1:
+                        # Multilabel standard
+                        if label_smoothing > 0.0:
+                             y = y * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                        loss = F.binary_cross_entropy_with_logits(logits, y.float())
+                    else:
+                        # Multiclass standard
+                        if y.dim() > 1 and y.size(1) == 1:
+                            y = y.squeeze(1)
+                        loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
                 if collect_aux and component_logits:
                     aux_loss = 0.0
                     for aux_logits in component_logits.values():
@@ -5165,18 +5309,85 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
             train_ds = dataset_cfg["train_class"](imagenet_train_dir, transform=train_transform)
             test_ds = dataset_cfg["test_class"](imagenet_val_dir, transform=test_transform)
         else:
-            train_ds = dataset_cfg["train_class"](
-                root=args.dataset_root,
-                train=True,
-                download=args.download,
-                transform=train_transform,
-            )
-            test_ds = dataset_cfg["test_class"](
-                root=args.dataset_root,
-                train=False,
-                download=args.download,
-                transform=test_transform,
-            )
+            split_mode = dataset_cfg.get("split_mode", "train_kw")
+            if split_mode == "split_str":
+                train_ds = dataset_cfg["train_class"](
+                    root=args.dataset_root,
+                    split="train",
+                    download=args.download,
+                    transform=train_transform,
+                )
+                test_ds = dataset_cfg["test_class"](
+                    root=args.dataset_root,
+                    split="test",
+                    download=args.download,
+                    transform=test_transform,
+                )
+            elif split_mode == "medmnist":
+                try:
+                    import medmnist
+                    from medmnist import INFO
+                except ImportError:
+                    raise ImportError("MedMNIST datasets require the 'medmnist' package. Install with 'pip install medmnist'.")
+                
+                info = INFO[dataset_key]
+                DataClass = getattr(medmnist, info['python_class'])
+                
+                train_ds = DataClass(
+                    root=args.dataset_root,
+                    split="train",
+                    download=args.download,
+                    transform=train_transform,
+                    size=28, # Explicitly requesting 28x28
+                )
+                # MedMNIST often has 'val' split too, but we map 'test' to test_ds
+                # If validation is needed as holdout, it can be handled via --test-holdout-fraction
+                test_ds = DataClass(
+                    root=args.dataset_root,
+                    split="test",
+                    download=args.download,
+                    transform=test_transform,
+                    size=28,
+                )
+            elif split_mode == "none":
+                # For datasets without native splits (e.g. Caltech256)
+                full_ds_train = dataset_cfg["train_class"](
+                    root=args.dataset_root,
+                    download=args.download,
+                    transform=train_transform,
+                )
+                full_ds_test = dataset_cfg["test_class"](
+                    root=args.dataset_root,
+                    download=args.download,
+                    transform=test_transform,
+                )
+                total_len = len(full_ds_train)
+                test_len = int(0.2 * total_len)
+                train_len = total_len - test_len
+                
+                g = torch.Generator()
+                g.manual_seed(args.seed if args.seed is not None else 42)
+                indices = torch.randperm(total_len, generator=g).tolist()
+                
+                train_indices = indices[:train_len]
+                test_indices = indices[train_len:]
+                
+                train_ds = torch.utils.data.Subset(full_ds_train, train_indices)
+                test_ds = torch.utils.data.Subset(full_ds_test, test_indices)
+            else:
+                # Default "train_kw"
+                train_ds = dataset_cfg["train_class"](
+                    root=args.dataset_root,
+                    train=True,
+                    download=args.download,
+                    transform=train_transform,
+                )
+                test_ds = dataset_cfg["test_class"](
+                    root=args.dataset_root,
+                    train=False,
+                    download=args.download,
+                    transform=test_transform,
+                )
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
@@ -5256,9 +5467,18 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
     if feature_mode == "conv":
         config_name = args.tm_feature_config or dataset_key
         if config_name not in DEFAULT_PREPROCESS_CONFIGS:
-            raise ValueError(
-                f"No TM preprocessing config named '{config_name}'. Available: {', '.join(DEFAULT_PREPROCESS_CONFIGS)}."
-            )
+             # Try fallback based on resolution
+             if image_h == 32 and image_w == 32 and input_channels == 3:
+                 config_name = "generic_32_rgb"
+             elif image_h == 224 and image_w == 224 and input_channels == 3:
+                 config_name = "generic_224_rgb"
+             elif image_h == 28 and image_w == 28 and input_channels == 1:
+                 config_name = "generic_28_gray"
+             
+             if config_name not in DEFAULT_PREPROCESS_CONFIGS:
+                raise ValueError(
+                    f"No TM preprocessing config named '{args.tm_feature_config or dataset_key}'. Available: {', '.join(DEFAULT_PREPROCESS_CONFIGS)}."
+                )
         base_config = DEFAULT_PREPROCESS_CONFIGS[config_name]
         if args.tm_feature_size is not None:
             base_config = replace(base_config, image_size=tuple(args.tm_feature_size))
@@ -5647,6 +5867,10 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     weight_decay=weight_decay,
                     gradient_centralize=args.gradient_centralize,
                     label_smoothing=args.label_smoothing,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_cstcm" or (model_key == "deep_stcm" and args.deepctm_channels):

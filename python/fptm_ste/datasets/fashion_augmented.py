@@ -91,6 +91,30 @@ DEFAULT_PREPROCESS_CONFIGS: Dict[str, PreprocessConfig] = {
         to_grayscale=False,
         augmentations=DEFAULT_AUGMENTATIONS,
     ),
+    # Generic fallback for any new dataset using 32x32 RGB
+    "generic_32_rgb": PreprocessConfig(
+        name="generic_32_rgb",
+        image_size=(32, 32),
+        in_channels=3,
+        to_grayscale=False,
+        augmentations=DEFAULT_AUGMENTATIONS,
+    ),
+    # Generic fallback for 224x224 RGB
+    "generic_224_rgb": PreprocessConfig(
+        name="generic_224_rgb",
+        image_size=(224, 224),
+        in_channels=3,
+        to_grayscale=False,
+        augmentations=DEFAULT_AUGMENTATIONS,
+    ),
+    # Generic fallback for 28x28 grayscale
+    "generic_28_gray": PreprocessConfig(
+        name="generic_28_gray",
+        image_size=(28, 28),
+        in_channels=1,
+        to_grayscale=True,
+        augmentations=DEFAULT_AUGMENTATIONS,
+    ),
 }
 
 
