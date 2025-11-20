@@ -237,11 +237,31 @@ def _compute_thresholds(
     raw: Tensor,
     kernels: Dict[str, Tuple[Tensor, int]],
 ) -> Tuple[List[Dict[str, Dict[str, Dict[str, float]]]], List[Dict[str, Tensor]]]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Move kernels to device
+    kernels_dev = {k: (v[0].to(device), v[1]) for k, v in kernels.items()}
+    
     thresholds_all: List[Dict[str, Dict[str, Dict[str, float]]]] = []
     caches_all: List[Dict[str, Tensor]] = []
+    
+    # Process in chunks to avoid OOM on GPU if dataset is huge
+    chunk_size = 4096
+    
     for channel in range(raw.size(1)):
-        channel_tensor = raw[:, channel, :, :]
-        raw_pos = channel_tensor[channel_tensor > 0]
+        # Keep full channel tensor on CPU to avoid OOM, move chunks to GPU
+        channel_tensor_cpu = raw[:, channel, :, :]
+        
+        # 1. Compute raw thresholds
+        # Sample a subset for quantile computation to speed up
+        if channel_tensor_cpu.numel() > 10_000_000:
+             indices = torch.randperm(channel_tensor_cpu.size(0))[:10000]
+             sample_tensor = channel_tensor_cpu[indices].to(device)
+        else:
+             sample_tensor = channel_tensor_cpu.to(device)
+             
+        raw_pos = sample_tensor[sample_tensor > 0]
+        
         thresholds: Dict[str, Dict[str, Dict[str, float]]] = {
             "raw": {
                 "pos": {
@@ -251,12 +271,19 @@ def _compute_thresholds(
                 }
             }
         }
+        
+        # For convolution thresholds, we also need to compute on sample
+        # To ensure consistency, we use the same sample_tensor
         cache: Dict[str, Tensor] = {}
         pos_queries = [0.25, 0.34, 0.5, 0.75]
         neg_queries = [1 - q for q in pos_queries]
-        for name, (kernel, crop) in kernels.items():
-            conv = _full_convolution(channel_tensor, kernel, crop)
-            cache[name] = conv
+        
+        for name, (kernel, crop) in kernels_dev.items():
+            # Convolve the sample
+            conv = _full_convolution(sample_tensor, kernel, crop)
+            # Note: We don't cache the full convolution here anymore because it's too big for GPU RAM often
+            # cache[name] = conv # Removed caching of full dataset conv for memory safety
+            
             pos_vals = conv[conv > 0]
             neg_vals = conv[conv < 0]
             thresholds[name] = {
@@ -326,20 +353,48 @@ def _write_packed_features(
     batch_size: int,
     num_bits: int,
 ) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Move kernels to device
+    kernels = {k: (v[0].to(device), v[1]) for k, v in kernels.items()}
+    
     packed_cols = (num_bits + 7) // 8
     mmap = _save_memmap(out_file, (images.size(0), packed_cols), np.uint8)
+    
+    # Increase batch size for GPU if possible
+    # If images are 32x32, 256 is too small for efficient GPU
+    if device.type == "cuda":
+        batch_size = max(batch_size, 2048)
+
     try:
         start = 0
-        while start < images.size(0):
-            end = min(start + batch_size, images.size(0))
-            batch = images[start:end].to(torch.float32)
+        total = images.size(0)
+        while start < total:
+            end = min(start + batch_size, total)
+            # Move batch to GPU
+            batch = images[start:end].to(device, dtype=torch.float32)
+            
+            # _booleanize_batch now runs on GPU
             bools = _booleanize_batch(batch, kernels, thresholds)
-            packed = _pack_bits(bools.cpu().numpy().astype(np.uint8), num_bits)
+            
+            # Move back to CPU for packing
+            # np.packbits requires numpy array (CPU)
+            # We cast to uint8 on GPU first to save bus bandwidth
+            bools_cpu = bools.to("cpu", dtype=torch.uint8).numpy()
+            
+            packed = _pack_bits(bools_cpu, num_bits)
             mmap[start:end, :] = packed
+            
+            # Clear GPU cache explicitly if needed (usually not needed for simple ops but good for safety in loops)
+            # torch.cuda.empty_cache()
+            
             start = end
+            if start % 10000 == 0:
+                 print(f"Processed {start}/{total} samples...", end="\r")
     finally:
         mmap.flush()
         del mmap
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 class PackedBooleanDataset(Dataset):
