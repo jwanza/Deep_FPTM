@@ -135,11 +135,12 @@ class TestSparseRoutingIntegration:
         
         router = TopKRouter(
             input_dim=integration_params["n_features"],
-            n_experts=4,
+            n_items=4,  # Number of items to route to
             top_k=2,
         )
         
-        weights, indices, lb_loss, logits = router(sample_input)
+        result = router(sample_input)
+        weights, indices = result[0], result[1]
         
         assert weights.shape == (integration_params["batch_size"], 2)
         assert indices.shape == (integration_params["batch_size"], 2)
@@ -182,15 +183,16 @@ class TestClauseAttentionIntegration:
         
         _, clauses = tm(sample_input)
         
+        # MultiHeadClauseAttention expects [batch, seq, dim]
         attention = MultiHeadClauseAttention(
-            clause_dim=1,
+            clause_dim=integration_params["n_clauses"],  # Each sample is treated as a single sequence
             n_heads=2,
-            n_clauses=integration_params["n_clauses"],
         )
         
-        attended = attention(clauses.unsqueeze(-1))
+        # Treat clauses as [batch, 1, n_clauses]
+        attended = attention(clauses.unsqueeze(1))
         
-        assert attended.shape == (integration_params["batch_size"], integration_params["n_clauses"], 1)
+        assert attended.shape == (integration_params["batch_size"], 1, integration_params["n_clauses"])
 
 
 # =============================================================================
@@ -202,9 +204,9 @@ class TestContinualLearningIntegration:
     """Test continual learning with TM."""
     
     def test_ewc_with_stcm(self, integration_params, sample_input):
-        """Test EWC wrapper with STCM."""
+        """Test EWC with STCM."""
         from fptm_ste.tm import FuzzyPatternTM_STCM
-        from fptm_ste.continual import EWCWrapper
+        from fptm_ste.continual import EWCClauseMachine
         
         tm = FuzzyPatternTM_STCM(
             n_features=integration_params["n_features"],
@@ -212,16 +214,16 @@ class TestContinualLearningIntegration:
             n_classes=integration_params["n_classes"],
         )
         
-        ewc = EWCWrapper(tm, lambda_=1000.0)
+        ewc = EWCClauseMachine(tm, lamb=1000.0)
         
         # Forward pass works
-        logits, _ = ewc.model(sample_input)
+        logits, _ = ewc(sample_input)
         assert logits.shape == (integration_params["batch_size"], integration_params["n_classes"])
     
     def test_lora_with_stcm(self, integration_params, sample_input):
         """Test LoRA adapter with STCM."""
         from fptm_ste.tm import FuzzyPatternTM_STCM
-        from fptm_ste.lora_adapter import LoRAWrapper
+        from fptm_ste.lora_adapter import LoRAClauseMachine
         
         tm = FuzzyPatternTM_STCM(
             n_features=integration_params["n_features"],
@@ -229,7 +231,7 @@ class TestContinualLearningIntegration:
             n_classes=integration_params["n_classes"],
         )
         
-        lora_tm = LoRAWrapper(tm, rank=4)
+        lora_tm = LoRAClauseMachine(tm, rank=4)
         
         # Forward pass works
         logits, _ = lora_tm(sample_input)
