@@ -49,7 +49,8 @@ from fptm_ste.datasets import (
     prepare_fashion_augmented_bundle,
 )
 from fptm_ste.visualization import generate_transformer_overlay
-from fptm_ste.trainers import anneal_ste_factor
+from fptm_ste.trainers import anneal_ste_factor, ClauseContrastiveLoss, SupervisedContrastiveLoss
+from fptm_ste.clause_attention import HierarchicalClauseAttention
 
 AVAILABLE_MODELS = ("tm", "stcm", "fptm_equiv", "deep_tm", "deep_stcm", "deep_fptm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
@@ -1305,7 +1306,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stcm-operator",
-        choices=["capacity", "product"],
+        choices=["capacity", "product", "godel", "lukasiewicz", "hamacher", "einstein", "yager", "softminmax", "tqand", "txor", "tmaj"],
         default="capacity",
         help="Clause strength operator used by STCM variants.",
     )
@@ -1369,6 +1370,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stcm-temp-start", type=float, default=None, help="Start value for STCM temperature schedule (defaults to --stcm-ste-temperature).")
     parser.add_argument("--stcm-temp-end", type=float, default=None, help="End value for STCM temperature schedule.")
     parser.add_argument("--stcm-temp-epochs", type=int, default=0, help="Epoch span for STCM temperature schedule.")
+
+    # ===== NEW INNOVATIONS (TM Breakthrough) =====
+    parser.add_argument("--contrastive-weight", type=float, default=0.0, help="Weight for clause contrastive loss (0 disables).")
+    parser.add_argument("--contrastive-temp", type=float, default=0.1, help="Temperature for contrastive loss.")
+    parser.add_argument("--curriculum-lf-start", type=float, default=None, help="Start value for LF curriculum (high=easy).")
+    parser.add_argument("--curriculum-lf-end", type=float, default=None, help="End value for LF curriculum.")
+    parser.add_argument("--curriculum-lf-epochs", type=int, default=0, help="Epochs over which to apply LF curriculum.")
+    parser.add_argument("--clause-attention", action=argparse.BooleanOptionalAction, default=False, help="Enable hierarchical clause attention before voting.")
+    parser.add_argument("--clause-attention-heads", type=int, default=4, help="Number of attention heads for clause attention.")
 
     # Hybrid options
     parser.add_argument("--hybrid-thresholds", type=int, default=32, help="Number of thresholds for CNN binarizer.")
@@ -3042,7 +3052,9 @@ def train_tm_model(model: nn.Module,
                    teacher_logit_adapter: Optional[nn.Module] = None,
                    ctm_schedule: Optional[Dict[str, Dict[str, Any]]] = None,
                    base_self_kd_weight: float = 0.0,
-                   base_self_kd_temp: float = 1.0, margin_loss: bool = False, l1_lambda: float = 0.0, prune_threshold: float = 0.0, contrastive_matcher: Optional["ContrastiveFeatureMatcher"] = None, teacher_feature_collector: Optional["TeacherFeatureCollector"] = None) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+                   base_self_kd_temp: float = 1.0, margin_loss: bool = False, l1_lambda: float = 0.0, prune_threshold: float = 0.0, contrastive_matcher: Optional["ContrastiveFeatureMatcher"] = None, teacher_feature_collector: Optional["TeacherFeatureCollector"] = None, contrastive_weight: float = 0.0, contrastive_temp: float = 0.1) -> Tuple[Optional[float], float, float, List[int], Optional[float]]:
+    # Initialize contrastive loss if enabled
+    clause_contrastive_loss = SupervisedContrastiveLoss(temperature=contrastive_temp) if contrastive_weight > 0 else None
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start = time.time()
@@ -3155,6 +3167,14 @@ def train_tm_model(model: nn.Module,
                     soft_teacher = F.softmax(ema_logits / self_temp_epoch, dim=1)
                     distill_term = F.kl_div(log_student, soft_teacher, reduction="batchmean") * (self_temp_epoch ** 2)
                     loss = loss + self_kd_weight * distill_term
+                # NEW: Contrastive clause learning
+                if clause_contrastive_loss is not None and contrastive_weight > 0:
+                    # Get clause outputs from model output (if available)
+                    clauses = outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 and outputs[1] is not None else None
+                    # Check if clauses is a tensor (not dict or other type)
+                    if clauses is not None and isinstance(clauses, torch.Tensor) and clauses.dim() >= 2:
+                        contrastive_term = clause_contrastive_loss(clauses, y)
+                        loss = loss + contrastive_weight * contrastive_term
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             if gradient_centralize:
@@ -3985,6 +4005,8 @@ def run_variant_deepcstcm(train_loader,
                         ctm_ema_decay: float = 0.0,
                         ctm_self_distill_weight: float = 0.0,
                         ctm_self_distill_temp: float = 1.0,
+                        contrastive_weight: float = 0.0,
+                        contrastive_temp: float = 0.1,
                         ) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepCTMNetwork(
         in_channels=in_channels,
@@ -4041,6 +4063,8 @@ def run_variant_deepcstcm(train_loader,
         ema_decay_value=ctm_ema_decay,
         base_self_kd_weight=ctm_self_distill_weight,
         base_self_kd_temp=ctm_self_distill_temp,
+        contrastive_weight=contrastive_weight,
+        contrastive_temp=contrastive_temp,
     )
     bundle = model.classifier.discretize(threshold=0.5)
     total_samples = len(train_loader.dataset)
@@ -5957,6 +5981,8 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     ctm_ema_decay=args.ctm_ema_decay,
                     ctm_self_distill_weight=args.ctm_self_distill_weight,
                     ctm_self_distill_temp=args.ctm_self_distill_temp,
+                    contrastive_weight=args.contrastive_weight,
+                    contrastive_temp=args.contrastive_temp,
                     base_lr=deeptm_base_lr,
                     min_lr=stcm_min_lr,
                     warmup_epochs=warmup_epochs,

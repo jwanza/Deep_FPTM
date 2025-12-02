@@ -258,96 +258,6 @@ class ConvTM2d(nn.Module):
         return out.view(B, self.out_channels, Ho, Wo)
 
 
-class ConvSTE2d(ConvTM2d):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int | Tuple[int, int],
-        stride: int | Tuple[int, int] = 1,
-        padding: int | Tuple[int, int] = 0,
-        dilation: int | Tuple[int, int] = 1,
-        *,
-        n_clauses: int = 128,
-        tau: float = 0.5,
-        core_backend: str = "tm",
-        core_hidden_dims: Optional[Sequence[int]] = None,
-        clause_dropout: float = 0.0,
-        literal_dropout: float = 0.0,
-        clause_bias_init: float = 0.0,
-        im2col_chunk: Optional[int] = None,
-    ):
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            n_clauses=n_clauses,
-            tau=tau,
-            core_backend=core_backend,
-            core_hidden_dims=core_hidden_dims,
-            clause_dropout=clause_dropout,
-            literal_dropout=literal_dropout,
-            clause_bias_init=clause_bias_init,
-            layer_cls=FuzzyPatternTM_STE,
-            operator=None,
-            ternary_voting=None,
-            ternary_band=0.0,
-            ste_temperature=1.0,
-            im2col_chunk=im2col_chunk,
-        )
-
-
-class ConvSTCM2d(ConvTM2d):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int | Tuple[int, int],
-        stride: int | Tuple[int, int] = 1,
-        padding: int | Tuple[int, int] = 0,
-        dilation: int | Tuple[int, int] = 1,
-        *,
-        n_clauses: int = 128,
-        tau: float = 0.5,
-        core_backend: str = "stcm",
-        core_hidden_dims: Optional[Sequence[int]] = None,
-        clause_dropout: float = 0.0,
-        literal_dropout: float = 0.0,
-        clause_bias_init: float = 0.0,
-        operator: str = "capacity",
-        ternary_voting: bool = False,
-        ternary_band: float = 0.05,
-        ste_temperature: float = 1.0,
-        im2col_chunk: Optional[int] = None,
-    ):
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            n_clauses=n_clauses,
-            tau=tau,
-            core_backend=core_backend,
-            core_hidden_dims=core_hidden_dims,
-            clause_dropout=clause_dropout,
-            literal_dropout=literal_dropout,
-            clause_bias_init=clause_bias_init,
-            layer_cls=FuzzyPatternTM_STCM,
-            operator=operator,
-            ternary_voting=ternary_voting,
-            ternary_band=ternary_band,
-            ste_temperature=ste_temperature,
-            im2col_chunk=im2col_chunk,
-        )
-
-
-
-
 class ConvTM2dOptimized(ConvTM2d):
     """
     Optimized Convolutional TM that uses F.conv2d instead of Unfold+MatMul.
@@ -448,3 +358,91 @@ class ConvTM2dOptimized(ConvTM2d):
         
         logits = F.conv2d(clause_outputs, w_vote)
         return logits
+
+
+class ConvSTE2d(ConvTM2dOptimized):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | Tuple[int, int],
+        stride: int | Tuple[int, int] = 1,
+        padding: int | Tuple[int, int] = 0,
+        dilation: int | Tuple[int, int] = 1,
+        *,
+        n_clauses: int = 128,
+        tau: float = 0.5,
+        core_backend: str = "tm",
+        core_hidden_dims: Optional[Sequence[int]] = None,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        clause_bias_init: float = 0.0,
+        im2col_chunk: Optional[int] = None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            n_clauses=n_clauses,
+            tau=tau,
+            core_backend=core_backend,
+            core_hidden_dims=core_hidden_dims,
+            clause_dropout=clause_dropout,
+            literal_dropout=literal_dropout,
+            clause_bias_init=clause_bias_init,
+            layer_cls=FuzzyPatternTM_STE,
+            operator=None,
+            ternary_voting=None,
+            ternary_band=0.0,
+            ste_temperature=1.0,
+            im2col_chunk=im2col_chunk,
+        )
+
+
+class ConvSTCM2d(ConvTM2dOptimized):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | Tuple[int, int],
+        stride: int | Tuple[int, int] = 1,
+        padding: int | Tuple[int, int] = 0,
+        dilation: int | Tuple[int, int] = 1,
+        *,
+        n_clauses: int = 128,
+        tau: float = 0.5,
+        core_backend: str = "stcm",
+        core_hidden_dims: Optional[Sequence[int]] = None,
+        clause_dropout: float = 0.0,
+        literal_dropout: float = 0.0,
+        clause_bias_init: float = 0.0,
+        operator: str = "capacity",
+        ternary_voting: bool = False,
+        ternary_band: float = 0.05,
+        ste_temperature: float = 1.0,
+        im2col_chunk: Optional[int] = None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            n_clauses=n_clauses,
+            tau=tau,
+            core_backend=core_backend,
+            core_hidden_dims=core_hidden_dims,
+            clause_dropout=clause_dropout,
+            literal_dropout=literal_dropout,
+            clause_bias_init=clause_bias_init,
+            layer_cls=FuzzyPatternTM_STCM,
+            operator=operator,
+            ternary_voting=ternary_voting,
+            ternary_band=ternary_band,
+            ste_temperature=ste_temperature,
+            im2col_chunk=im2col_chunk,
+        )

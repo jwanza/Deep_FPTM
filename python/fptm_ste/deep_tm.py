@@ -77,11 +77,15 @@ class DeepTMNetwork(nn.Module):
                 n_clauses=n_clauses,
                 n_classes=h,
                 tau=tau,
-                clause_dropout=clause_dropout,
-                literal_dropout=literal_dropout,
-                clause_bias_init=clause_bias_init,
-                **layer_kwargs,
             )
+            # Only add dropout params if the layer class supports them
+            if _class_supports_kwarg(layer_cls, "clause_dropout"):
+                tm_kwargs["clause_dropout"] = clause_dropout
+            if _class_supports_kwarg(layer_cls, "literal_dropout"):
+                tm_kwargs["literal_dropout"] = literal_dropout
+            if _class_supports_kwarg(layer_cls, "clause_bias_init"):
+                tm_kwargs["clause_bias_init"] = clause_bias_init
+            tm_kwargs.update(layer_kwargs)
             tm_kwargs.update(self.layer_extra_kwargs)
             if layer_operator is not None and _class_supports_kwarg(layer_cls, "operator"):
                 tm_kwargs["operator"] = layer_operator
@@ -94,13 +98,17 @@ class DeepTMNetwork(nn.Module):
 
         classifier_kwargs = dict(
             n_features=prev,
-            n_clauses=n_clauses ,
+            n_clauses=n_clauses,
             n_classes=n_classes,
             tau=tau,
-            clause_dropout=clause_dropout,
-            literal_dropout=literal_dropout,
-            clause_bias_init=clause_bias_init,
         )
+        # Only add dropout params if the layer class supports them
+        if _class_supports_kwarg(layer_cls, "clause_dropout"):
+            classifier_kwargs["clause_dropout"] = clause_dropout
+        if _class_supports_kwarg(layer_cls, "literal_dropout"):
+            classifier_kwargs["literal_dropout"] = literal_dropout
+        if _class_supports_kwarg(layer_cls, "clause_bias_init"):
+            classifier_kwargs["clause_bias_init"] = clause_bias_init
         classifier_kwargs.update(self.layer_extra_kwargs)
         if layer_operator is not None and _class_supports_kwarg(layer_cls, "operator"):
             classifier_kwargs["operator"] = layer_operator
