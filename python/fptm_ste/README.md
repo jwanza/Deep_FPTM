@@ -23,12 +23,49 @@ logits, clauses = tm(x, use_ste=True)
 
 ```python
 import torch
-from fptm_ste import SwinFeatureExtractor, MultiScaleTMEnsemble
+from fptm_ste import MultiScaleTMEnsemble, UniversalBackboneFactory
 
-backbone = SwinFeatureExtractor(pretrained=True, freeze=True)
+backbone_spec = {
+    "backbone_type": "swin",
+    "backbone_variant": "tiny",
+    "num_scales": 4,
+    "pretrained": True,
+    "freeze": True,
+}
+
+ensemble = MultiScaleTMEnsemble.from_backbone(
+    n_classes=1000,
+    backbone_spec=backbone_spec,
+    default_clauses=256,
+    default_thresholds=24,
+    ensemble_kwargs={"use_learnable_scale_attention": True},
+)
+
+backbone = UniversalBackboneFactory.create(**backbone_spec)
 feats = backbone(torch.randn(2, 3, 224, 224))
-ens = MultiScaleTMEnsemble([f.shape[1] for f in feats], n_classes=1000, n_clauses_per_scale=[500,300,200,100])
-final_logits, scale_logits, clause_outputs = ens(feats, use_ste=True)
+final_logits, scale_logits, clause_outputs = ensemble(feats, use_ste=True)
+```
+
+
+### Learnable Binarizers
+
+```python
+from fptm_ste.booleanization import LearnableBinarizer
+
+# Dual mode doubles the channel count for transformer features
+binarizer = LearnableBinarizer(in_channels=128, num_thresholds=16, mode="dual")
+features = binarizer(backbone_features)
+```
+### Backbone-aware preprocessing
+
+```python
+from fptm_ste.datasets import build_backbone_transforms
+
+transforms_bundle = build_backbone_transforms(
+    backbone_type="swin", input_size=224, input_channels=3, mixup_alpha=0.2
+)
+train_tensor = transforms_bundle.train_transform(image)
+eval_tensor = transforms_bundle.eval_transform(image)
 ```
 
 ### Export literals to JSON (for Julia)

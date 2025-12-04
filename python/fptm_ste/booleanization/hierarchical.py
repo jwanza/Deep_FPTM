@@ -409,3 +409,4 @@ class HierarchicalMultiResolutionTM(nn.Module):
         """
         return F.softmax(self.level_importance, dim=0)
 
+

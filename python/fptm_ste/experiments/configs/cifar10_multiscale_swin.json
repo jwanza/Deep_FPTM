@@ -1,0 +1,28 @@
+{
+  "label": "cifar10_multiscale_swin",
+  "description": "Swin-Tiny backbone + MultiScaleTMEnsemble smoke test.",
+  "tags": ["transformer-smoke", "multiscale", "cifar-full"],
+  "command": [
+    "{python}",
+    "python/fptm_ste/tests/run_cifar_ensemble.py",
+    "--epochs",
+    "1",
+    "--batch-size",
+    "8",
+    "--train-subset",
+    "512",
+    "--test-subset",
+    "256",
+    "--backbone",
+    "swin_t",
+    "--num-scales",
+    "4",
+    "--image-size",
+    "192",
+    "--freeze-stages",
+    "2",
+    "--use-fpn"
+  ],
+  "output_json": "cifar10/multiscale/swin_tiny_smoke.json"
+}
+

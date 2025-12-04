@@ -54,6 +54,19 @@ from .attention_adaptive import (
     DynamicThresholdPredictor,
 )
 
+
+from .learnable import (
+    LearnableBinarizer,
+)
+from .enhanced_continuous import (
+    EnhancedContinuousTM,
+    EnhancedContinuousEncoder,
+    MultiScaleThermometer,
+    GaussianBasisExpansion,
+    LearnedFeatureBins,
+    PositionalValueEncoding,
+)
+
 __all__ = [
     # Continuous Residual
     "ContinuousResidualClauseMachine",
@@ -79,5 +92,13 @@ __all__ = [
     "NeuralSymbolicTransformer",
     "NeuralSymbolicBlock",
     "DynamicThresholdPredictor",
+    # Enhanced Continuous Encoding
+    "EnhancedContinuousTM",
+    "EnhancedContinuousEncoder",
+    "MultiScaleThermometer",
+    "GaussianBasisExpansion",
+    "LearnedFeatureBins",
+    "PositionalValueEncoding",
+    "LearnableBinarizer",
 ]
 

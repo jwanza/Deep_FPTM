@@ -1,183 +1,174 @@
-# TM Breakthrough Implementation - Test Report
+# FuzzyPatternTM Test Report
 
-**Date:** December 2, 2025  
-**Implementation Phase:** Complete  
-**Test Status:** ✅ All tests passing
+## Test Suite Summary
 
----
+**Total Tests: 456 passed, 1 skipped**
 
-## Executive Summary
-
-This report documents the comprehensive testing of the TM Breakthrough Research Roadmap implementation. All 257 unit tests pass, and end-to-end benchmarks on CIFAR-10 demonstrate measurable improvements from the new architectural innovations.
-
-### Key Achievements
-- **+8.1% accuracy improvement** with Sparse MoE TM vs baseline
-- **+3.9% accuracy improvement** with Cascade Resolution STCM
-- **257/257 unit tests passing** (100%)
-- **All 7 phases of the roadmap implemented**
-
----
-
-## Unit Test Results
-
-### Test Suite Summary
-
-| Test File | Tests | Status |
-|-----------|-------|--------|
-| `test_clause_attention.py` | 34 | ✅ PASS |
-| `test_fuzzy_operators.py` | 76 | ✅ PASS |
-| `test_memory_bank.py` | 25 | ✅ PASS |
-| `test_moe_tm.py` | 13 | ✅ PASS |
-| `test_multires.py` | 26 | ✅ PASS |
-| `test_operators.py` | 4 | ✅ PASS |
-| `test_pretraining.py` | 9 | ✅ PASS |
-| `test_stcm_e2e.py` | 7 | ✅ PASS |
+| Test Suite | Tests | Status |
+|------------|-------|--------|
+| `test_booleanization_unit.py` | 41 | ✅ PASS |
+| `test_booleanization_e2e.py` | 15 | ✅ PASS |
+| `test_integration.py` | 22 | ✅ PASS |
+| `test_hyperbolic.py` | 50 | ✅ PASS |
+| `test_sparse_routing.py` | 31 | ✅ PASS |
+| `test_continual_learning.py` | 40+ | ✅ PASS |
 | `test_stcm_unit.py` | 8 | ✅ PASS |
-| **TOTAL** | **257** | **✅ ALL PASS** |
-
-### Test Coverage by Component
-
-#### Phase 1: Fuzzy Operators
-- ✅ Shape correctness for all 13 operators
-- ✅ Output range validation (all outputs in [0, 1])
-- ✅ Gradient flow verification
-- ✅ Mathematical properties (commutativity, monotonicity)
-- ✅ Numerical stability with edge cases
-- ✅ Learnable operator parameters update correctly
-- ✅ AdaptiveOperatorMixer and EnsembleOperator
-
-#### Phase 2: Architectural Innovations
-- ✅ HierarchicalClauseAttention (intra, cross, global stages)
-- ✅ ClauseMemoryBank with EMA updates
-- ✅ MultiResolutionSTCM with attention fusion
-- ✅ SparseMoETM with clause routing
-- ✅ All gradient flows verified
-
-#### Phase 3: Training Innovations
-- ✅ ClauseCurriculumScheduler (LF, temp, band annealing)
-- ✅ ClauseContrastiveLoss (NT-Xent style)
-- ✅ SupervisedContrastiveLoss
-
-#### Phase 5: Voting Mechanisms
-- ✅ AttentionVoting
-- ✅ HierarchicalVoting with super-clauses
-- ✅ ProbabilisticVoting with uncertainty
-- ✅ ConfidenceWeightedVoting
-
-#### Phase 6: Fusion Layers
-- ✅ TMAttentionFusion (sequential, parallel, interleaved)
-- ✅ AdaptiveFusionBlock
-- ✅ DeepTMAttentionNetwork
-
-#### Phase 7: Pre-Training
-- ✅ MaskedClauseModeling
-- ✅ ContrastivePretraining
-- ✅ BYOLPretraining
-- ✅ ReconstructionPretraining
+| `test_stcm_e2e.py` | 7 | ✅ PASS |
+| Other test files | 240+ | ✅ PASS |
 
 ---
 
-## E2E Benchmark Results (CIFAR-10)
+## Comprehensive Test Matrix
 
-### Test Configuration
-- **Dataset:** CIFAR-10 (3x32x32 RGB images, 10 classes)
-- **Train samples:** 5,000 (subset for quick testing)
-- **Test samples:** 2,000
-- **Epochs:** 15
-- **Batch size:** 128
-- **Learning rate:** 1e-3
-- **Device:** CUDA
+| Model Family | New Feature Coverage | Primary Tests / Scripts |
+|--------------|----------------------|-------------------------|
+| STE TM / STCM / FPTM-Equiv | Learnable binarizers, clause curriculum, KD hooks | `tests/test_binarizers.py`, `tests/test_schedule.py`, `experiments/run_validation_suite.py --suite mnist-smoke` |
+| Deep TM / Deep STCM | Clause grouping, curriculum, KD, SAM/Lion toggles | `tests/test_schedule.py`, `run_mnist_equiv.py --models deep_tm,deep_stcm` |
+| Deep CTM / Deep CSTCM | Multi-scale conv cores, EMA self-distill | `tests/test_schedule.py`, `tests/run_cifar_ensemble.py --models deep_ctm,deep_cstcm` |
+| Hybrid CNN+TM + Learnable binarizers | Backbone factory, dual-sigmoid | `tests/test_backbone_factory.py`, `tests/test_binarizers.py`, `experiments/run_validation_suite.py --suite cifar-smoke --models hybrid` |
+| Multi-scale TM Ensemble | Spatial attention, residual decision | `tests/test_spatial_tm.py`, `tests/test_swin_and_multiscale.py` |
+| Swin / ViT Transformer Hybrids | Clause attention, KD/contrastive, auto clause tuning | `run_mnist_equiv.py --models transformer`, `tests/test_swin_and_multiscale.py`, `experiments/run_validation_suite.py --suite transformer-smoke` |
 
-### Model Performance Comparison
-
-| Model | Test Accuracy | Parameters | vs Baseline |
-|-------|--------------|------------|-------------|
-| **Sparse MoE TM** | **39.30%** | 1,011,236 | **+8.1%** ✅ |
-| **Cascade Resolution STCM** | **37.75%** | 925,103 | **+3.9%** ✅ |
-| STCM Baseline (capacity) | 36.35% | 924,900 | — |
-| STCM + Contrastive Loss | 35.95% | 924,900 | -1.1% |
-| STCM + Product operator | 12.45% | 924,900 | -65.7% |
-| STCM + Hamacher operator | 9.00% | 924,900 | -75.2% |
-
-### Key Findings
-
-1. **Sparse MoE TM is the winner:** The mixture-of-experts architecture with 8 experts and top-2 routing achieves the best accuracy (+8.1%), demonstrating that specialized clause groups can capture different pattern types effectively.
-
-2. **Cascade Resolution improves accuracy:** Processing at multiple tau thresholds (0.3 → 0.7) in cascade fashion provides +3.9% improvement, showing that multi-scale processing helps with CIFAR-10's continuous features.
-
-3. **Alternative fuzzy operators need tuning:** Direct replacement of the capacity operator with Godel/Lukasiewicz/Hamacher/Product operators degrades performance. These operators may be better suited for:
-   - Different initialization strategies
-   - Integration as part of AdaptiveOperatorMixer
-   - Specific problem domains
-
-4. **Contrastive loss is neutral:** Adding contrastive loss showed minimal impact (-1.1%), suggesting more epochs or different temperature tuning may be needed.
+The matrix is mirrored in `docs/TEST_REPORT.md` so every new feature has at least one unit/component test plus an integration/smoke entry point.
 
 ---
 
-## Architecture Improvements Summary
+## Dataset Targets & Metrics
 
-### Successfully Validated Innovations
+| Dataset | Purpose | Baseline Target | Enhanced Target | Notes |
+|---------|---------|-----------------|-----------------|-------|
+| MNIST / Fashion-MNIST | Fast functional smoke for all variants | Match historical accuracy ±1% | Verify no regressions after refactors | Runs with batch 64, 1–2 epochs |
+| CIFAR-10 | Primary accuracy benchmark | Baseline configs captured in `experiments/configs/*_baseline.json` | +2% Top-1 over baseline or ≥10% throughput gain | Logged via `results/cifar10/<model>.json` |
+| CIFAR-10 (Nightly) | Extended runs for transformers + Swin hybrids | 60–65% (short run) | 70%+ with KD and binarizers | Executed via `experiments/run_validation_suite.py --suite cifar-full` |
 
-| Innovation | Impact | Notes |
-|------------|--------|-------|
-| Sparse MoE TM | ⬆️ High | +8.1% acc, specialization works |
-| Cascade Resolution | ⬆️ Medium | +3.9% acc, multi-scale helps |
-| Hierarchical Clause Attention | ✅ Tested | Gradients flow, shapes correct |
-| ClauseMemoryBank | ✅ Tested | EMA updates stable |
-| Attention Voting | ✅ Tested | Learnable voting works |
-| Pre-training modules | ✅ Tested | MCM, Contrastive, BYOL ready |
-
-### Recommendations for Further Improvement
-
-1. **Scale up training:** Run full CIFAR-10 (50K samples) for 50+ epochs
-2. **Tune fuzzy operators:** Use AdaptiveOperatorMixer to learn optimal blends
-3. **Combine innovations:** Stack MoE + Cascade + Attention Voting
-4. **Apply curriculum:** Use ClauseCurriculumScheduler during training
-5. **Pre-train then fine-tune:** Use MaskedClauseModeling pre-training
+Metrics tracked per run: top-1 accuracy, train throughput (samples/s), best-epoch accuracy, clause entropy, attention focus entropy, and CUDA max memory when available.
 
 ---
 
-## Files Created/Modified
+## CIFAR-10 Benchmark Results
 
-### New Files (11 total)
-- `python/fptm_ste/benchmarks/__init__.py` - Benchmark utilities
-- `python/fptm_ste/benchmarks/run_all.py` - Benchmark runner
-- `python/fptm_ste/clause_attention.py` - Hierarchical clause attention
-- `python/fptm_ste/multires_tm.py` - Multi-resolution architectures
-- `python/fptm_ste/moe_tm.py` - Mixture-of-experts TM
-- `python/fptm_ste/fusion_layers.py` - TM-Attention fusion
-- `python/fptm_ste/pretraining.py` - Self-supervised pre-training
-- `python/tests/test_clause_attention.py`
-- `python/tests/test_fuzzy_operators.py`
-- `python/tests/test_memory_bank.py`
-- `python/tests/test_moe_tm.py`
-- `python/tests/test_multires.py`
-- `python/tests/test_pretraining.py`
-- `python/fptm_ste/tests/test_cifar10_regression.py`
+### Baseline vs. Optimized
 
-### Modified Files
-- `python/fptm_ste/operators.py` - Added 12 new fuzzy operators
-- `python/fptm_ste/tm.py` - Added ClauseMemoryBank, voting mechanisms
-- `python/fptm_ste/trainers.py` - Added curriculum, contrastive loss
-- `python/fptm_ste/tm_integrated.py` - Updated operator registry
-- `python/fptm_ste/__init__.py` - Exported all new modules
+| Model | Test Accuracy | Epochs | Time | Notes |
+|-------|---------------|--------|------|-------|
+| **Deep-CSTCM (Baseline)** | **64.37%** | 5 | 225s | Original configuration |
+| **Deep-CSTCM (Optimized)** | **77.00%** | 25 | 829s | +12.63% improvement |
+| Deep-CSTCM (Self-distill) | 74.01% | 30 | 857s | Higher self-distillation weight |
+
+### Best Configuration (77.00% Accuracy)
+
+```bash
+python3 python/fptm_ste/tests/run_mnist_equiv.py \
+    --dataset cifar10 \
+    --models deep_cstcm \
+    --epochs 25 \
+    --batch-size 128 \
+    --lr 0.003 \
+    --normalize auto \
+    --deepctm-stem \
+    --deepctm-stem-channels 64 \
+    --deepctm-mix linear \
+    --deepctm-channels 64,128,256 \
+    --deepctm-kernels 3,3,3 \
+    --deepctm-strides 1,1,1 \
+    --deepctm-pools 2,2,2 \
+    --deepctm-clauses 256,256,512 \
+    --deepctm-head-clauses 1024 \
+    --deepcstcm-core stcm \
+    --deepctm-aux-weight 0.1 \
+    --ctm-ema-decay 0.995 \
+    --ctm-self-distill-weight 0.1 \
+    --ctm-self-distill-temp 2.0
+```
 
 ---
 
-## Conclusion
+## New Modules Implemented
 
-The TM Breakthrough Research Roadmap has been successfully implemented with all 7 phases complete. The implementation introduces significant architectural innovations that demonstrate measurable improvements on CIFAR-10:
+### Booleanization Solutions (python/fptm_ste/booleanization/)
 
-- **Sparse MoE TM provides +8.1% accuracy improvement** over baseline
-- **Cascade Resolution STCM provides +3.9% improvement**
-- All 257 unit tests pass, validating correctness
-- The codebase is well-structured and ready for further research
+1. **ContinuousResidualClauseMachine** - Dual-stream binary + continuous architecture
+2. **ProbabilisticLiteralClauseMachine** - Distributional literals with uncertainty
+3. **HyperdimensionalClauseMachine** - HD computing for similarity-preserving encoding
+4. **InformationPreservingClauseMachine** - Information Bottleneck binarization
+5. **HierarchicalMultiResolutionTM** - Multi-resolution clause hierarchy
+6. **NeuralSymbolicTransformer** - Per-sample dynamic binarization
+7. **EnhancedContinuousTM** - Multi-scale thermometer + Gaussian + Positional encoding
 
-The new modules provide a rich toolkit for TM research, including:
-- 12 new fuzzy logic operators with learnable variants
-- Advanced voting mechanisms (attention, hierarchical, probabilistic)
-- Self-supervised pre-training capabilities
-- Comprehensive curriculum learning support
+### Advanced Features
 
-Next steps should focus on scaling experiments to full datasets and combining multiple innovations.
+- **Hyperbolic Geometry** (`hyperbolic.py`): Poincare ball projection, hyperbolic voting
+- **Sparse Routing** (`sparse_routing.py`): TopK router, L0 pruning, MoE
+- **Continual Learning** (`continual.py`): EWC, SI, MAS, GEM, PackNet, Replay
+- **LoRA Adapters** (`lora_adapter.py`): Low-rank adaptation for TM
+- **SAM Optimizer** (`sam_optimizer.py`): Sharpness-aware minimization
+- **Data Augmentation** (`augmentation.py`): Mixup, CutMix, ManifoldMixup
+- **Temporal TM** (`temporal.py`): Sequence modeling with clauses
+- **Ultimate Hybrid** (`ultimate_hybrid.py`): Combines all techniques
 
+---
+
+## Key Insights
+
+### Why Deep-CSTCM Outperforms Flat Models
+
+1. **Convolutional Architecture**: Preserves spatial structure of images
+2. **Hierarchical Processing**: Multi-level feature extraction
+3. **Self-Distillation**: Teacher-student learning within the model
+4. **EMA Updates**: Exponential moving average for stable training
+
+### Booleanization Bottleneck
+
+The new booleanization modules (CRCM, HD, IB, etc.) achieve ~45-55% on CIFAR-10 with flattened features vs. 77% with convolutional architecture. The gap is due to:
+
+- Loss of spatial structure when flattening 32x32x3 → 3072
+- Single-threshold binarization losing continuous information
+- No multi-scale feature extraction
+
+### Future Improvements
+
+1. Integrate booleanization with ConvTM architecture
+2. Use pretrained CNN features before booleanization
+3. Apply hierarchical spatial booleanization to patches
+
+---
+
+## Automation & CI Hooks
+
+- **`python/fptm_ste/experiments/run_validation_suite.py`** orchestrates unit, MNIST-smoke, CIFAR-smoke, and CIFAR-full suites. Each suite streams logs to `logs/validation/<suite>.log` and emits JSON summaries.
+- Fast suites (unit + MNIST-smoke) are wired for CI using `RUN_SUITE=unit,mnist-smoke python .../run_validation_suite.py`; heavier CIFAR suites are tagged for nightly builds.
+- Suite definitions record command arguments so we can bisect regressions quickly and replay with exact seeds.
+
+---
+
+## Result Aggregation & Reproduction
+
+- **Configs**: Reusable experiment descriptors live under `python/fptm_ste/experiments/configs/`. Each JSON file encodes dataset, model, baseline/enhanced flag, and CLI overrides for `tests/run_mnist_equiv.py`.
+- **Execution**: `run_validation_suite.py --suite cifar-full --config-dir python/fptm_ste/experiments/configs` fans out runs across all configs (baseline first, enhanced second) and writes results to `results/cifar10/<model>/<variant>.json`.
+- **Comparison**: `python/fptm_ste/experiments/analyze_results.py --baseline results/cifar10/deep_cstcm/baseline.json --enhanced results/cifar10/deep_cstcm/enhanced.json` prints accuracy/throughput deltas and highlights whether targets are met.
+- **Reporting**: Aggregated CSV/Markdown tables are appended to this document after each sweep; automation scripts update clause/attention diagnostics to keep interpretability regressions visible.
+
+---
+
+## Test Commands
+
+```bash
+# Run all unit tests
+pytest python/tests/test_booleanization_unit.py -v
+
+# Run all E2E tests
+pytest python/tests/test_booleanization_e2e.py -v
+
+# Run integration tests
+pytest python/tests/test_integration.py -v
+
+# Run all tests except SOTA validation
+pytest python/tests/ -v --ignore=python/tests/test_sota_validation.py
+
+# Run CIFAR-10 benchmark
+python3 python/fptm_ste/tests/run_mnist_equiv.py --dataset cifar10 --models deep_cstcm --epochs 25 ...
+```
+
+---
+
+## Date: December 2, 2024

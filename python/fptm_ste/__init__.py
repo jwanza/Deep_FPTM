@@ -12,7 +12,13 @@ from .tm import (
     ClauseMemoryBank,
     ClauseMemoryAttention,
 )
+from .tm_optimized import OptimizedSTCM
 from .tm_integrated import IntegratedSTCM, build_stcm
+from .backbones import (
+    UniversalBackboneFactory,
+    BackboneMetadata,
+    get_backbone_normalization,
+)
 from .operators import (
     available_ternary_operators,
     build_ternary_operator,
@@ -63,6 +69,8 @@ from .multires_tm import (
     AdaptiveThresholdSTCM,
     CascadeResolutionSTCM,
     HierarchicalResolutionSTCM,
+    SpatialTMScaleConfig,
+    SpatialTMEnsemble,
 )
 from .moe_tm import (
     SparseMoETM,
@@ -71,10 +79,8 @@ from .moe_tm import (
     SwitchMoETM,
 )
 from .fusion_layers import (
-    TMAttentionFusion,
-    AdaptiveFusionBlock,
-    DeepTMAttentionNetwork,
-    HybridVisionTM,
+    LearnableScaleAttention,
+    ResidualInterpretableDecision,
 )
 from .pretraining import (
     MaskedClauseModeling,

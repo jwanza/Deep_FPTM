@@ -112,14 +112,18 @@ def update_attention_ema(module):
 
 
 def train_step(
-    model, 
-    data, 
-    target, 
-    optimizer, 
-    use_ste: bool = True, 
-    clip_grad: float = 1.0, 
-    margin_loss: bool = False, 
-    l1_lambda: float = 0.0
+    model,
+    data,
+    target,
+    optimizer,
+    use_ste: bool = True,
+    clip_grad: float = 1.0,
+    margin_loss: bool = False,
+    l1_lambda: float = 0.0,
+    *,
+    label_smoothing: float = 0.0,
+    teacher_logits: torch.Tensor | None = None,
+    distill_weight: float = 0.0,
 ):
     model.train()
     optimizer.zero_grad()
@@ -128,24 +132,32 @@ def train_step(
         logits = out[0]
     else:
         logits = out
-    
+
     if margin_loss:
-        # Attempt to get T from model
         T = getattr(model, 'T', 1.0)
         if hasattr(model, 'module') and hasattr(model.module, 'T'):
             T = model.module.T
         loss_fn = TsetlinMarginLoss(T=T)
-        loss = loss_fn(logits, target)
+        ce_loss = loss_fn(logits, target)
     else:
-        loss = F.cross_entropy(logits, target)
+        if target.ndim > 1:
+            log_probs = F.log_softmax(logits, dim=-1)
+            ce_loss = -(target * log_probs).sum(dim=-1).mean()
+        else:
+            ce_loss = F.cross_entropy(logits, target, label_smoothing=label_smoothing)
 
-    # L1 Regularization
+    loss = ce_loss
+    if distill_weight > 0.0 and teacher_logits is not None:
+        teacher_probs = F.softmax(teacher_logits.detach(), dim=-1)
+        student_log_probs = F.log_softmax(logits, dim=-1)
+        kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+        loss = (1.0 - distill_weight) * loss + distill_weight * kl_loss
+
     if l1_lambda > 0.0:
         l1_reg = torch.tensor(0.0, device=logits.device)
         for name, param in model.named_parameters():
-            # Heuristic to find literal inclusion logits
             if 'ta_' in name or ('logits' in name and 'vote' not in name):
-                 l1_reg += torch.abs(param).sum()
+                l1_reg += torch.abs(param).sum()
         loss = loss + l1_lambda * l1_reg
 
     aux_loss = gather_auxiliary_losses(model)
@@ -157,6 +169,8 @@ def train_step(
     optimizer.step()
     update_attention_ema(model)
     return loss.item()
+
+
 
 
 def cosine_anneal_temperature(initial: float, final: float, epoch: int, max_epochs: int) -> float:
@@ -650,10 +664,19 @@ def train_epoch_with_curriculum(
     # Update curriculum
     curriculum.step()
     
-    return {
+    extra_logs = {}
+    if hasattr(model, "get_gate_diagnostics"):
+        extra_logs["gate"] = model.get_gate_diagnostics()
+    if hasattr(model, "last_attention_weights"):
+        attn = getattr(model, "last_attention_weights")
+        if attn is not None:
+            extra_logs["attention_mean"] = float(attn.mean().item())
+    result = {
         "loss": total_loss / total_samples,
         "accuracy": total_correct / total_samples,
         "curriculum": curriculum.get_current_values(),
     }
+    result.update(extra_logs)
+    return result
 
 

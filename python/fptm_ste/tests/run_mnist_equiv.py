@@ -3850,7 +3850,8 @@ def run_variant_hybrid(train_loader,
         "samples_per_second": throughput,
         "max_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
     }
-    return label, last_train_acc, test_acc, train_time, preds, best_test_acc, profile
+    bundle = None  # Hybrid models do not currently export clause bundles
+    return label, last_train_acc, test_acc, train_time, preds, bundle, best_test_acc, profile
 
 
 def run_variant_deepctm(train_loader,

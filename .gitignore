@@ -1,3 +1,5 @@
+results/
+
 # General artifacts
 __pycache__/
 *.py[cod]

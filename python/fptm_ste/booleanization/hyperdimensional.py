@@ -343,3 +343,4 @@ class HyperdimensionalClauseMachine(nn.Module):
         
         return loss
 
+

@@ -15,7 +15,10 @@ Key innovations:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import math
 
 import torch
 import torch.nn as nn
@@ -532,3 +535,147 @@ class HierarchicalResolutionSTCM(nn.Module):
         
         return final_logits, concat_clauses
 
+
+
+
+@dataclass
+class SpatialTMScaleConfig:
+    in_channels: int
+    image_size: int
+    patch_size: int
+    n_clauses: int
+    tau: float = 0.5
+    operator: str = "capacity"
+    tm_kwargs: Optional[Dict[str, Any]] = None
+
+
+class PatchwiseTMBlock(nn.Module):
+    """TM block that preserves spatial structure via patchifying inputs."""
+
+    def __init__(
+        self,
+        config: SpatialTMScaleConfig,
+    ) -> None:
+        super().__init__()
+        if config.image_size % config.patch_size != 0:
+            raise ValueError(
+                f"image_size {config.image_size} must be divisible by patch_size {config.patch_size}."
+            )
+        self.config = config
+        self.patch_dim = config.in_channels * config.patch_size * config.patch_size
+        self.h = config.image_size // config.patch_size
+        self.w = config.image_size // config.patch_size
+        tm_kwargs = dict(config.tm_kwargs or {})
+        self.tm = FuzzyPatternTM_STCM(
+            n_features=self.patch_dim,
+            n_clauses=config.n_clauses,
+            n_classes=config.n_clauses,
+            tau=config.tau,
+            operator=config.operator,
+            **tm_kwargs,
+        )
+        self.unfold = nn.Unfold(kernel_size=config.patch_size, stride=config.patch_size)
+
+    def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
+        patches = self.unfold(x).transpose(1, 2)  # [B, N, patch_dim]
+        B, N, _ = patches.shape
+        flat = patches.reshape(B * N, self.patch_dim)
+        _, clause_outputs = self.tm(flat, use_ste=use_ste)
+        clause_outputs = clause_outputs.view(B, N, self.config.n_clauses)
+        clause_outputs = clause_outputs.permute(0, 2, 1).contiguous()
+        clause_maps = clause_outputs.view(B, self.config.n_clauses, self.h, self.w)
+        return clause_maps
+
+
+class SpatialCrossScaleFusion(nn.Module):
+    """Aligns and fuses clause maps from multiple scales via attention."""
+
+    def __init__(self, clause_dims: Sequence[int], num_heads: int = 4, proj_dim: int = 256, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.num_scales = len(clause_dims)
+        self.proj_dim = proj_dim
+        self.projections = nn.ModuleList([nn.Conv2d(dim, proj_dim, kernel_size=1) for dim in clause_dims])
+        self.attn = nn.MultiheadAttention(embed_dim=proj_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(proj_dim)
+        self.output = nn.ModuleList([nn.Conv2d(proj_dim, dim, kernel_size=1) for dim in clause_dims])
+
+    def forward(self, features: Sequence[torch.Tensor]) -> List[torch.Tensor]:
+        if not features:
+            return []
+        bsz = features[0].shape[0]
+        min_h = min(f.shape[2] for f in features)
+        min_w = min(f.shape[3] for f in features)
+
+        aligned = []
+        shapes = []
+        for feat, proj in zip(features, self.projections):
+            shapes.append(feat.shape)
+            if feat.shape[2:] != (min_h, min_w):
+                feat = F.adaptive_avg_pool2d(feat, (min_h, min_w))
+            feat = proj(feat)
+            aligned.append(feat.flatten(2).transpose(1, 2))
+
+        combined = torch.cat(aligned, dim=1)
+        attended, _ = self.attn(combined, combined, combined)
+        attended = self.norm(attended + combined)
+
+        splits = torch.split(attended, [a.shape[1] for a in aligned], dim=1)
+        outputs: List[torch.Tensor] = []
+        for split, out_proj, (b, c, h, w) in zip(splits, self.output, shapes):
+            split = split.transpose(1, 2).reshape(bsz, self.proj_dim, min_h, min_w)
+            split = out_proj(split)
+            if (h, w) != (min_h, min_w):
+                split = F.interpolate(split, size=(h, w), mode="bilinear", align_corners=False)
+            outputs.append(split)
+        return outputs
+
+
+class ResidualClauseDecision(nn.Module):
+    """Aggregates per-scale clause maps into final logits with residual MLPs."""
+
+    def __init__(self, clause_dims: Sequence[int], n_classes: int, hidden: Optional[int] = None) -> None:
+        super().__init__()
+        self.n_classes = n_classes
+        total_dim = sum(clause_dims)
+        hidden = hidden or max(64, total_dim // 2)
+        self.proj = nn.Sequential(
+            nn.Linear(total_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, n_classes),
+        )
+        self.scale_heads = nn.ModuleList(
+            [nn.Sequential(nn.Linear(dim, hidden // 2), nn.GELU(), nn.Linear(hidden // 2, n_classes)) for dim in clause_dims]
+        )
+
+    def forward(self, clause_maps: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        pooled = [cm.mean(dim=(2, 3)) for cm in clause_maps]
+        concat = torch.cat(pooled, dim=1)
+        logits = self.proj(concat)
+        aux = [head(p) for head, p in zip(self.scale_heads, pooled)]
+        return logits, aux
+
+
+class SpatialTMEnsemble(nn.Module):
+    """End-to-end spatial TM pipeline with cross-scale fusion and residual decisions."""
+
+    def __init__(
+        self,
+        scale_configs: Sequence[SpatialTMScaleConfig],
+        n_classes: int,
+        use_cross_scale_attention: bool = True,
+        attention_heads: int = 4,
+        attention_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([PatchwiseTMBlock(cfg) for cfg in scale_configs])
+        clause_dims = [cfg.n_clauses for cfg in scale_configs]
+        self.cross_scale = SpatialCrossScaleFusion(clause_dims, num_heads=attention_heads, proj_dim=attention_dim) if use_cross_scale_attention else None
+        self.decision = ResidualClauseDecision(clause_dims, n_classes)
+
+    def forward(self, features: Sequence[torch.Tensor], use_ste: bool = True):
+        if len(features) != len(self.blocks):
+            raise ValueError(f"Expected {len(self.blocks)} feature maps, received {len(features)}")
+        clause_maps = [block(feat, use_ste=use_ste) for block, feat in zip(self.blocks, features)]
+        fused_maps = self.cross_scale(clause_maps) if self.cross_scale is not None else clause_maps
+        logits, aux = self.decision(fused_maps)
+        return logits, aux, fused_maps

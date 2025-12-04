@@ -248,7 +248,7 @@ class SparseMoETM(nn.Module):
         return_routing: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Dict]:
         """
-        Sparse MoE forward pass.
+        Sparse MoE forward pass - OPTIMIZED with batched expert processing.
         
         Args:
             x: Input tensor [batch, n_features]
@@ -259,6 +259,7 @@ class SparseMoETM(nn.Module):
         """
         batch_size = x.shape[0]
         device = x.device
+        n_classes = self.experts[0].stcm.n_classes
         
         # Get routing decisions
         expert_weights, expert_indices, gates, aux_loss = self.router(x)
@@ -267,31 +268,54 @@ class SparseMoETM(nn.Module):
         if aux_loss is not None:
             self._aux_loss = aux_loss * self.aux_loss_weight
         
-        # Initialize outputs
-        logits = torch.zeros(batch_size, self.experts[0].stcm.n_classes, device=device)
-        all_clauses = []
+        # OPTIMIZED: Process experts in batches instead of per-sample
+        # Group samples by expert assignment for batched processing
+        logits = torch.zeros(batch_size, n_classes, device=device, dtype=x.dtype)
+        all_clauses_list = [None] * batch_size
         
-        # Process each sample with its selected experts
-        for i in range(batch_size):
-            sample_logits = torch.zeros(self.experts[0].stcm.n_classes, device=device)
-            sample_clauses = []
+        # For each expert, find all samples that selected it and process together
+        for expert_idx in range(self.n_experts):
+            # Find which (sample, position) pairs selected this expert
+            mask = (expert_indices == expert_idx)  # [batch, top_k]
             
-            for k in range(self.top_k):
-                expert_idx = expert_indices[i, k].item()
-                weight = expert_weights[i, k]
-                
-                # Run expert
-                exp_logits, exp_clauses = self.experts[expert_idx](x[i:i+1])
-                
-                # Weighted contribution
-                sample_logits = sample_logits + weight * exp_logits.squeeze(0)
-                sample_clauses.append(exp_clauses.squeeze(0) * weight)
+            if not mask.any():
+                continue
             
-            logits[i] = sample_logits
-            all_clauses.append(torch.cat(sample_clauses, dim=0))
+            # Get sample indices and position (0 or 1 for top_k=2)
+            sample_pos = mask.nonzero(as_tuple=False)  # [N, 2] where N = number of selections
+            
+            if sample_pos.shape[0] == 0:
+                continue
+            
+            sample_indices = sample_pos[:, 0]  # Which samples selected this expert
+            pos_indices = sample_pos[:, 1]     # At which top-k position
+            
+            # Batch process all samples that selected this expert
+            expert_inputs = x[sample_indices]  # [N, n_features]
+            
+            # Run expert once for all samples
+            exp_logits, exp_clauses = self.experts[expert_idx](expert_inputs)  # [N, n_classes], [N, n_clauses]
+            
+            # Get weights for these selections
+            weights = expert_weights[sample_indices, pos_indices].unsqueeze(-1)  # [N, 1]
+            
+            # Accumulate weighted logits (using index_add for efficiency)
+            weighted_logits = exp_logits * weights
+            logits.index_add_(0, sample_indices, weighted_logits)
+            
+            # Store weighted clauses
+            weighted_clauses = exp_clauses * weights
+            for idx, sample_idx in enumerate(sample_indices.tolist()):
+                if all_clauses_list[sample_idx] is None:
+                    all_clauses_list[sample_idx] = [weighted_clauses[idx]]
+                else:
+                    all_clauses_list[sample_idx].append(weighted_clauses[idx])
         
-        # Stack clauses
-        clauses = torch.stack(all_clauses, dim=0)
+        # Concatenate clause outputs
+        clauses = torch.stack([
+            torch.cat(c, dim=0) if c else torch.zeros(self.top_k * self.n_clauses_per_expert, device=device)
+            for c in all_clauses_list
+        ], dim=0)
         
         # Output projection
         logits = self.output_proj(logits)
@@ -565,11 +589,12 @@ class SwitchMoETM(nn.Module):
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Switch-style forward pass.
+        Switch-style forward pass - OPTIMIZED with batched expert processing.
         """
         batch_size = x.shape[0]
         device = x.device
         n_classes = self.experts[0].stcm.n_classes
+        n_clauses = self.experts[0].stcm.n_clauses
         
         # Route to single expert
         router_logits = self.router(x)
@@ -578,34 +603,35 @@ class SwitchMoETM(nn.Module):
         # Top-1 selection
         expert_gate, expert_index = router_probs.max(dim=-1)
         
-        # Compute load balancing loss
-        # Fraction of samples per expert
-        expert_counts = torch.zeros(self.n_experts, device=device)
-        for i in range(self.n_experts):
-            expert_counts[i] = (expert_index == i).float().sum()
-        fraction_per_expert = expert_counts / batch_size
-        
-        # Mean router probability per expert
+        # Compute load balancing loss (vectorized)
+        expert_mask = F.one_hot(expert_index, self.n_experts).float()  # [batch, n_experts]
+        fraction_per_expert = expert_mask.sum(dim=0) / batch_size
         mean_prob_per_expert = router_probs.mean(dim=0)
         
-        # Auxiliary loss
         self._aux_loss = self.n_experts * torch.sum(
             fraction_per_expert * mean_prob_per_expert
         ) * 0.01
         
-        # Run selected experts
-        logits = torch.zeros(batch_size, n_classes, device=device)
-        all_clauses = []
+        # OPTIMIZED: Batch process per expert
+        logits = torch.zeros(batch_size, n_classes, device=device, dtype=x.dtype)
+        clauses = torch.zeros(batch_size, n_clauses, device=device, dtype=x.dtype)
         
-        for i in range(batch_size):
-            exp_idx = expert_index[i].item()
-            gate = expert_gate[i]
+        for exp_idx in range(self.n_experts):
+            # Find samples routed to this expert
+            mask = (expert_index == exp_idx)
+            if not mask.any():
+                continue
             
-            exp_logits, exp_clauses = self.experts[exp_idx](x[i:i+1])
-            logits[i] = gate * exp_logits.squeeze(0)
-            all_clauses.append(exp_clauses.squeeze(0))
-        
-        clauses = torch.stack(all_clauses, dim=0)
+            sample_indices = mask.nonzero(as_tuple=True)[0]
+            expert_inputs = x[sample_indices]
+            gates = expert_gate[sample_indices].unsqueeze(-1)
+            
+            # Batch process
+            exp_logits, exp_clauses = self.experts[exp_idx](expert_inputs)
+            
+            # Store results with gating
+            logits[sample_indices] = gates * exp_logits
+            clauses[sample_indices] = exp_clauses
         
         return logits, clauses
 

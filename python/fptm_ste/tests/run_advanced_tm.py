@@ -44,6 +44,7 @@ AVAILABLE_MODELS = (
     "ib",                # Information Bottleneck TM
     "hierarchical",      # Hierarchical Multi-Resolution TM
     "neural_symbolic",   # Neural Symbolic Transformer
+    "enhanced",          # Enhanced Continuous Encoding TM (NEW)
     
     # Hybrid Architectures
     "ultimate_hybrid",   # Ultimate Hybrid TM
@@ -349,6 +350,15 @@ def create_model(
             n_features=n_features,
             n_clauses=n_clauses,
             n_classes=n_classes,
+        )
+    
+    elif model_name == "enhanced":
+        from fptm_ste.booleanization import EnhancedContinuousTM
+        return EnhancedContinuousTM(
+            n_features=n_features,
+            n_clauses=n_clauses,
+            n_classes=n_classes,
+            encoding_dim=kwargs.get("encoding_dim", None),
         )
     
     elif model_name == "temporal":
