@@ -56,3 +56,16 @@ We implemented this optimization in `tm_optimized.py` as `OptimizedSTCM`.
 - **Multi-Head STCM:** Implementing a Transformer-style multi-head mechanism where different STCM "heads" look at subspaces of features.
 - **Int8/Bit Packing:** For inference, the ternary weights can be packed into 2-bit representations, potentially offering 16x memory reduction over Float32.
 
+### 5. Recent Engineering Improvements
+- **Optimized STCM default:** The capacity/product operators now use the linear
+  mismatch projection path by default, matching the throughput of
+  `OptimizedSTCM` without requiring a different class. Custom fuzzy operators
+  automatically fall back to the legacy logic.
+- **Clause memory for transformers:** `TMFeedForward` accepts shared
+  `ClauseMemoryBank` instances, and `UnifiedTMTransformer` exposes
+  `clause_memory_slots` to configure per-stage memories. Diagnostics now report
+  memory peak/mean attention so you can verify whether slots are being used.
+- **Tau/LF scheduler:** `trainers.TauLiteralScheduler` provides a single entry
+  point for annealing STE hardness together with literal budgets, making staged
+  curricula reproducible across MNIST/CIFAR baselines.
+

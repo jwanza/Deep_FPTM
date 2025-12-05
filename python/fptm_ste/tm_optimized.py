@@ -99,8 +99,8 @@ class OptimizedSTCM(FuzzyPatternTM_STCM):
         hard_pos_all = torch.clamp(mask_all, min=0.0)
         hard_inv_all = torch.clamp(-mask_all, min=0.0)
         
-        pos_all = hard_pos_all + (soft_pos_all - soft_pos_all.detach())
-        inv_all = hard_inv_all + (soft_inv_all - soft_inv_all.detach())
+        pos_all = hard_pos_all
+        inv_all = hard_inv_all
         
         pos_pos = pos_all[:half]
         pos_inv = inv_all[:half]

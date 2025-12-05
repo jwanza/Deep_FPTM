@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tm import FuzzyPatternTM_STCM
+from .tm_optimized import OptimizedSTCM
 
 
 class MoEClauseRouter(nn.Module):
@@ -148,9 +149,10 @@ class ClauseExpert(nn.Module):
         n_classes: int,
         operator: str = "capacity",
         tau: float = 0.5,
+        expert_cls: type = OptimizedSTCM,
     ):
         super().__init__()
-        self.stcm = FuzzyPatternTM_STCM(
+        self.stcm = expert_cls(
             n_features=n_features,
             n_clauses=n_clauses,
             n_classes=n_classes,
@@ -376,7 +378,7 @@ class BatchedSparseMoETM(nn.Module):
         # Batched expert computation
         # Instead of separate modules, use combined parameters
         total_clauses = n_experts * n_clauses_per_expert
-        self.shared_stcm = FuzzyPatternTM_STCM(
+        self.shared_stcm = OptimizedSTCM(
             n_features=n_features,
             n_clauses=total_clauses,
             n_classes=n_classes,

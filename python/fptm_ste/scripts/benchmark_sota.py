@@ -65,9 +65,22 @@ def run_benchmarks():
             )
         else:
             # Create standard backbone + linear head
+            # Split manually for Robustness
+            if "_" in backbone:
+                bb_type = backbone.split("_")[0]
+                bb_variant = backbone.split("_", 1)[1]
+            else:
+                # Handle resnet18 case (no underscore)
+                if "resnet" in backbone:
+                    bb_type = "resnet"
+                    bb_variant = backbone.replace("resnet", "")
+                else:
+                    bb_type = backbone
+                    bb_variant = "base"
+                    
             bb = UniversalBackboneFactory.create(
-                backbone_type=backbone.split("_")[0],
-                backbone_variant=backbone.split("_")[1] if "_" in backbone else backbone,
+                backbone_type=bb_type,
+                backbone_variant=bb_variant,
                 pretrained=False
             )
             # Simple head

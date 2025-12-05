@@ -1,4 +1,6 @@
 from copy import deepcopy
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -109,6 +111,70 @@ def update_attention_ema(module):
     for m in module.modules():
         if hasattr(m, "update_attention_ema"):
             m.update_attention_ema()
+
+
+@dataclass
+class TauLiteralScheduleConfig:
+    tau_start: float = 0.9
+    tau_end: float = 0.5
+    literal_start: Optional[float] = None
+    literal_end: Optional[float] = None
+    warmup_epochs: int = 0
+    total_epochs: int = 100
+    mode: str = "cosine"  # {"cosine", "linear"}
+
+
+class TauLiteralScheduler:
+    """
+    Joint scheduler for STE tau and literal budgets.
+
+    Example:
+        cfg = TauLiteralScheduleConfig(tau_start=0.9, tau_end=0.45,
+                                       literal_start=8, literal_end=4,
+                                       total_epochs=50)
+        scheduler = TauLiteralScheduler(cfg)
+        for epoch in range(num_epochs):
+            scheduler.apply(model, epoch)
+    """
+
+    def __init__(self, config: TauLiteralScheduleConfig):
+        self.config = config
+
+    def _progress(self, epoch: int) -> float:
+        total = max(1, self.config.total_epochs - self.config.warmup_epochs)
+        if epoch <= self.config.warmup_epochs:
+            return 0.0
+        return min(1.0, (epoch - self.config.warmup_epochs) / total)
+
+    def _interpolate(self, start: float, end: float, progress: float) -> float:
+        if self.config.mode == "linear":
+            return start + (end - start) * progress
+        # cosine
+        import math
+        cos = (1 + math.cos(math.pi * progress)) / 2.0
+        return end + (start - end) * cos
+
+    def tau_at(self, epoch: int) -> float:
+        prog = self._progress(epoch)
+        return self._interpolate(self.config.tau_start, self.config.tau_end, prog)
+
+    def literal_at(self, epoch: int) -> Optional[float]:
+        if self.config.literal_start is None or self.config.literal_end is None:
+            return None
+        prog = self._progress(epoch)
+        return self._interpolate(self.config.literal_start, self.config.literal_end, prog)
+
+    def apply(self, module: nn.Module, epoch: int) -> None:
+        tau_val = self.tau_at(epoch)
+        anneal_ste_factor(module, tau_val)
+        literal_val = self.literal_at(epoch)
+        if literal_val is None:
+            return
+        for sub in module.modules():
+            if hasattr(sub, "literal_budget"):
+                sub.literal_budget = float(literal_val)
+            if hasattr(sub, "lf"):
+                sub.lf = float(literal_val)
 
 
 def train_step(

@@ -1,16 +1,27 @@
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM
+from .tm import ClauseMemoryBank, FuzzyPatternTM_STE, FuzzyPatternTM_STCM
 from .deep_tm import DeepTMNetwork
 from .swin_tm import DropPath, WindowAttention, InstrumentedMultiheadAttention
 from .tm_positional import RelativePositionBias2D, RotaryEmbedding
 from .swin_pyramid_tm import PatchMerging, window_partition, window_reverse
+from .tm_optimized import OptimizedSTCM
+
+
+def _resolve_stcm_core(operator: Optional[str]) -> Type[FuzzyPatternTM_STCM]:
+    """
+    Returns the preferred STCM implementation for a given operator.
+    Capacity/product operators use the optimized projection by default.
+    """
+    if operator is None:
+        return OptimizedSTCM
+    return OptimizedSTCM if operator in {"capacity", "product"} else FuzzyPatternTM_STCM
 
 
 class ClauseSelfAttention(nn.Module):
@@ -156,6 +167,8 @@ class TMFeedForward(nn.Module):
         tm_operator: str = "capacity",
         ternary_voting: bool = False,
         ternary_band: float = 0.1,
+        clause_memory_slots: int = 0,
+        shared_clause_memory: Optional[ClauseMemoryBank] = None,
     ) -> None:
         super().__init__()
         self.backend = backend.lower()
@@ -175,6 +188,13 @@ class TMFeedForward(nn.Module):
              self.clause_attention_type = "proj" # Backwards compatibility
         self.clause_routing = clause_routing
         self.continuous_bypass = continuous_bypass
+        self.clause_memory = shared_clause_memory
+        if self.clause_memory is None and clause_memory_slots > 0:
+            self.clause_memory = ClauseMemoryBank(
+                n_slots=clause_memory_slots,
+                clause_dim=1,
+            )
+        self.latest_clause_metrics: Dict[str, float] = {}
         self.norm = build_norm(norm_type, dim)
         self._requires_split_gate = self.gate_type in {"linear", "geglu", "swiglu"}
         proj_dim = hidden_dim * 2 if self._requires_split_gate else hidden_dim
@@ -262,7 +282,8 @@ class TMFeedForward(nn.Module):
                 clause_bias_init=clause_bias_init,
             )
         elif self.backend == "stcm":
-            self.core = FuzzyPatternTM_STCM(
+            stcm_cls = _resolve_stcm_core(tm_operator)
+            self.core = stcm_cls(
                 hidden_dim,
                 n_clauses,
                 dim,
@@ -290,6 +311,7 @@ class TMFeedForward(nn.Module):
                 clause_bias_init=clause_bias_init,
             )
         elif self.backend == "deep_stcm":
+             stcm_cls = _resolve_stcm_core(tm_operator)
              self.core = DeepTMNetwork(
                 input_dim=hidden_dim,
                 hidden_dims=[hidden_dim],
@@ -303,7 +325,7 @@ class TMFeedForward(nn.Module):
                 clause_dropout=clause_dropout,
                 literal_dropout=literal_dropout,
                 clause_bias_init=clause_bias_init,
-                layer_cls=FuzzyPatternTM_STCM,
+                layer_cls=stcm_cls,
                 layer_operator=tm_operator,
                 layer_ternary_voting=ternary_voting,
                 layer_extra_kwargs={"ternary_band": ternary_band},
@@ -358,6 +380,38 @@ class TMFeedForward(nn.Module):
             elif hasattr(self.gate_core, "tau"):
                 self.gate_core.tau = tau
 
+    def _vote_from_clauses(self, clauses: torch.Tensor, use_ste: bool) -> torch.Tensor:
+        B, T, _ = clauses.shape
+        flat = clauses.view(B * T, -1)
+        target_module = self.core
+        if hasattr(target_module, "classifier"):
+            target_module = target_module.classifier
+        voting_weight = None
+        if hasattr(target_module, "_voting_matrix"):
+            voting_weight = target_module._voting_matrix(use_ste)
+        elif hasattr(target_module, "voting") and target_module.voting is not None:
+            voting_weight = target_module.voting
+        clause_bias = getattr(target_module, "clause_bias", None)
+        projected = flat
+        if clause_bias is not None:
+            projected = projected + clause_bias.view(1, -1)
+        if voting_weight is None:
+            raise RuntimeError("Unable to resolve voting weights for clause refinement.")
+        projected = projected @ voting_weight
+        return projected.view(B, T, self.output_dim)
+
+    def _apply_clause_memory(self, clauses: torch.Tensor) -> torch.Tensor:
+        if self.clause_memory is None:
+            return clauses
+        B, T, C = clauses.shape
+        mem_in = clauses.view(B * T, C)
+        mem_out = self.clause_memory(mem_in, update_memory=self.training)
+        mem_out = mem_out.view(B, T, C)
+        if getattr(self.clause_memory, "last_attention_metrics", None):
+            for key, value in self.clause_memory.last_attention_metrics.items():
+                self.latest_clause_metrics[f"memory_{key}"] = value
+        return mem_out
+
     def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
         B, T, C = x.shape
         y = self.norm(x)
@@ -406,49 +460,34 @@ class TMFeedForward(nn.Module):
             bypass_out = self.bypass(y)
         flat = fused.reshape(B * T, -1)
         logits, clause_outputs = self.core(flat, use_ste=use_ste)
+        core_metrics = getattr(self.core, "latest_clause_metrics", None)
+        self.latest_clause_metrics = dict(core_metrics) if core_metrics else {}
         if self.sparsity_weight > 0.0:
             self._sparsity_penalty = clause_outputs.abs().mean() * self.sparsity_weight
         else:
             self._sparsity_penalty = None
         reshaped_clauses = clause_outputs.view(B, T, -1)
+        reshaped_clauses = self._apply_clause_memory(reshaped_clauses)
         self.last_clause_outputs = reshaped_clauses.detach()
         self.last_clause_outputs_raw = reshaped_clauses
         logits = logits.view(B, T, C)
+        if self.clause_memory is not None:
+            logits = self._vote_from_clauses(reshaped_clauses, use_ste)
 
         if self.clause_self_attn is not None:
             # [B, T, n_clauses]
             refined = self.clause_self_attn(reshaped_clauses)
+            reshaped_clauses = refined
             self.last_clause_outputs = refined.detach()
-            
-            # Recalculate logits with refined clauses
-            refined_flat = refined.view(B * T, -1)
-            
-            # Resolve voting weights and bias from core or deep core classifier
-            voting_weight = None
-            clause_bias = None
-            target_module = self.core
-            if hasattr(target_module, "classifier"):
-                target_module = target_module.classifier
-            
-            if hasattr(target_module, "_voting_matrix"):
-                voting_weight = target_module._voting_matrix(use_ste)
-            elif hasattr(target_module, "voting") and target_module.voting is not None:
-                voting_weight = target_module.voting
-            
-            if hasattr(target_module, "clause_bias"):
-                clause_bias = target_module.clause_bias
+            self.last_clause_outputs_raw = refined
+            logits = self._vote_from_clauses(refined, use_ste)
 
-            if voting_weight is not None:
-                if clause_bias is not None:
-                    refined_flat = refined_flat + clause_bias.view(1, -1)
-                logits = refined_flat @ voting_weight
-                logits = logits.view(B, T, C)
-
+        clause_source = reshaped_clauses.view(B * T, -1)
         if self.clause_attn_proj is not None:
-            clause_ctx = self.clause_attn_proj(clause_outputs).view(B, T, C)
+            clause_ctx = self.clause_attn_proj(clause_source).view(B, T, C)
             logits = logits + clause_ctx
         if self.clause_gate is not None:
-            gate = self.clause_gate(clause_outputs).view(B, T, C)
+            gate = self.clause_gate(clause_source).view(B, T, C)
             logits = logits * gate
         if bypass_out is not None:
             gain = torch.tanh(self.bypass_gain) if self.bypass_gain is not None else 1.0
@@ -504,6 +543,8 @@ class TMEncoderBlock(nn.Module):
         tm_operator: str = "capacity",
         ternary_voting: bool = False,
         ternary_band: float = 0.1,
+        clause_memory: Optional[ClauseMemoryBank] = None,
+        clause_memory_slots: int = 0,
     ) -> None:
         super().__init__()
         self.norm1 = build_norm(norm_type, dim)
@@ -558,6 +599,8 @@ class TMEncoderBlock(nn.Module):
             tm_operator=tm_operator,
             ternary_voting=ternary_voting,
             ternary_band=ternary_band,
+                shared_clause_memory=clause_memory,
+                clause_memory_slots=clause_memory_slots,
         )
         self.norm2 = build_norm(norm_type, dim)
         self.num_heads = num_heads
@@ -642,6 +685,8 @@ class TMSwinBlock(nn.Module):
         tm_operator: str = "capacity",
         ternary_voting: bool = False,
         ternary_band: float = 0.1,
+        clause_memory: Optional[ClauseMemoryBank] = None,
+        clause_memory_slots: int = 0,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -696,6 +741,8 @@ class TMSwinBlock(nn.Module):
             tm_operator=tm_operator,
             ternary_voting=ternary_voting,
             ternary_band=ternary_band,
+            shared_clause_memory=clause_memory,
+            clause_memory_slots=clause_memory_slots,
         )
         self.norm2 = build_norm(norm_type, dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
@@ -813,9 +860,16 @@ class TMSwinStage(nn.Module):
         tm_operator: str = "capacity",
         ternary_voting: bool = False,
         ternary_band: float = 0.1,
+        clause_memory_slots: int = 0,
     ) -> None:
         super().__init__()
         blocks = []
+        shared_memory = None
+        if clause_memory_slots > 0:
+            shared_memory = ClauseMemoryBank(
+                n_slots=clause_memory_slots,
+                clause_dim=1,
+            )
         for idx in range(depth):
             shift = 0 if idx % 2 == 0 else window_size // 2
             blocks.append(
@@ -857,6 +911,8 @@ class TMSwinStage(nn.Module):
                     tm_operator=tm_operator,
                     ternary_voting=ternary_voting,
                     ternary_band=ternary_band,
+                    clause_memory=shared_memory,
+                    clause_memory_slots=clause_memory_slots,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -952,6 +1008,7 @@ class UnifiedTMTransformer(nn.Module):
         tm_operator: str = "capacity",
         ternary_voting: bool = False,
         ternary_band: float = 0.1,
+        clause_memory_slots: int = 0,
     ) -> None:
         super().__init__()
         self.architecture = architecture.lower()
@@ -991,6 +1048,13 @@ class UnifiedTMTransformer(nn.Module):
         self.component_order: List[str] = []
         self.diagnostic_heads: nn.ModuleDict = nn.ModuleDict()
         self.attn_head_heads: nn.ModuleDict = nn.ModuleDict()
+        self._diagnostics_ready: bool = False
+        self._vit_depth: Optional[int] = None
+        self._vit_heads: Optional[int] = None
+        self._vit_head_dim: Optional[int] = None
+        self._stage_depths: Optional[Tuple[int, ...]] = None
+        self._stage_heads: Optional[Tuple[int, ...]] = None
+        self._stage_dims: Optional[Tuple[int, ...]] = None
 
         if self.architecture not in {"vit", "swin"}:
             raise ValueError("architecture must be 'vit' or 'swin'.")
@@ -1007,12 +1071,25 @@ class UnifiedTMTransformer(nn.Module):
             depth = depths if isinstance(depths, int) else sum(depths)
             head = num_heads if isinstance(num_heads, int) else num_heads[0]
             mlp = mlp_ratio if isinstance(mlp_ratio, (int, float)) else mlp_ratio[0]
+            self._vit_depth = depth
+            self._vit_heads = head
+            self._vit_head_dim = int(embed_dim) // head
+            self._stage_depths = None
             clause_list = _expand_vit_clauses(tm_clauses, depth)
             if schedule == "cosine":
                 steps = torch.linspace(0.0, 1.0, depth)
                 drop_path = (drop_path_rate * 0.5 * (1 - torch.cos(torch.pi * steps))).tolist()
             else:
                 drop_path = torch.linspace(0, drop_path_rate, depth).tolist()
+            memory_modules: List[Optional[ClauseMemoryBank]] = []
+            if clause_memory_slots > 0:
+                for _ in clause_list:
+                    memory_modules.append(
+                        ClauseMemoryBank(
+                            n_slots=clause_memory_slots,
+                            clause_dim=1,
+                        )
+                    )
             self.blocks = nn.ModuleList(
                 [
                     TMEncoderBlock(
@@ -1049,6 +1126,8 @@ class UnifiedTMTransformer(nn.Module):
                         grid_size=grid_size,
                         include_cls_token=self.cls_token is not None,
                         relative_position_type=self.relative_position_type,
+                        clause_memory=memory_modules[i] if clause_memory_slots > 0 else None,
+                        clause_memory_slots=clause_memory_slots,
                     )
                     for i in range(depth)
                 ]
@@ -1062,15 +1141,6 @@ class UnifiedTMTransformer(nn.Module):
             self.component_order = ["patch_embed"] + [f"block_{i + 1}" for i in range(depth)] + ["pre_head"]
             for name in self.component_order:
                 self.component_dims[name] = int(embed_dim)
-            head_dim = int(embed_dim) // head
-            for block_idx in range(depth):
-                for head_idx in range(head):
-                    key = f"block_{block_idx + 1}_head{head_idx + 1}"
-                    layer = nn.Linear(head_dim, num_classes)
-                    nn.init.trunc_normal_(layer.weight, std=0.02)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
-                    self.attn_head_heads[key] = layer
         else:
             if isinstance(depths, int):
                 raise ValueError("depths must be a sequence for Swin architecture.")
@@ -1080,6 +1150,12 @@ class UnifiedTMTransformer(nn.Module):
                 stage_dims = tuple(embed_dim)
             else:
                 stage_dims = tuple(int(embed_dim) * (2 ** i) for i in range(len(stage_depths)))
+            self._vit_depth = None
+            self._vit_heads = None
+            self._vit_head_dim = None
+            self._stage_depths = stage_depths
+            self._stage_heads = stage_heads
+            self._stage_dims = stage_dims
             stage_mlp = _to_sequence(mlp_ratio, len(stage_depths))
             stage_clauses = _to_sequence(tm_clauses, len(stage_depths))
             total_blocks = sum(stage_depths)
@@ -1131,6 +1207,7 @@ class UnifiedTMTransformer(nn.Module):
                     tm_operator=tm_operator,
                     ternary_voting=ternary_voting,
                     ternary_band=ternary_band,
+                    clause_memory_slots=clause_memory_slots,
                 )
                 stages.append(stage)
                 dp_offset += depth
@@ -1156,23 +1233,10 @@ class UnifiedTMTransformer(nn.Module):
                 for block_idx in range(depth):
                     for head_idx in range(stage_heads[idx]):
                         key = f"stage{idx + 1}_block{block_idx + 1}_head{head_idx + 1}"
-                        layer = nn.Linear(head_dim, num_classes)
-                        nn.init.trunc_normal_(layer.weight, std=0.02)
-                        if layer.bias is not None:
-                            nn.init.zeros_(layer.bias)
-                        self.attn_head_heads[key] = layer
 
         nn.init.trunc_normal_(self.head.weight, std=0.02)
         if self.head.bias is not None:
             nn.init.zeros_(self.head.bias)
-
-        for name in self.component_order:
-            dim = self.component_dims[name]
-            head = nn.Linear(dim, num_classes)
-            nn.init.trunc_normal_(head.weight, std=0.02)
-            if head.bias is not None:
-                nn.init.zeros_(head.bias)
-            self.diagnostic_heads[name] = head
 
     def _pool_vit_tokens(self, x: torch.Tensor) -> torch.Tensor:
         """Pool tokens for ViT architecture."""
@@ -1188,6 +1252,35 @@ class UnifiedTMTransformer(nn.Module):
         if mode == "vit" and self.pool == "cls" and head_tokens.size(2) > 0:
             return head_tokens[:, :, 0, :]
         return head_tokens.mean(dim=2)
+
+    def _ensure_diagnostics(self) -> None:
+        if self._diagnostics_ready:
+            return
+        self.diagnostic_heads = nn.ModuleDict()
+        self.attn_head_heads = nn.ModuleDict()
+        if self.architecture == "vit" and self._vit_depth is not None and self._vit_heads is not None:
+            head_dim = self._vit_head_dim or self.num_classes
+            for block_idx in range(self._vit_depth):
+                for head_idx in range(self._vit_heads):
+                    key = f"block_{block_idx + 1}_head{head_idx + 1}"
+                    layer = nn.Linear(head_dim, self.num_classes)
+                    _init_linear(layer)
+                    self.attn_head_heads[key] = layer
+        elif self.architecture == "swin" and self._stage_depths is not None and self._stage_heads is not None and self._stage_dims is not None:
+            for idx, depth in enumerate(self._stage_depths):
+                head_dim = self._stage_dims[idx] // self._stage_heads[idx]
+                for block_idx in range(depth):
+                    for head_idx in range(self._stage_heads[idx]):
+                        key = f"stage{idx + 1}_block{block_idx + 1}_head{head_idx + 1}"
+                        layer = nn.Linear(head_dim, self.num_classes)
+                        _init_linear(layer)
+                        self.attn_head_heads[key] = layer
+        for name in self.component_order:
+            dim = self.component_dims[name]
+            head = nn.Linear(dim, self.num_classes)
+            _init_linear(head)
+            self.diagnostic_heads[name] = head
+        self._diagnostics_ready = True
 
     def forward(
         self,
@@ -1209,6 +1302,8 @@ class UnifiedTMTransformer(nn.Module):
         collecting = collect_diagnostics
         reg_loss: Optional[torch.Tensor] = None
         clause_metrics: Dict[str, torch.Tensor] = {}
+        if collecting:
+            self._ensure_diagnostics()
 
         if self.architecture == "vit":
             x = self.patch_embed(x)
@@ -1267,6 +1362,10 @@ class UnifiedTMTransformer(nn.Module):
                             dtype=clause_mean.dtype,
                         )
                         clause_metrics[f"{component_key}_head_mean"] = head_means.cpu()
+                    extra_metrics = getattr(block.ffn, "latest_clause_metrics", None)
+                    if extra_metrics:
+                        for key, value in extra_metrics.items():
+                            clause_metrics[f"{component_key}_{key}"] = torch.tensor(value)
                 penalty = getattr(block.ffn, "sparsity_penalty", None)
                 if penalty is not None:
                     reg_loss = penalty if reg_loss is None else reg_loss + penalty
@@ -1330,6 +1429,10 @@ class UnifiedTMTransformer(nn.Module):
                             dtype=clause_mean.dtype,
                         )
                         clause_metrics[key + "_head_mean"] = head_means.cpu()
+                        extra_metrics = getattr(block.ffn, "latest_clause_metrics", None)
+                        if extra_metrics:
+                            for metric_key, value in extra_metrics.items():
+                                clause_metrics[f"{key}_{metric_key}"] = torch.tensor(value)
             for block in stage.blocks:
                 penalty = getattr(block.ffn, "sparsity_penalty", None)
                 if penalty is not None:

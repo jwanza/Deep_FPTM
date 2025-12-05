@@ -3,7 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, Optional, Sequence, Tuple, Type
-from .tm import FuzzyPatternTM_STE, prepare_tm_input
+from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM, prepare_tm_input
+from .tm_optimized import OptimizedSTCM
+
+
+def _resolve_layer_cls(layer_cls: Type[nn.Module], operator: Optional[str]) -> Type[nn.Module]:
+    if layer_cls not in {FuzzyPatternTM_STCM, OptimizedSTCM}:
+        return layer_cls
+    if operator is None or operator in {"capacity", "product"}:
+        return OptimizedSTCM
+    return FuzzyPatternTM_STCM
 
 
 def _class_supports_kwarg(cls: Type[nn.Module], name: str) -> bool:
@@ -60,7 +69,7 @@ class DeepTMNetwork(nn.Module):
         self.norms = nn.ModuleList()
         self.residuals = nn.ModuleList()
         self.noise_std = noise_std
-        self.layer_cls = layer_cls
+        self.layer_cls = _resolve_layer_cls(layer_cls, layer_operator)
         self.layer_extra_kwargs = dict(layer_extra_kwargs or {})
 
         prev = input_dim
@@ -79,19 +88,19 @@ class DeepTMNetwork(nn.Module):
                 tau=tau,
             )
             # Only add dropout params if the layer class supports them
-            if _class_supports_kwarg(layer_cls, "clause_dropout"):
+            if _class_supports_kwarg(self.layer_cls, "clause_dropout"):
                 tm_kwargs["clause_dropout"] = clause_dropout
-            if _class_supports_kwarg(layer_cls, "literal_dropout"):
+            if _class_supports_kwarg(self.layer_cls, "literal_dropout"):
                 tm_kwargs["literal_dropout"] = literal_dropout
-            if _class_supports_kwarg(layer_cls, "clause_bias_init"):
+            if _class_supports_kwarg(self.layer_cls, "clause_bias_init"):
                 tm_kwargs["clause_bias_init"] = clause_bias_init
             tm_kwargs.update(layer_kwargs)
             tm_kwargs.update(self.layer_extra_kwargs)
-            if layer_operator is not None and _class_supports_kwarg(layer_cls, "operator"):
+            if layer_operator is not None and _class_supports_kwarg(self.layer_cls, "operator"):
                 tm_kwargs["operator"] = layer_operator
-            if layer_ternary_voting is not None and _class_supports_kwarg(layer_cls, "ternary_voting"):
+            if layer_ternary_voting is not None and _class_supports_kwarg(self.layer_cls, "ternary_voting"):
                 tm_kwargs["ternary_voting"] = layer_ternary_voting
-            self.layers.append(layer_cls(**tm_kwargs))
+            self.layers.append(self.layer_cls(**tm_kwargs))
             self.norms.append(nn.LayerNorm(h))
             self.residuals.append(nn.Linear(prev, h, bias=False) if prev != h else nn.Identity())
             prev = h
@@ -103,18 +112,18 @@ class DeepTMNetwork(nn.Module):
             tau=tau,
         )
         # Only add dropout params if the layer class supports them
-        if _class_supports_kwarg(layer_cls, "clause_dropout"):
+        if _class_supports_kwarg(self.layer_cls, "clause_dropout"):
             classifier_kwargs["clause_dropout"] = clause_dropout
-        if _class_supports_kwarg(layer_cls, "literal_dropout"):
+        if _class_supports_kwarg(self.layer_cls, "literal_dropout"):
             classifier_kwargs["literal_dropout"] = literal_dropout
-        if _class_supports_kwarg(layer_cls, "clause_bias_init"):
+        if _class_supports_kwarg(self.layer_cls, "clause_bias_init"):
             classifier_kwargs["clause_bias_init"] = clause_bias_init
         classifier_kwargs.update(self.layer_extra_kwargs)
-        if layer_operator is not None and _class_supports_kwarg(layer_cls, "operator"):
+        if layer_operator is not None and _class_supports_kwarg(self.layer_cls, "operator"):
             classifier_kwargs["operator"] = layer_operator
-        if layer_ternary_voting is not None and _class_supports_kwarg(layer_cls, "ternary_voting"):
+        if layer_ternary_voting is not None and _class_supports_kwarg(self.layer_cls, "ternary_voting"):
             classifier_kwargs["ternary_voting"] = layer_ternary_voting
-        self.classifier = layer_cls(**classifier_kwargs)
+        self.classifier = self.layer_cls(**classifier_kwargs)
         self.dropout = nn.Dropout(dropout)
 
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:

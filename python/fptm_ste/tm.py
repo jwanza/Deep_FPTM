@@ -51,6 +51,7 @@ class ClauseMemoryBank(nn.Module):
         self.key_dim = key_dim if key_dim is not None else clause_dim
         self.ema_decay = ema_decay
         self.temperature = temperature
+        self.last_attention_metrics: Dict[str, float] = {}
         
         # Memory bank (not a parameter, updated via EMA)
         self.register_buffer("memory", torch.randn(n_slots, clause_dim) * 0.02)
@@ -105,6 +106,10 @@ class ClauseMemoryBank(nn.Module):
         attn_logits = torch.bmm(queries, keys.transpose(-2, -1).expand(batch_size, -1, -1))
         attn_logits = attn_logits / (self.key_dim ** 0.5 * self.temperature)
         attn_weights = F.softmax(attn_logits, dim=-1)
+        with torch.no_grad():
+            peak = attn_weights.amax(dim=-1).mean().item()
+            mean = attn_weights.mean().item()
+            self.last_attention_metrics = {"mean": mean, "peak": peak}
         
         # Retrieve memory content: [batch, n_clauses, clause_dim]
         # Detach memory to avoid in-place modification issues
@@ -1203,6 +1208,7 @@ class FuzzyPatternTM_STCM(nn.Module):
         ternary_voting: bool = False,
         ternary_band: float = 0.0,
         ste_temperature: float = 1.0,
+        init_std: float = 0.01,
     ):
         super().__init__()
         if n_clauses <= 0 or n_features <= 0:
@@ -1259,8 +1265,8 @@ class FuzzyPatternTM_STCM(nn.Module):
         if half == 0:
             raise ValueError("n_clauses must be at least 2 for STCM.")
 
-        self.pos_logits = nn.Parameter(torch.randn(half, n_features) * 0.05)
-        self.neg_logits = nn.Parameter(torch.randn(half, n_features) * 0.05)
+        self.pos_logits = nn.Parameter(torch.randn(half, n_features) * init_std)
+        self.neg_logits = nn.Parameter(torch.randn(half, n_features) * init_std)
 
         if ternary_voting:
             self.vote_logits = nn.Parameter(torch.randn(n_clauses, n_classes) * 0.1)
@@ -1268,6 +1274,11 @@ class FuzzyPatternTM_STCM(nn.Module):
         else:
             self.voting = nn.Parameter(torch.randn(n_clauses, n_classes) * 0.1)
             self.vote_logits = None
+        # Runtime helpers
+        self.cache_masks: bool = True
+        self._mask_cache: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        self._mask_cache_key: Optional[Tuple[bool, int, int]] = None
+        self.latest_clause_metrics: Dict[str, float] = {}
 
     def prune(self, threshold: float = 0.1):
         """
@@ -1295,15 +1306,27 @@ class FuzzyPatternTM_STCM(nn.Module):
         inv = hard_inv + (soft_inv - soft_inv.detach())
         return pos, inv
 
+    def _mismatch_projection(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mismatch: sum(mask_pos) - x @ (mask_pos - mask_inv)^T
+            bias: mask_pos sum used for diagnostics
+        """
+        w_eff = mask_pos - mask_inv
+        projection = F.linear(x, w_eff)  # [B, half]
+        bias = mask_pos.sum(dim=1).unsqueeze(0)
+        mismatch = bias - projection
+        return mismatch, bias
+
     def _capacity_strength(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
+        mismatch, _ = self._mismatch_projection(x, mask_pos, mask_inv)
         capacity = self._clause_capacity(mask_pos, mask_inv)
-        mismatch = F.linear(1.0 - x, mask_pos) + F.linear(x, mask_inv)
         raw = capacity - mismatch
         return self._straight_relu(raw)
 
     def _product_strength(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
-        penalties = F.linear(1.0 - x, mask_pos) + F.linear(x, mask_inv)
-        scaled = torch.clamp(penalties * self.product_scale, min=0.0, max=10.0)
+        mismatch, _ = self._mismatch_projection(x, mask_pos, mask_inv)
+        scaled = torch.clamp(mismatch * self.product_scale, min=0.0, max=10.0)
         return torch.exp(-scaled)
 
     def _match_scores(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1331,10 +1354,15 @@ class FuzzyPatternTM_STCM(nn.Module):
         
         # Check for custom fuzzy operator
         if hasattr(self, 'operator_impl') and self.operator_impl is not None:
-            # Compute match scores for the fuzzy operator
             pos_match, inv_match = self._match_scores(x, mask_pos, mask_inv)
-            # Apply fuzzy t-norm to combine match scores
-            combined = self.operator_impl(pos_match, inv_match)
+            try:
+                combined = self.operator_impl(pos_match, inv_match)
+            except ValueError as exc:
+                msg = str(exc).lower()
+                if "expects at least" not in msg:
+                    raise
+                capacity = self._clause_capacity(mask_pos, mask_inv).expand_as(pos_match)
+                combined = self.operator_impl(pos_match, inv_match, capacity)
             return combined
         
         # Built-in operators
@@ -1342,129 +1370,101 @@ class FuzzyPatternTM_STCM(nn.Module):
             return self._capacity_strength(x, mask_pos, mask_inv)
         return self._product_strength(x, mask_pos, mask_inv)
 
-    def _clause_outputs(self, x: torch.Tensor, use_ste: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Batch calculate masks
-        # Stack logits: [4*half, n_features]
-        # Note: self.pos_logits is [half, F], self.neg_logits is [half, F]
-        # Masks required: pos_pos, pos_inv, neg_pos, neg_inv
-        # STCM only stores pos_logits and neg_logits.
-        # _split_masks splits one logit set into (pos, inv).
-        
-        # We can stack pos_logits and neg_logits -> [2*half, F]
-        # Calculate mask -> [2*half, F]
-        # Then split -> [4*half, F] effectively? No, split logic is inside _split_masks.
-        
-        # Let's optimize _split_masks first.
-        # It does sigmoid(logits) and sigmoid(-logits).
-        # sigmoid(-x) = 1 - sigmoid(x).
-        
-        all_logits = torch.cat([self.pos_logits, self.neg_logits], dim=0) # [2*half, F]
-        
-        temp = max(self.ste_temperature, 1e-6)
-        
-        if use_ste:
-             mask_all = _ste_ternary(all_logits, self.ternary_band, self.ste_temperature)
-        else:
-             mask_all = torch.tanh(all_logits / self.ste_temperature)
-             
-        # Split back
+    def _maybe_get_cached_masks(self, use_ste: bool) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not self.cache_masks or torch.is_grad_enabled():
+            return None
+        key = (bool(use_ste), self.pos_logits._version, self.neg_logits._version)
+        if self._mask_cache_key == key and self._mask_cache is not None:
+            return tuple(t for t in self._mask_cache)
+        return None
+
+    def _set_mask_cache(
+        self,
+        use_ste: bool,
+        pos_pos: torch.Tensor,
+        neg_pos: torch.Tensor,
+        pos_inv: torch.Tensor,
+        neg_inv: torch.Tensor,
+    ) -> None:
+        if not self.cache_masks or torch.is_grad_enabled():
+            self._mask_cache = None
+            self._mask_cache_key = None
+            return
+        key = (bool(use_ste), self.pos_logits._version, self.neg_logits._version)
+        self._mask_cache_key = key
+        self._mask_cache = tuple(t.detach().clone() for t in (pos_pos, neg_pos, pos_inv, neg_inv))
+
+    def _compute_split_masks(self, use_ste: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cached = self._maybe_get_cached_masks(use_ste)
+        if cached is not None:
+            return cached
+
         half = self.n_clauses // 2
-        mask_pos = mask_all[:half]
-        mask_neg = mask_all[half:]
-        
-        # Now _split_masks logic:
-        # hard_pos = clamp(mask, min=0)
-        # hard_inv = clamp(-mask, min=0)
-        # soft_pos = sigmoid(logits/temp)
-        # soft_inv = sigmoid(-logits/temp)
-        
-        # Optimize soft calculation:
+        all_logits = torch.cat([self.pos_logits, self.neg_logits], dim=0)
+        temp = max(self.ste_temperature, 1e-6)
+
+        if use_ste:
+            mask_all = _ste_ternary(all_logits, self.ternary_band, self.ste_temperature)
+        else:
+            mask_all = torch.tanh(all_logits / self.ste_temperature)
+
         soft_all = torch.sigmoid(all_logits / temp)
         soft_pos_all = soft_all
-        soft_inv_all = 1.0 - soft_all # sigmoid(-x) == 1 - sigmoid(x)
-        
-        # Optimize hard calculation:
+        soft_inv_all = 1.0 - soft_all
+
         hard_pos_all = torch.clamp(mask_all, min=0.0)
         hard_inv_all = torch.clamp(-mask_all, min=0.0)
-        
-        # Apply STE-like pass-through if needed (mask_all already has it if use_ste? No, _split_masks adds another layer?)
-        # _mask_from_logits returns values in [-1, 1].
-        # _split_masks splits -1 -> inv=1, 1 -> pos=1.
-        # And adds soft gradients.
-        
+
         pos_all = hard_pos_all + (soft_pos_all - soft_pos_all.detach())
         inv_all = hard_inv_all + (soft_inv_all - soft_inv_all.detach())
-        
-        # Split into pos/neg halves
+
         pos_pos = pos_all[:half]
         pos_inv = inv_all[:half]
         neg_pos = pos_all[half:]
         neg_inv = inv_all[half:]
-        
-        # Enforce budget
-        # We can optimize enforce_budget later if needed, it's elementwise/sum.
+
         pos_pos, pos_inv = self._enforce_literal_budget(pos_pos, pos_inv)
         neg_pos, neg_inv = self._enforce_literal_budget(neg_pos, neg_inv)
-        
-        # Calculate strengths
-        # Similar to STE optimization: Fuse into single linear call?
-        # _strength uses either capacity or product.
-        # Capacity: relu(capacity - mismatch)
-        # Mismatch = (1-x) @ mask_pos.t() + x @ mask_inv.t()
-        
-        # We can reuse the [1-x, x] concatenation trick!
-        
-        x_neg = 1.0 - x
-        X_combined = torch.cat([x_neg, x], dim=1) # [B, 2F]
-        
-        # Weights:
-        # W_pos = [mask_pos, mask_inv] (concatenated along F dim)
-        # W_neg = [mask_neg, mask_neg_inv]
-        
-        # But wait, mask_pos is [half, F].
-        # We need [mask_pos; mask_inv] -> [half, 2F].
-        
-        W_pos = torch.cat([pos_pos, pos_inv], dim=1)
-        W_neg = torch.cat([neg_pos, neg_inv], dim=1)
-        W_total = torch.cat([W_pos, W_neg], dim=0) # [n_clauses, 2F]
-        
-        # Mismatches / Penalties
-        # For Capacity: mismatch = X_combined @ W_total.t()
-        # For Product: penalties = X_combined @ W_total.t()
-        # Both are just linear projection!
-        
-        raw_outputs = F.linear(X_combined, W_total) # [B, n_clauses]
-        
-        if self.operator == "capacity":
-            # Need capacity per clause
-            # capacity = sum(mask_pos + mask_inv)
-            # W_total is [mask_pos, mask_inv] per row.
-            # So sum(W_total, dim=1) is exactly capacity!
-            capacity = W_total.sum(dim=1).unsqueeze(0) # [1, n_clauses]
-            
-            # Apply literal budget constraints to capacity (moved here from mask)
-            capacity = self._apply_literal_constraints(capacity)
 
-            # Raw strength = capacity - mismatch
-            # mismatch = raw_outputs
-            strength = self._straight_relu(capacity - raw_outputs)
-            
-        else: # Product
-            # strength = exp(-clamp(raw_outputs * scale))
-            scaled = torch.clamp(raw_outputs * self.product_scale, min=0.0, max=10.0)
-            strength = torch.exp(-scaled)
-            
-        # Split back to pos/neg strength for voting
-        pos_strength = strength[:, :half]
-        neg_strength = strength[:, half:]
-        
+        self._set_mask_cache(use_ste, pos_pos, neg_pos, pos_inv, neg_inv)
+        return pos_pos, neg_pos, pos_inv, neg_inv
+
+    def _record_clause_metrics(
+        self,
+        pos_pos: torch.Tensor,
+        neg_pos: torch.Tensor,
+        pos_inv: torch.Tensor,
+        neg_inv: torch.Tensor,
+        pos_strength: torch.Tensor,
+        neg_strength: torch.Tensor,
+    ) -> None:
+        with torch.no_grad():
+            literal_activity = torch.cat(
+                [pos_pos, neg_pos, pos_inv, neg_inv],
+                dim=0,
+            )
+            clause_activity = torch.cat([pos_strength, neg_strength], dim=1)
+            self.latest_clause_metrics = {
+                "avg_literal_activation": float(literal_activity.mean().item()),
+                "avg_literals_per_clause": float(literal_activity.sum(dim=1).mean().item()),
+                "avg_clause_strength": float(clause_activity.mean().item()),
+                "tau": float(self.tau),
+            }
+
+    def _clause_outputs(self, x: torch.Tensor, use_ste: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pos_pos, neg_pos, pos_inv, neg_inv = self._compute_split_masks(use_ste)
+
+        pos_strength = self._strength(x, pos_pos, pos_inv)
+        neg_strength = self._strength(x, neg_pos, neg_inv)
+
         clause_votes = torch.cat([pos_strength, -neg_strength], dim=1)
 
         if self.vote_clamp is not None:
             clause_votes = clause_votes.clamp(-self.vote_clamp, self.vote_clamp)
         if self.training and self.clause_dropout > 0.0:
             clause_votes = F.dropout(clause_votes, p=self.clause_dropout, training=True)
-            
+
+        self._record_clause_metrics(pos_pos, neg_pos, pos_inv, neg_inv, pos_strength, neg_strength)
         return pos_strength, neg_strength, clause_votes
 
     def _clause_capacity(self, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
@@ -1516,38 +1516,8 @@ class FuzzyPatternTM_STCM(nn.Module):
             - pos_inv: [half, n_features] - inverted literals (x=0) for positive clauses
             - neg_inv: [half, n_features] - inverted literals (x=0) for negative clauses
         """
-        half = self.n_clauses // 2
-        all_logits = torch.cat([self.pos_logits, self.neg_logits], dim=0)
-        
-        temp = max(self.ste_temperature, 1e-6)
-        
-        if use_ste:
-            mask_all = _ste_ternary(all_logits, self.ternary_band, self.ste_temperature)
-        else:
-            mask_all = torch.tanh(all_logits / self.ste_temperature)
-        
-        mask_pos = mask_all[:half]
-        mask_neg = mask_all[half:]
-        
-        soft_all = torch.sigmoid(all_logits / temp)
-        soft_pos_all = soft_all
-        soft_inv_all = 1.0 - soft_all
-        
-        hard_pos_all = torch.clamp(mask_all, min=0.0)
-        hard_inv_all = torch.clamp(-mask_all, min=0.0)
-        
-        pos_all = hard_pos_all + (soft_pos_all - soft_pos_all.detach())
-        inv_all = hard_inv_all + (soft_inv_all - soft_inv_all.detach())
-        
-        pos_pos = pos_all[:half]
-        pos_inv = inv_all[:half]
-        neg_pos = pos_all[half:]
-        neg_inv = inv_all[half:]
-        
-        pos_pos, pos_inv = self._enforce_literal_budget(pos_pos, pos_inv)
-        neg_pos, neg_inv = self._enforce_literal_budget(neg_pos, neg_inv)
-        
-        return pos_pos, neg_pos, pos_inv, neg_inv
+        pos_pos, neg_pos, pos_inv, neg_inv = self._compute_split_masks(use_ste)
+        return pos_pos.detach(), neg_pos.detach(), pos_inv.detach(), neg_inv.detach()
 
     def forward(self, x: torch.Tensor, use_ste: bool = True, skip_norm: bool = False):
         """

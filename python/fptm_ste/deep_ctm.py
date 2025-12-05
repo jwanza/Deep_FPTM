@@ -9,6 +9,17 @@ import torch.nn.init as init
 from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM
 from .conv_tm import ConvSTE2d, ConvSTCM2d
 from .deep_tm import DeepTMNetwork
+from .tm_optimized import OptimizedSTCM
+
+
+def _is_stcm_cls(cls: Type[nn.Module]) -> bool:
+    return cls in {FuzzyPatternTM_STCM, OptimizedSTCM}
+
+
+def _preferred_stcm_cls(operator: Optional[str]) -> Type[nn.Module]:
+    if operator is None:
+        return OptimizedSTCM
+    return OptimizedSTCM if operator in {"capacity", "product"} else FuzzyPatternTM_STCM
 
 
 def _softplus_inverse(value: float) -> float:
@@ -84,13 +95,13 @@ class DeepCTMNetwork(nn.Module):
         self.dropout_p = float(dropout)
         self.conv_core_backend = (conv_core_backend or "tm").lower()
         self.core_hidden_dims = list(core_hidden_dims) if core_hidden_dims is not None else None
-        self.layer_cls = layer_cls
+        self.layer_cls = _preferred_stcm_cls(stcm_operator) if _is_stcm_cls(layer_cls) else layer_cls
         self.use_stem = bool(use_stem)
         self.stem_channels = int(stem_channels) if stem_channels is not None else (int(channels[0]) if channels else in_channels)
         self.mix_type = (mix_type or "none").lower()
         resolved_head_type = head_type.lower() if head_type else "auto"
         if resolved_head_type == "auto":
-            resolved_head_type = "stcm" if (layer_cls is FuzzyPatternTM_STCM or layer_cls == FuzzyPatternTM_STCM) else "tm"
+            resolved_head_type = "stcm" if _is_stcm_cls(self.layer_cls) else "tm"
         self.head_type = resolved_head_type
         self.head_hidden_dims = list(int(h) for h in head_hidden_dims) if head_hidden_dims is not None else None
         self.head_linear_enabled = bool(head_linear)
@@ -128,7 +139,7 @@ class DeepCTMNetwork(nn.Module):
         else:
             self.stem = None
         for idx, (C_out, K, S, P, nC) in enumerate(zip(self.channels, self.kernels, self.strides, self.pools, self.clauses_per_block)):
-            if layer_cls is FuzzyPatternTM_STE or layer_cls == FuzzyPatternTM_STE:
+            if self.layer_cls is FuzzyPatternTM_STE or self.layer_cls == FuzzyPatternTM_STE:
                 conv = ConvSTE2d(
                     C_in,
                     C_out,
@@ -186,7 +197,7 @@ class DeepCTMNetwork(nn.Module):
         self.final_channels = C_in
         self.final_hw = (max(1, H), max(1, W))
         # Diagnostic heads for per-block classification (for logging/monitoring)
-        self.diag_heads = nn.ModuleList([nn.Linear(c, self.num_classes) for c in self.channels])
+        self._diag_heads: Optional[nn.ModuleList] = None
         self.aux_weight = float(aux_weight)
 
         # Head classifier setup
@@ -242,6 +253,11 @@ class DeepCTMNetwork(nn.Module):
             )
         self.classifier = self._resolve_classifier_export()
 
+    def _get_diag_head(self, idx: int) -> nn.Module:
+        if self._diag_heads is None:
+            self._diag_heads = nn.ModuleList([nn.Linear(c, self.num_classes) for c in self.channels])
+        return self._diag_heads[idx]
+
     def forward(self, x: torch.Tensor, use_ste: bool = True, collect_diagnostics: bool = False):
         # x: [B, C, H, W]
         if self.stem is not None:
@@ -260,7 +276,7 @@ class DeepCTMNetwork(nn.Module):
                 x = x + mixer(x)
             if collect_diagnostics:
                 pooled = F.adaptive_avg_pool2d(x, 1).squeeze(-1).squeeze(-1)  # [B, C_i]
-                diag = self.diag_heads[block_idx](pooled)  # [B, num_classes]
+                diag = self._get_diag_head(block_idx)(pooled)  # [B, num_classes]
                 diagnostics[f"block_{block_idx + 1}"] = diag
             x = pool(x)
         # Global average pool to [B, C]
@@ -360,7 +376,7 @@ class DeepCTMNetwork(nn.Module):
         if head_type == "none":
             return None, False
         if head_type in {"tm", "stcm"}:
-            classifier_cls = FuzzyPatternTM_STE if head_type == "tm" else FuzzyPatternTM_STCM
+            classifier_cls = FuzzyPatternTM_STE if head_type == "tm" else _preferred_stcm_cls(stcm_operator)
             head_kwargs = dict(
                 n_features=self.final_channels,
                 n_clauses=max(2, self.head_clauses),
@@ -381,7 +397,7 @@ class DeepCTMNetwork(nn.Module):
                 )
             return classifier_cls(**head_kwargs), True
         if head_type in {"deeptm", "deepstcm"}:
-            layer_cls = FuzzyPatternTM_STE if head_type == "deeptm" else FuzzyPatternTM_STCM
+            layer_cls = FuzzyPatternTM_STE if head_type == "deeptm" else _preferred_stcm_cls(stcm_operator)
             hidden_dims = self.head_hidden_dims or [max(self.final_channels, self.num_classes * 2)]
             layer_extra_kwargs: Dict[str, float] = {}
             layer_operator = None

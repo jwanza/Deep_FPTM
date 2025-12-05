@@ -679,3 +679,4 @@ class SpatialTMEnsemble(nn.Module):
         fused_maps = self.cross_scale(clause_maps) if self.cross_scale is not None else clause_maps
         logits, aux = self.decision(fused_maps)
         return logits, aux, fused_maps
+

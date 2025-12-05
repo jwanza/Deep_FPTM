@@ -14,6 +14,22 @@ versions. This halves the literal parameter count, enforces mutual exclusivity,
 and makes the clause representation directly compatible with TCAM-style hardware
 or other Setun-inspired accelerators.
 
+## Recent updates
+
+* **Optimized mismatch path (default)** – The Python STCM now ships with the
+  same linear-projection trick as `OptimizedSTCM`, avoiding the `[1 − x, x]`
+  concatenation and halving GEMM width for capacity/product operators. Existing
+  scripts automatically benefit without changing constructors.
+* **Clause memory in transformers** – `TMFeedForward` accepts
+  `clause_memory_slots` or a shared `ClauseMemoryBank`, letting ViT/Swin blocks
+  share EMA-updated clause prototypes. Enable it via
+  `clause_memory_slots=64` (for example) on `UnifiedTMTransformer` to gather
+  memory hit-rate diagnostics per block.
+* **Tau + literal schedulers** – `trainers.TauLiteralScheduler` exposes a
+  cosine/linear curriculum that jointly anneals STE `tau`, `lf`, and
+  `literal_budget`. Call `scheduler.apply(model, epoch)` inside your training
+  loop to keep clause granularity under control without bespoke hooks.
+
 ## Architecture overview
 
 ### Input handling
@@ -138,6 +154,19 @@ deep_tm = DeepTMNetwork(
 * **Budgets (`lf`, `literal_budget`)**: these still apply in capacity mode and
   keep clauses compact. In product mode they act as soft regularizers because
   the penalties accumulate faster for long clauses.
+* **Curriculum**: tie STE hardening and literal budgets together via
+  `TauLiteralScheduler` (see `python/fptm_ste/trainers.py`). A sample config:
+
+  ```python
+  cfg = TauLiteralScheduleConfig(tau_start=0.9, tau_end=0.45,
+                                 literal_start=12, literal_end=6,
+                                 total_epochs=60)
+  scheduler = TauLiteralScheduler(cfg)
+  for epoch in range(epochs):
+      scheduler.apply(model, epoch)
+      train_epoch(...)
+  ```
+
 * **Export**: `discretize()` now returns `positive`, `positive_inv`, `negative`,
   `negative_inv`, along with metadata (`clauses_num`, `operator`,
   `ternary_voting`). Each list contains 1-based literal indices ready for JSON

@@ -104,3 +104,37 @@ def test_custom_ternary_operators_forward(operator: str):
     assert clauses.shape == (6, 14)
     assert torch.isfinite(logits).all()
 
+
+def test_stcm_optimized_projection_matches_concat_formulation():
+    torch.manual_seed(21)
+    model = FuzzyPatternTM_STCM(n_features=12, n_clauses=14, n_classes=2, operator="capacity")
+    x = torch.rand(5, 12)
+    pos_pos, _, pos_inv, _ = model._compute_split_masks(use_ste=False)
+    optimized = model._capacity_strength(x, pos_pos, pos_inv)
+
+    x_neg = 1.0 - x
+    X_concat = torch.cat([x_neg, x], dim=1)
+    W_concat = torch.cat([pos_pos, pos_inv], dim=1)
+    legacy_capacity = W_concat.sum(dim=1).unsqueeze(0)
+    legacy_mismatch = F.linear(X_concat, W_concat)
+    legacy_strength = F.relu(legacy_capacity - legacy_mismatch)
+
+    assert torch.allclose(optimized, legacy_strength, atol=1e-5)
+
+
+def test_stcm_mask_cache_eval_only():
+    model = FuzzyPatternTM_STCM(n_features=10, n_clauses=12, n_classes=2)
+    model.cache_masks = True
+    model.eval()
+    with torch.no_grad():
+        masks = model._compute_split_masks(use_ste=False)
+        assert model._mask_cache is not None
+        cached = model._maybe_get_cached_masks(False)
+        assert cached is not None
+        for live, cached_tensor in zip(masks, cached):
+            assert torch.allclose(live.detach(), cached_tensor, atol=1e-6)
+    model.train()
+    _ = model._compute_split_masks(use_ste=True)
+    # Training (grad-enabled) should disable the cache
+    assert model._mask_cache is None
+
