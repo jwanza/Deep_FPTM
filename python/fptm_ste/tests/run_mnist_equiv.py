@@ -41,6 +41,11 @@ from fptm_ste.deep_tm import DeepTMNetwork
 from fptm_ste.deep_ctm import DeepCTMNetwork
 from fptm_ste.tm_optimized import OptimizedSTCM, TritonSTCM, TRITON_KERNELS_AVAILABLE
 from fptm_ste.compiled_stcm import CompiledSTCM, DeepCompiledSTCM
+from fptm_ste.distillation import DistillationTrainer, DistilledSTCM
+from fptm_ste.sparse_stcm import SparseSTCM, DeepSparseSTCM
+from fptm_ste.hierarchical_stcm import HierarchicalSTCM, DeepHierarchicalSTCM
+from fptm_ste.evolutionary_stcm import EvolutionarySTCM, DeepEvolutionarySTCM
+from fptm_ste.ultimate_stcm import UltimateSTCM, DeepUltimateSTCM
 from fptm_ste.export import export_compiled_to_json
 from fptm_ste.tm_transformer import UnifiedTMTransformer
 from fptm_ste.tm_priors import apply_tm_prior_template
@@ -54,7 +59,7 @@ from fptm_ste.visualization import generate_transformer_overlay
 from fptm_ste.trainers import anneal_ste_factor, ClauseContrastiveLoss, SupervisedContrastiveLoss
 from fptm_ste.clause_attention import HierarchicalClauseAttention
 
-AVAILABLE_MODELS = ("tm", "stcm", "optimized_stcm", "triton_stcm", "compiled_stcm", "fptm_equiv", "deep_tm", "deep_stcm", "deep_optimized_stcm", "deep_triton_stcm", "deep_compiled_stcm", "deep_fptm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
+AVAILABLE_MODELS = ("tm", "stcm", "optimized_stcm", "triton_stcm", "compiled_stcm", "distilled_stcm", "sparse_stcm", "hierarchical_stcm", "evolutionary_stcm", "ultimate_stcm", "fptm_equiv", "deep_tm", "deep_stcm", "deep_optimized_stcm", "deep_triton_stcm", "deep_compiled_stcm", "deep_sparse_stcm", "deep_hierarchical_stcm", "deep_evolutionary_stcm", "deep_ultimate_stcm", "deep_fptm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
     "tm": "tm",
@@ -62,11 +67,20 @@ EXPORT_SLUGS = {
     "optimized_stcm": "optimized_stcm",
     "triton_stcm": "triton_stcm",
     "compiled_stcm": "compiled_stcm",
+    "distilled_stcm": "distilled_stcm",
+    "sparse_stcm": "sparse_stcm",
+    "hierarchical_stcm": "hierarchical_stcm",
+    "evolutionary_stcm": "evolutionary_stcm",
+    "ultimate_stcm": "ultimate_stcm",
     "deep_tm": "deeptm",
     "deep_stcm": "deepstcm",
     "deep_optimized_stcm": "deep_optimized_stcm",
     "deep_triton_stcm": "deep_triton_stcm",
     "deep_compiled_stcm": "deep_compiled_stcm",
+    "deep_sparse_stcm": "deep_sparse_stcm",
+    "deep_hierarchical_stcm": "deep_hierarchical_stcm",
+    "deep_evolutionary_stcm": "deep_evolutionary_stcm",
+    "deep_ultimate_stcm": "deep_ultimate_stcm",
     "deep_ctm": "deepctm",
     "deep_cstcm": "deepcstcm",
     "hybrid": "hybrid",
@@ -5920,6 +5934,151 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     stcm_ternary_band=args.stcm_ternary_band,
                     stcm_ste_temperature=args.stcm_ste_temperature,
                 )
+                variant_classes = args.num_classes
+            elif model_key == "distilled_stcm":
+                # Distilled STCM: Train deep model, then distill to shallow
+                import time as time_module
+                
+                t0 = time_module.time()
+                
+                # Step 1: Train teacher (deep STCM)
+                from fptm_ste.deep_tm import DeepTMNetwork
+                teacher = DeepTMNetwork(
+                    input_dim=tm_n_features,
+                    hidden_dims=hidden_dims,
+                    n_classes=args.num_classes,
+                    n_clauses=args.deeptm_n_clauses,
+                    dropout=args.deeptm_dropout,
+                    tau=args.deeptm_tau,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    layer_cls=OptimizedSTCM,
+                    layer_operator=args.stcm_operator,
+                    layer_ternary_voting=args.stcm_ternary_voting,
+                ).to(device)
+                
+                # Train teacher for half the epochs
+                teacher_epochs = max(1, args.epochs // 2)
+                teacher_opt = torch.optim.AdamW(teacher.parameters(), lr=deeptm_base_lr, weight_decay=weight_decay)
+                teacher_sched = torch.optim.lr_scheduler.CosineAnnealingLR(teacher_opt, T_max=teacher_epochs)
+                
+                print(f"  [distilled_stcm] Training teacher for {teacher_epochs} epochs...")
+                teacher.train()
+                for epoch in range(teacher_epochs):
+                    for batch_x, batch_y in deeptm_train_loader:
+                        x = deeptm_prepare_fn(batch_x.to(device), n_features=deeptm_input_dim)
+                        y = batch_y.to(device)
+                        teacher_opt.zero_grad()
+                        logits = teacher(x)[0]
+                        loss = F.cross_entropy(logits, y)
+                        loss.backward()
+                        teacher_opt.step()
+                    teacher_sched.step()
+                
+                # Evaluate teacher
+                teacher.eval()
+                teacher_correct = 0
+                teacher_total = 0
+                with torch.no_grad():
+                    for batch_x, batch_y in deeptm_test_loader:
+                        x = deeptm_prepare_fn(batch_x.to(device), n_features=deeptm_input_dim)
+                        y = batch_y.to(device)
+                        preds_t = teacher(x)[0].argmax(-1)
+                        teacher_correct += (preds_t == y).sum().item()
+                        teacher_total += y.size(0)
+                teacher_acc = teacher_correct / teacher_total
+                print(f"  [distilled_stcm] Teacher accuracy: {teacher_acc:.4f}")
+                
+                # Step 2: Create student and distill
+                student = OptimizedSTCM(
+                    n_features=tm_n_features,
+                    n_clauses=args.tm_n_clauses,
+                    n_classes=args.num_classes,
+                    tau=args.tm_tau,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    lf=args.tm_lf,
+                    literal_budget=args.tm_literal_budget,
+                    vote_clamp=args.tm_vote_clamp,
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    operator=args.stcm_operator,
+                    ternary_voting=args.stcm_ternary_voting,
+                    ternary_band=args.stcm_ternary_band,
+                    ste_temperature=args.stcm_ste_temperature,
+                ).to(device)
+                
+                distill_epochs = args.epochs - teacher_epochs
+                print(f"  [distilled_stcm] Distilling for {distill_epochs} epochs...")
+                trainer = DistillationTrainer(
+                    teacher_model=teacher,
+                    student_model=student,
+                    temperature=4.0,
+                    alpha=0.7,
+                    device=device,
+                )
+                
+                # Create data loader for distillation
+                class DistillDataset(torch.utils.data.Dataset):
+                    def __init__(self, loader, prepare_fn, n_features):
+                        self.data = []
+                        for batch_x, batch_y in loader:
+                            x = prepare_fn(batch_x.to(device), n_features=n_features)
+                            for i in range(x.size(0)):
+                                self.data.append((x[i].cpu(), batch_y[i]))
+                    def __len__(self):
+                        return len(self.data)
+                    def __getitem__(self, idx):
+                        return self.data[idx]
+                
+                distill_ds = DistillDataset(tm_train_loader, tm_prepare_fn, tm_n_features)
+                distill_loader = torch.utils.data.DataLoader(distill_ds, batch_size=args.batch_size, shuffle=True)
+                
+                trainer.train(
+                    train_loader=distill_loader,
+                    epochs=distill_epochs,
+                    lr=tm_base_lr * 0.5,
+                    verbose=True,
+                )
+                
+                train_time = time_module.time() - t0
+                
+                # Evaluate student
+                student.eval()
+                correct = 0
+                total = 0
+                all_preds = []
+                with torch.no_grad():
+                    for batch_x, batch_y in tm_test_loader:
+                        x = tm_prepare_fn(batch_x.to(device), n_features=tm_n_features)
+                        y = batch_y.to(device)
+                        logits = student(x)[0]
+                        preds_batch = logits.argmax(-1)
+                        correct += (preds_batch == y).sum().item()
+                        total += y.size(0)
+                        all_preds.extend(preds_batch.cpu().tolist())
+                
+                test_acc = correct / total
+                
+                # Get train accuracy
+                train_correct = 0
+                train_total = 0
+                with torch.no_grad():
+                    for batch_x, batch_y in tm_train_loader:
+                        x = tm_prepare_fn(batch_x.to(device), n_features=tm_n_features)
+                        y = batch_y.to(device)
+                        logits = student(x)[0]
+                        train_correct += (logits.argmax(-1) == y).sum().item()
+                        train_total += y.size(0)
+                train_acc = train_correct / train_total
+                
+                label = "DistilledSTCM"
+                preds = all_preds
+                bundle = {"model_state_dict": student.state_dict()}
+                best_epoch_test_acc = test_acc
+                profile = None
                 variant_classes = args.num_classes
             elif model_key == "fptm_equiv":
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_fptm_equiv(
