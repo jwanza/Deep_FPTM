@@ -150,14 +150,17 @@ class ClauseExpert(nn.Module):
         operator: str = "capacity",
         tau: float = 0.5,
         expert_cls: type = OptimizedSTCM,
+        expert_kwargs: Optional[Dict] = None,
     ):
         super().__init__()
+        expert_kwargs = expert_kwargs or {}
         self.stcm = expert_cls(
             n_features=n_features,
             n_clauses=n_clauses,
             n_classes=n_classes,
             operator=operator,
             tau=tau,
+            **expert_kwargs,
         )
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -203,6 +206,12 @@ class SparseMoETM(nn.Module):
         router_dim: Optional[int] = None,
         noise_std: float = 0.1,
         aux_loss_weight: float = 0.01,
+        *,
+        use_clause_stats: bool = False,
+        entropy_weight: float = 0.0,
+        activity_momentum: float = 0.9,
+        expert_cls: type = OptimizedSTCM,
+        expert_kwargs: Optional[Dict] = None,
     ):
         super().__init__()
         self.n_features = n_features
@@ -210,11 +219,16 @@ class SparseMoETM(nn.Module):
         self.n_clauses_per_expert = n_clauses_per_expert
         self.top_k = top_k
         self.aux_loss_weight = aux_loss_weight
+        self.use_clause_stats = use_clause_stats
+        self.entropy_weight = entropy_weight
+        self.activity_momentum = activity_momentum
+        self.expert_kwargs = expert_kwargs or {}
         
         # Router
         router_dim = router_dim or n_features
+        router_input_dim = router_dim + (n_experts if use_clause_stats else 0)
         self.router = MoEClauseRouter(
-            input_dim=router_dim,
+            input_dim=router_input_dim,
             n_experts=n_experts,
             top_k=top_k,
             noise_std=noise_std,
@@ -228,6 +242,8 @@ class SparseMoETM(nn.Module):
                 n_classes=n_classes,
                 operator=operator,
                 tau=tau,
+                expert_cls=expert_cls,
+                expert_kwargs=self.expert_kwargs,
             )
             for _ in range(n_experts)
         ])
@@ -238,6 +254,7 @@ class SparseMoETM(nn.Module):
         
         # Track auxiliary loss for training
         self.register_buffer("_aux_loss", torch.tensor(0.0))
+        self.register_buffer("expert_activity", torch.zeros(n_experts))
     
     @property
     def aux_loss(self) -> torch.Tensor:
@@ -264,11 +281,19 @@ class SparseMoETM(nn.Module):
         n_classes = self.experts[0].stcm.n_classes
         
         # Get routing decisions
-        expert_weights, expert_indices, gates, aux_loss = self.router(x)
+        router_input = self._augment_router_input(x)
+        expert_weights, expert_indices, gates, aux_loss = self.router(router_input)
         
         # Store aux loss for training
+        entropy_loss = self._entropy_regularizer(gates)
+
+        combined_aux = None
         if aux_loss is not None:
-            self._aux_loss = aux_loss * self.aux_loss_weight
+            combined_aux = aux_loss * self.aux_loss_weight
+        if entropy_loss is not None:
+            combined_aux = entropy_loss if combined_aux is None else combined_aux + entropy_loss
+        if combined_aux is not None:
+            self._aux_loss = combined_aux
         
         # OPTIMIZED: Process experts in batches instead of per-sample
         # Group samples by expert assignment for batched processing
@@ -297,6 +322,7 @@ class SparseMoETM(nn.Module):
             
             # Run expert once for all samples
             exp_logits, exp_clauses = self.experts[expert_idx](expert_inputs)  # [N, n_classes], [N, n_clauses]
+            self._update_expert_activity(expert_idx, exp_clauses)
             
             # Get weights for these selections
             weights = expert_weights[sample_indices, pos_indices].unsqueeze(-1)  # [N, 1]
@@ -342,6 +368,32 @@ class SparseMoETM(nn.Module):
         """
         # This requires tracking during forward, simplified version:
         return torch.ones(self.n_experts) / self.n_experts
+
+    def _augment_router_input(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_clause_stats:
+            return x
+        stats = self.expert_activity
+        if stats is None:
+            return x
+        expanded = stats.view(1, -1).expand(x.size(0), -1)
+        return torch.cat([x, expanded.to(x.device)], dim=1)
+
+    def _update_expert_activity(self, expert_idx: int, clauses: torch.Tensor) -> None:
+        if not self.use_clause_stats:
+            return
+        if clauses.numel() == 0:
+            return
+        value = clauses.detach().abs().mean()
+        momentum = self.activity_momentum
+        prev = self.expert_activity[expert_idx]
+        self.expert_activity[expert_idx] = prev * momentum + value * (1.0 - momentum)
+
+    def _entropy_regularizer(self, gates: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.entropy_weight <= 0:
+            return None
+        entropy = -(gates * torch.log(gates + 1e-8)).sum(dim=1).mean()
+        # Maximize entropy => minimize negative entropy
+        return -entropy * self.entropy_weight
 
 
 class BatchedSparseMoETM(nn.Module):

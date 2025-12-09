@@ -680,3 +680,4 @@ class SpatialTMEnsemble(nn.Module):
         logits, aux = self.decision(fused_maps)
         return logits, aux, fused_maps
 
+

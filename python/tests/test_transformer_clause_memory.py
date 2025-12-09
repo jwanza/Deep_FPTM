@@ -27,3 +27,4 @@ def test_transformer_reports_clause_memory_metrics(backend: str):
     assert any("memory_mean" in key for key in metrics.keys())
 
 
+

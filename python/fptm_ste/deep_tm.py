@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from typing import Any, Dict, Optional, Sequence, Tuple, Type
 from .tm import FuzzyPatternTM_STE, FuzzyPatternTM_STCM, prepare_tm_input
 from .tm_optimized import OptimizedSTCM
+from .tm_feedback import EnhancedSTCM
 
 
 def _resolve_layer_cls(layer_cls: Type[nn.Module], operator: Optional[str]) -> Type[nn.Module]:
@@ -47,6 +48,9 @@ class DeepTMNetwork(nn.Module):
         layer_operator: Optional[str] = None,
         layer_ternary_voting: Optional[bool] = None,
         layer_extra_kwargs: Optional[Dict[str, Any]] = None,
+        vote_dropout: float = 0.0,
+        slow_layer_count: int = 0,
+        slow_layer_lr_scale: float = 0.5,
     ):
         super().__init__()
         self.input_shape = tuple(input_shape) if input_shape is not None else None
@@ -71,6 +75,10 @@ class DeepTMNetwork(nn.Module):
         self.noise_std = noise_std
         self.layer_cls = _resolve_layer_cls(layer_cls, layer_operator)
         self.layer_extra_kwargs = dict(layer_extra_kwargs or {})
+        self.vote_dropout = vote_dropout
+        self.slow_layer_count = max(0, slow_layer_count)
+        self.slow_layer_lr_scale = slow_layer_lr_scale
+        self._enhanced_layer_configs: list[tuple[nn.Module, float]] = []
 
         prev = input_dim
         for idx, h in enumerate(hidden_dims):
@@ -100,7 +108,9 @@ class DeepTMNetwork(nn.Module):
                 tm_kwargs["operator"] = layer_operator
             if layer_ternary_voting is not None and _class_supports_kwarg(self.layer_cls, "ternary_voting"):
                 tm_kwargs["ternary_voting"] = layer_ternary_voting
-            self.layers.append(self.layer_cls(**tm_kwargs))
+            layer_module = self.layer_cls(**tm_kwargs)
+            self._register_enhanced_layer(layer_module, idx)
+            self.layers.append(layer_module)
             self.norms.append(nn.LayerNorm(h))
             self.residuals.append(nn.Linear(prev, h, bias=False) if prev != h else nn.Identity())
             prev = h
@@ -123,7 +133,9 @@ class DeepTMNetwork(nn.Module):
             classifier_kwargs["operator"] = layer_operator
         if layer_ternary_voting is not None and _class_supports_kwarg(self.layer_cls, "ternary_voting"):
             classifier_kwargs["ternary_voting"] = layer_ternary_voting
-        self.classifier = self.layer_cls(**classifier_kwargs)
+        classifier_module = self.layer_cls(**classifier_kwargs)
+        self._register_enhanced_layer(classifier_module, len(self.layers))
+        self.classifier = classifier_module
         self.dropout = nn.Dropout(dropout)
 
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -143,8 +155,10 @@ class DeepTMNetwork(nn.Module):
             identity = res(x)
             # Bypass internal normalization checks for speed
             logits, _ = layer(x, use_ste=use_ste, skip_norm=True)
+            logits = self._maybe_drop_votes(layer, logits)
             x = norm(self.dropout(torch.sigmoid(logits)) + identity)
         logits, clauses = self.classifier(x, use_ste=use_ste, skip_norm=True)
+        logits = self._maybe_drop_votes(self.classifier, logits)
         return logits, clauses
 
     def set_tau(self, tau: float) -> None:
@@ -153,6 +167,42 @@ class DeepTMNetwork(nn.Module):
                 layer.tau = tau
         if hasattr(self.classifier, "tau"):
             self.classifier.tau = tau
+
+    # ------------------------------------------------------------------ #
+    # Enhanced-layer helpers
+    # ------------------------------------------------------------------ #
+    def _register_enhanced_layer(self, layer: nn.Module, idx: int) -> None:
+        if not isinstance(layer, EnhancedSTCM):
+            return
+        base_dropout = float(getattr(layer, "clause_dropout", 0.0))
+        self._enhanced_layer_configs.append((layer, base_dropout))
+        if idx < self.slow_layer_count and self.slow_layer_lr_scale < 1.0:
+            self._scale_gradients(layer, self.slow_layer_lr_scale)
+
+    def _scale_gradients(self, module: nn.Module, scale: float) -> None:
+        for param in module.parameters():
+            if not param.requires_grad:
+                continue
+            param.register_hook(lambda grad, s=scale: grad * s if grad is not None else grad)
+
+    def _maybe_drop_votes(self, layer: nn.Module, logits: torch.Tensor) -> torch.Tensor:
+        if self.vote_dropout <= 0 or not isinstance(layer, EnhancedSTCM):
+            return logits
+        return F.dropout(logits, p=self.vote_dropout, training=self.training)
+
+    def set_validation_gap(self, gap: float) -> None:
+        """
+        Adjust clause dropout for enhanced layers based on validation gap
+        (train_acc - val_acc). Larger gaps increase dropout to limit overfit.
+        """
+        if not self._enhanced_layer_configs:
+            return
+        clamp_gap = max(0.0, float(gap))
+        scale = min(2.0, 1.0 + clamp_gap)
+        for layer, base in self._enhanced_layer_configs:
+            if hasattr(layer, "clause_dropout"):
+                adjusted = max(0.0, min(0.5, base * scale))
+                layer.clause_dropout = float(adjusted)
 
 
 

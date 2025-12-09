@@ -380,6 +380,68 @@ class ClauseCurriculumScheduler:
         }
 
 
+@dataclass
+class ClauseMetricSchedulerConfig:
+    tau_bounds: tuple[float, float] = (0.3, 0.95)
+    literal_bounds: tuple[int, int] = (2, 64)
+    tau_step: float = 0.02
+    literal_step: int = 1.0
+    activity_high: float = 0.65
+    activity_low: float = 0.2
+    min_fraction: float = 0.1
+
+
+class ClauseMetricScheduler:
+    """
+    Dynamically adjust STE tau / literal budgets based on clause activity.
+
+    Any module that exposes a `clause_activity()` method (e.g., EnhancedSTCM)
+    will be nudged toward higher tau & tighter literal budgets if too many
+    clauses fire, and relaxed if clauses rarely activate.
+    """
+
+    def __init__(self, model: nn.Module, config: ClauseMetricSchedulerConfig | None = None):
+        self.model = model
+        self.config = config or ClauseMetricSchedulerConfig()
+
+    def step(self) -> dict:
+        adjustments = []
+        for module in self.model.modules():
+            if not hasattr(module, "clause_activity"):
+                continue
+            activity = module.clause_activity()
+            if activity is None:
+                continue
+            if activity.numel() == 0:
+                continue
+
+            over_ratio = (activity > self.config.activity_high).float().mean().item()
+            under_ratio = (activity < self.config.activity_low).float().mean().item()
+            if over_ratio >= self.config.min_fraction:
+                self._tighten(module)
+                adjustments.append(("tighten", over_ratio))
+            elif under_ratio >= self.config.min_fraction:
+                self._relax(module)
+                adjustments.append(("relax", under_ratio))
+        return {"adjustments": adjustments}
+
+    def _tighten(self, module: nn.Module) -> None:
+        if hasattr(module, "tau") and isinstance(module.tau, (float, int)):
+            module.tau = float(min(self.config.tau_bounds[1], module.tau + self.config.tau_step))
+        literal_budget = getattr(module, "literal_budget", None)
+        if literal_budget is not None:
+            new_budget = max(self.config.literal_bounds[0], literal_budget - self.config.literal_step)
+            module.literal_budget = float(new_budget)
+
+    def _relax(self, module: nn.Module) -> None:
+        if hasattr(module, "tau") and isinstance(module.tau, (float, int)):
+            module.tau = float(max(self.config.tau_bounds[0], module.tau - self.config.tau_step))
+        literal_budget = getattr(module, "literal_budget", None)
+        if literal_budget is not None:
+            new_budget = min(self.config.literal_bounds[1], literal_budget + self.config.literal_step)
+            module.literal_budget = float(new_budget)
+
+
 class AdaptiveLRScheduler:
     """
     Learning rate scheduler that adapts based on clause statistics.

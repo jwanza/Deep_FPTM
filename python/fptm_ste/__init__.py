@@ -12,6 +12,7 @@ from .tm import (
     ClauseMemoryBank,
     ClauseMemoryAttention,
 )
+from .tm_feedback import EnhancedSTCM
 from .tm_optimized import OptimizedSTCM
 from .tm_integrated import IntegratedSTCM, build_stcm
 from .backbones import (
@@ -51,6 +52,7 @@ from .trainers import (
     anneal_ste_factor,
     train_step,
     ClauseCurriculumScheduler,
+    ClauseMetricScheduler,
     ClauseContrastiveLoss,
     SupervisedContrastiveLoss,
     ClauseRepresentationLoss,
