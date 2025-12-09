@@ -530,14 +530,16 @@ class ExperienceReplayBuffer:
         self,
         max_size: int = 1000,
         device: str = "cpu",
+        capacity: Optional[int] = None,
     ):
-        self.max_size = max_size
+        # Accept legacy keyword `capacity` used by tests; falls back to max_size.
+        self.max_size = capacity if capacity is not None else max_size
         self.device = device
         
         self.buffer_x: List[torch.Tensor] = []
         self.buffer_y: List[torch.Tensor] = []
         self.n_seen = 0
-    
+
     def add(
         self,
         x: torch.Tensor,
@@ -550,6 +552,12 @@ class ExperienceReplayBuffer:
             x: Input samples [batch, features]
             y: Labels [batch]
         """
+        # Normalize shapes for single sample inputs
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if y.dim() == 0:
+            y = y.unsqueeze(0)
+
         batch_size = x.shape[0]
         
         for i in range(batch_size):
@@ -597,6 +605,43 @@ class ExperienceReplayBuffer:
         self.buffer_x = []
         self.buffer_y = []
         self.n_seen = 0
+
+
+class EWCWrapper(EWCClauseMachine):
+    """
+    Thin wrapper to match legacy keyword `lambda_` used in tests.
+    """
+
+    def __init__(self, base_model: nn.Module, lambda_: float = 1000.0, **kwargs):
+        super().__init__(base_model, lamb=lambda_, **kwargs)
+        # Legacy compatibility: expose `model` attribute used in tests.
+        self.model = self.base_model
+
+    def compute_fisher(self, x: torch.Tensor, y: torch.Tensor, batch_size: int = 64):
+        """Legacy helper expected by tests; wraps compute_fisher_information."""
+        dataset = TensorDataset(x, y)
+        loader = DataLoader(dataset, batch_size=min(batch_size, len(dataset)))
+        fisher = self.compute_fisher_information(loader)
+        # Mirror consolidate_task side effects expected by tests
+        self.fisher = fisher
+        self.optimal_params = {
+            name: param.clone().detach()
+            for name, param in self.base_model.named_parameters()
+            if param.requires_grad
+        }
+        return fisher
+
+    def consolidate(self, dataloader: Optional[DataLoader] = None):
+        """Legacy alias; if no dataloader is provided, just bump task counter."""
+        if dataloader is not None:
+            return self.consolidate_task(dataloader)
+        # Already populated fisher/optimal_params via compute_fisher
+        self.current_task += 1
+        return None
+
+    def ewc_penalty(self) -> torch.Tensor:
+        """Legacy alias for penalty()."""
+        return self.penalty()
 
 
 class ReplayAugmentedTrainer:

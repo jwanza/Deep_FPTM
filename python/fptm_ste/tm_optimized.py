@@ -4,6 +4,12 @@ Optimized implementation of Set Tsetlin Convolutional Machine (STCM).
 This implementation leverages the mathematical equivalence between the Tsetlin Machine
 clause matching operation and a constrained sparse/ternary linear layer to achieve
 significant memory and computational efficiency gains (approx 2x).
+
+Optimizations:
+1. Uses W_eff = mask_pos - mask_inv (ternary weights {-1, 0, 1})
+2. Avoids input concatenation [x_neg, x] -> just uses x
+3. Matrix size halved: [C, 2F] -> [C, F]
+4. Optional: Packed ternary weights for 16x memory reduction
 """
 
 from typing import Dict, Optional, Tuple
@@ -14,6 +20,13 @@ import torch.nn.functional as F
 
 from .tm import FuzzyPatternTM_STCM, prepare_tm_input, _ste_ternary
 from .operators import build_ternary_operator
+
+# Try to import triton kernels
+try:
+    from .kernels import pack_ternary_pytorch, ternary_linear_cached
+    TRITON_KERNELS_AVAILABLE = True
+except ImportError:
+    TRITON_KERNELS_AVAILABLE = False
 
 class OptimizedSTCM(FuzzyPatternTM_STCM):
     """
@@ -125,5 +138,68 @@ class OptimizedSTCM(FuzzyPatternTM_STCM):
             clause_votes = F.dropout(clause_votes, p=self.clause_dropout, training=True)
             
         return pos_strength, neg_strength, clause_votes
+
+
+class TritonSTCM(OptimizedSTCM):
+    """
+    STCM with optional Triton kernel acceleration and packed ternary weights.
+    
+    This class extends OptimizedSTCM with:
+    1. Packed ternary weight storage (16x memory reduction)
+    2. Optional Triton kernel for accelerated matmul (when available)
+    
+    The packed weights are stored as int8 tensors with 4 weights per byte.
+    This significantly reduces memory bandwidth requirements for inference.
+    
+    Note: Packed weights are currently disabled during training and eval
+    because the STE masks are not perfectly ternary. Use for inference-only
+    optimization after training is complete and weights are frozen.
+    
+    To enable packed weights for inference:
+        model.eval()
+        model.enable_packed_inference = True
+    """
+    
+    def __init__(self, *args, use_packed_weights: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_packed_weights = use_packed_weights and TRITON_KERNELS_AVAILABLE
+        self.enable_packed_inference = False  # Must be explicitly enabled after training
+        
+        if self.use_packed_weights and not TRITON_KERNELS_AVAILABLE:
+            import warnings
+            warnings.warn("Triton kernels not available, falling back to standard implementation")
+    
+    def _strength(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
+        # Check for custom fuzzy operator (fallback to original logic)
+        if hasattr(self, 'operator_impl') and self.operator_impl is not None:
+            return FuzzyPatternTM_STCM._strength(self, x, mask_pos, mask_inv)
+        
+        # Compute effective ternary weights
+        W_eff = mask_pos - mask_inv  # [half, F], values in {-1, 0, 1} after STE
+        
+        # Use packed ternary computation only if explicitly enabled for inference
+        # This is disabled by default because STE masks are not perfectly ternary
+        use_packed = (
+            self.use_packed_weights 
+            and TRITON_KERNELS_AVAILABLE 
+            and self.enable_packed_inference
+            and not self.training
+        )
+        
+        if use_packed:
+            projection = ternary_linear_cached(x, W_eff)
+        else:
+            projection = F.linear(x, W_eff)
+        
+        mismatch_bias = mask_pos.sum(dim=1).unsqueeze(0)
+        mismatch = mismatch_bias - projection
+        
+        if self.operator == "capacity":
+            capacity = self._clause_capacity(mask_pos, mask_inv)
+            raw = capacity - mismatch
+            return self._straight_relu(raw)
+        else:  # product
+            scaled = torch.clamp(mismatch * self.product_scale, min=0.0, max=10.0)
+            return torch.exp(-scaled)
 
 

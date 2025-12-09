@@ -93,4 +93,49 @@ from .pretraining import (
     pretrain_tm,
 )
 
+# Augmentation utilities
+from .augmentation import (
+    mixup_data,
+    cutmix_data,
+    mixup_criterion,
+    AugmentationPipeline,
+)
+
+# Incremental learning (Julia-style)
+from .incremental_tm import (
+    IncrementalConfig,
+    TsetlinAutomaton,
+    IncrementalSTCM,
+    IncrementalDeepTM,
+    incremental_train_step,
+    incremental_train_epoch,
+)
+
+# Stable training utilities
+from .stable_training import (
+    StableTrainingConfig,
+    StableEMA,
+    AdaptiveLRScheduler,
+    ConfidenceWeightedLoss,
+    ClauseRegularizer,
+    stable_train_step,
+    stable_train_epoch,
+    stable_evaluate,
+    StableTrainer,
+)
+
+# Continual learning
+from .continual import (
+    ContinualLearningWrapper,
+    EWCClauseMachine,
+    EWCWrapper,
+    SynapticIntelligenceClause,
+    MemoryAwareSynapsesClause,
+    ExperienceReplayBuffer,
+    ReplayAugmentedTrainer,
+    GradientEpisodicMemory,
+    PackNetClause,
+    ProgressiveClauseNetwork,
+    ContinualLearningPipeline,
+)
 

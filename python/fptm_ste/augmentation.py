@@ -49,6 +49,22 @@ def mixup_cutmix_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
+# Backwards-compatible aliases expected by tests
+def mixup_data(images: torch.Tensor, labels: torch.Tensor, alpha: float = 0.8):
+    return mixup(images, labels, alpha)
+
+
+def cutmix_data(images: torch.Tensor, labels: torch.Tensor, alpha: float = 1.0):
+    # If non-image features (2D), fall back to mixup to avoid shape errors.
+    if images.dim() < 4:
+        return mixup_data(images, labels, alpha)
+    return cutmix(images, labels, alpha)
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return mixup_cutmix_criterion(criterion, pred, y_a, y_b, lam)
+
+
 class CutMixMixUp(nn.Module):
     """Apply CutMix or MixUp randomly."""
     def __init__(self, cutmix_alpha: float = 1.0, mixup_alpha: float = 0.8, cutmix_prob: float = 0.5):
@@ -61,6 +77,36 @@ class CutMixMixUp(nn.Module):
         if np.random.random() < self.cutmix_prob:
             return cutmix(images, labels, self.cutmix_alpha)
         return mixup(images, labels, self.mixup_alpha)
+
+
+class AugmentationPipeline(nn.Module):
+    """
+    Minimal augmentation wrapper used in integration tests.
+    Applies mixup and/or cutmix; returns (aug_x, y_a, y_b, lam).
+    """
+
+    def __init__(
+        self,
+        use_mixup: bool = True,
+        use_cutmix: bool = False,
+        mixup_alpha: float = 0.4,
+        cutmix_alpha: float = 1.0,
+        cutmix_prob: float = 0.5,
+    ):
+        super().__init__()
+        self.use_mixup = use_mixup
+        self.use_cutmix = use_cutmix
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.cutmix_prob = cutmix_prob
+
+    def forward(self, images: torch.Tensor, labels: torch.Tensor):
+        if self.use_cutmix and np.random.random() < self.cutmix_prob:
+            return cutmix_data(images, labels, self.cutmix_alpha)
+        if self.use_mixup:
+            return mixup_data(images, labels, self.mixup_alpha)
+        # No augmentation fallback
+        return images, labels, labels, 1.0
 
 
 def get_cifar10_train_transform(mode: str = 'strong'):

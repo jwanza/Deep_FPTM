@@ -39,6 +39,8 @@ from fptm_ste import FuzzyPatternTM_STE, FuzzyPatternTMFPTM, FuzzyPatternTM_STCM
 from fptm_ste.binarizers import CNNSingleBinarizer
 from fptm_ste.deep_tm import DeepTMNetwork
 from fptm_ste.deep_ctm import DeepCTMNetwork
+from fptm_ste.tm_optimized import OptimizedSTCM, TritonSTCM, TRITON_KERNELS_AVAILABLE
+from fptm_ste.compiled_stcm import CompiledSTCM, DeepCompiledSTCM
 from fptm_ste.export import export_compiled_to_json
 from fptm_ste.tm_transformer import UnifiedTMTransformer
 from fptm_ste.tm_priors import apply_tm_prior_template
@@ -52,13 +54,19 @@ from fptm_ste.visualization import generate_transformer_overlay
 from fptm_ste.trainers import anneal_ste_factor, ClauseContrastiveLoss, SupervisedContrastiveLoss
 from fptm_ste.clause_attention import HierarchicalClauseAttention
 
-AVAILABLE_MODELS = ("tm", "stcm", "fptm_equiv", "deep_tm", "deep_stcm", "deep_fptm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
+AVAILABLE_MODELS = ("tm", "stcm", "optimized_stcm", "triton_stcm", "compiled_stcm", "fptm_equiv", "deep_tm", "deep_stcm", "deep_optimized_stcm", "deep_triton_stcm", "deep_compiled_stcm", "deep_fptm", "deep_ctm", "deep_cstcm", "hybrid", "transformer")
 DEFAULT_MODELS = ("tm", "deep_tm", "hybrid", "transformer")
 EXPORT_SLUGS = {
     "tm": "tm",
     "stcm": "stcm",
+    "optimized_stcm": "optimized_stcm",
+    "triton_stcm": "triton_stcm",
+    "compiled_stcm": "compiled_stcm",
     "deep_tm": "deeptm",
     "deep_stcm": "deepstcm",
+    "deep_optimized_stcm": "deep_optimized_stcm",
+    "deep_triton_stcm": "deep_triton_stcm",
+    "deep_compiled_stcm": "deep_compiled_stcm",
     "deep_ctm": "deepctm",
     "deep_cstcm": "deepcstcm",
     "hybrid": "hybrid",
@@ -3401,6 +3409,74 @@ def run_variant_tm(train_loader,
         use_ste_train = False
         use_ste_eval = False
         label = "STCM"
+    elif tm_impl == "optimized_stcm":
+        model = OptimizedSTCM(
+            n_features=n_features,
+            n_clauses=tm_n_clauses,
+            n_classes=n_classes,
+            tau=tm_tau,
+            input_shape=input_shape,
+            auto_expand_grayscale=auto_expand_grayscale,
+            allow_channel_reduce=allow_channel_reduce,
+            lf=tm_lf,
+            literal_budget=tm_literal_budget,
+            vote_clamp=tm_vote_clamp,
+            clause_dropout=tm_clause_dropout,
+            literal_dropout=tm_literal_dropout,
+            operator=stcm_operator,
+            ternary_voting=stcm_ternary_voting,
+            ternary_band=stcm_ternary_band,
+            ste_temperature=stcm_ste_temperature,
+        ).to(device)
+        use_ste_train = False
+        use_ste_eval = False
+        label = "OptimizedSTCM"
+    elif tm_impl == "triton_stcm":
+        model = TritonSTCM(
+            n_features=n_features,
+            n_clauses=tm_n_clauses,
+            n_classes=n_classes,
+            tau=tm_tau,
+            input_shape=input_shape,
+            auto_expand_grayscale=auto_expand_grayscale,
+            allow_channel_reduce=allow_channel_reduce,
+            lf=tm_lf,
+            literal_budget=tm_literal_budget,
+            vote_clamp=tm_vote_clamp,
+            clause_dropout=tm_clause_dropout,
+            literal_dropout=tm_literal_dropout,
+            operator=stcm_operator,
+            ternary_voting=stcm_ternary_voting,
+            ternary_band=stcm_ternary_band,
+            ste_temperature=stcm_ste_temperature,
+            use_packed_weights=True,
+        ).to(device)
+        use_ste_train = False
+        use_ste_eval = False
+        label = "TritonSTCM"
+    elif tm_impl == "compiled_stcm":
+        model = CompiledSTCM(
+            n_features=n_features,
+            n_clauses=tm_n_clauses,
+            n_classes=n_classes,
+            tau=tm_tau,
+            input_shape=input_shape,
+            auto_expand_grayscale=auto_expand_grayscale,
+            allow_channel_reduce=allow_channel_reduce,
+            lf=tm_lf,
+            literal_budget=tm_literal_budget,
+            vote_clamp=tm_vote_clamp,
+            clause_dropout=tm_clause_dropout,
+            literal_dropout=tm_literal_dropout,
+            operator=stcm_operator,
+            ternary_voting=stcm_ternary_voting,
+            ternary_band=stcm_ternary_band,
+            ste_temperature=stcm_ste_temperature,
+            compile_mode="reduce-overhead",
+        ).to(device)
+        use_ste_train = False
+        use_ste_eval = False
+        label = "CompiledSTCM"
     else:
         model = FuzzyPatternTM_STE(
             n_features=n_features,
@@ -5719,6 +5795,132 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     stcm_ste_temperature=args.stcm_ste_temperature,
                 )
                 variant_classes = args.num_classes
+            elif model_key == "optimized_stcm":
+                # OptimizedSTCM uses W_eff = mask_pos - mask_inv for efficiency
+                opt_stcm_min_lr = tm_min_lr
+                if args.min_lr is None:
+                    opt_stcm_min_lr = tm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_tm(
+                    tm_train_loader,
+                    tm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    n_features=tm_n_features,
+                    prepare_fn=tm_prepare_fn,
+                    tm_impl="optimized_stcm",
+                    tm_tau=args.tm_tau,
+                    tm_lf=args.tm_lf,
+                    tm_literal_budget=args.tm_literal_budget,
+                    tm_vote_clamp=args.tm_vote_clamp,
+                    tm_n_clauses=args.tm_n_clauses,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=tm_base_lr,
+                    min_lr=opt_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    tm_clause_dropout=args.tm_clause_dropout,
+                    tm_literal_dropout=args.tm_literal_dropout,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "triton_stcm":
+                # TritonSTCM uses packed ternary weights for memory efficiency
+                if not TRITON_KERNELS_AVAILABLE:
+                    print(f"  [SKIP] triton_stcm requires triton kernels (not available)")
+                    continue
+                triton_stcm_min_lr = tm_min_lr
+                if args.min_lr is None:
+                    triton_stcm_min_lr = tm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_tm(
+                    tm_train_loader,
+                    tm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    n_features=tm_n_features,
+                    prepare_fn=tm_prepare_fn,
+                    tm_impl="triton_stcm",
+                    tm_tau=args.tm_tau,
+                    tm_lf=args.tm_lf,
+                    tm_literal_budget=args.tm_literal_budget,
+                    tm_vote_clamp=args.tm_vote_clamp,
+                    tm_n_clauses=args.tm_n_clauses,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=tm_base_lr,
+                    min_lr=triton_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    tm_clause_dropout=args.tm_clause_dropout,
+                    tm_literal_dropout=args.tm_literal_dropout,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "compiled_stcm":
+                # CompiledSTCM uses torch.compile for kernel fusion
+                compiled_stcm_min_lr = tm_min_lr
+                if args.min_lr is None:
+                    compiled_stcm_min_lr = tm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_tm(
+                    tm_train_loader,
+                    tm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    n_features=tm_n_features,
+                    prepare_fn=tm_prepare_fn,
+                    tm_impl="compiled_stcm",
+                    tm_tau=args.tm_tau,
+                    tm_lf=args.tm_lf,
+                    tm_literal_budget=args.tm_literal_budget,
+                    tm_vote_clamp=args.tm_vote_clamp,
+                    tm_n_clauses=args.tm_n_clauses,
+                    input_shape=tm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=tm_base_lr,
+                    min_lr=compiled_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    tm_clause_dropout=args.tm_clause_dropout,
+                    tm_literal_dropout=args.tm_literal_dropout,
+                    stcm_operator=args.stcm_operator,
+                    stcm_ternary_voting=args.stcm_ternary_voting,
+                    stcm_ternary_band=args.stcm_ternary_band,
+                    stcm_ste_temperature=args.stcm_ste_temperature,
+                )
+                variant_classes = args.num_classes
             elif model_key == "fptm_equiv":
                 label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_fptm_equiv(
                     tm_train_loader,
@@ -5820,6 +6022,149 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     layer_ternary_voting=args.stcm_ternary_voting,
                     layer_extra_kwargs=stcm_layer_kwargs,
                     label_override="Deep-STCM",
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    use_ste_train=False,
+                    use_ste_eval=False,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "deep_optimized_stcm" and not args.deepctm_channels:
+                # Deep version of OptimizedSTCM
+                stcm_layer_kwargs = {
+                    "ternary_band": args.stcm_ternary_band,
+                    "ste_temperature": args.stcm_ste_temperature,
+                }
+                deep_opt_stcm_min_lr = deeptm_min_lr
+                if args.min_lr is None:
+                    deep_opt_stcm_min_lr = deeptm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deeptm(
+                    deeptm_train_loader,
+                    deeptm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    prepare_fn=deeptm_prepare_fn,
+                    input_dim=deeptm_input_dim,
+                    hidden_dims=hidden_dims,
+                    n_clauses=args.deeptm_n_clauses,
+                    dropout=args.deeptm_dropout,
+                    tau=args.deeptm_tau,
+                    input_shape=deeptm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=deeptm_base_lr,
+                    min_lr=deep_opt_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    layer_cls=OptimizedSTCM,
+                    layer_operator=args.stcm_operator,
+                    layer_ternary_voting=args.stcm_ternary_voting,
+                    layer_extra_kwargs=stcm_layer_kwargs,
+                    label_override="Deep-OptimizedSTCM",
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    use_ste_train=False,
+                    use_ste_eval=False,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "deep_triton_stcm" and not args.deepctm_channels:
+                # Deep version of TritonSTCM with packed weights
+                if not TRITON_KERNELS_AVAILABLE:
+                    print(f"  [SKIP] deep_triton_stcm requires triton kernels (not available)")
+                    continue
+                stcm_layer_kwargs = {
+                    "ternary_band": args.stcm_ternary_band,
+                    "ste_temperature": args.stcm_ste_temperature,
+                    "use_packed_weights": True,
+                }
+                deep_triton_stcm_min_lr = deeptm_min_lr
+                if args.min_lr is None:
+                    deep_triton_stcm_min_lr = deeptm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deeptm(
+                    deeptm_train_loader,
+                    deeptm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    prepare_fn=deeptm_prepare_fn,
+                    input_dim=deeptm_input_dim,
+                    hidden_dims=hidden_dims,
+                    n_clauses=args.deeptm_n_clauses,
+                    dropout=args.deeptm_dropout,
+                    tau=args.deeptm_tau,
+                    input_shape=deeptm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=deeptm_base_lr,
+                    min_lr=deep_triton_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    layer_cls=TritonSTCM,
+                    layer_operator=args.stcm_operator,
+                    layer_ternary_voting=args.stcm_ternary_voting,
+                    layer_extra_kwargs=stcm_layer_kwargs,
+                    label_override="Deep-TritonSTCM",
+                    clause_dropout=args.tm_clause_dropout,
+                    literal_dropout=args.tm_literal_dropout,
+                    use_ste_train=False,
+                    use_ste_eval=False,
+                )
+                variant_classes = args.num_classes
+            elif model_key == "deep_compiled_stcm" and not args.deepctm_channels:
+                # Deep version of CompiledSTCM with torch.compile optimization
+                stcm_layer_kwargs = {
+                    "ternary_band": args.stcm_ternary_band,
+                    "ste_temperature": args.stcm_ste_temperature,
+                    "compile_mode": "reduce-overhead",
+                }
+                deep_compiled_stcm_min_lr = deeptm_min_lr
+                if args.min_lr is None:
+                    deep_compiled_stcm_min_lr = deeptm_base_lr * 0.1
+                label, train_acc, test_acc, train_time, preds, bundle, best_epoch_test_acc, profile = run_variant_deeptm(
+                    deeptm_train_loader,
+                    deeptm_test_loader,
+                    device,
+                    epochs=args.epochs,
+                    report_train_acc=args.report_train_acc,
+                    report_epoch_acc=args.report_epoch_acc,
+                    report_epoch_test=args.report_epoch_test,
+                    prepare_fn=deeptm_prepare_fn,
+                    input_dim=deeptm_input_dim,
+                    hidden_dims=hidden_dims,
+                    n_clauses=args.deeptm_n_clauses,
+                    dropout=args.deeptm_dropout,
+                    tau=args.deeptm_tau,
+                    input_shape=deeptm_input_shape_active,
+                    auto_expand_grayscale=tm_auto_expand,
+                    allow_channel_reduce=tm_allow_reduce,
+                    n_classes=args.num_classes,
+                    base_lr=deeptm_base_lr,
+                    min_lr=deep_compiled_stcm_min_lr,
+                    warmup_epochs=warmup_epochs,
+                    weight_decay=weight_decay,
+                    gradient_centralize=args.gradient_centralize,
+                    label_smoothing=args.label_smoothing,
+                    lr_cycle_steps=args.lr_cycle_steps,
+                    tm_prior_template=args.tm_prior_template,
+                    layer_cls=CompiledSTCM,
+                    layer_operator=args.stcm_operator,
+                    layer_ternary_voting=args.stcm_ternary_voting,
+                    layer_extra_kwargs=stcm_layer_kwargs,
+                    label_override="Deep-CompiledSTCM",
                     clause_dropout=args.tm_clause_dropout,
                     literal_dropout=args.tm_literal_dropout,
                     use_ste_train=False,
