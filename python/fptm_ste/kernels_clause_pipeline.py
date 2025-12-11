@@ -306,15 +306,18 @@ def fused_clause_outputs(
     ternary_band: float,
     ste_temperature: float,
     product_scale: float = 1.0,
+    operator: str = 'product',
 ) -> torch.Tensor:
     """
     Compute clause outputs (pos + neg strengths) in a single Triton launch.
+    
+    Supports both 'product' and 'capacity' operators.
 
     Returns:
         clause_outputs: [B, n_clauses]
     """
-    if not TRITON_AVAILABLE or not x.is_cuda:
-        # Reference path (product operator)
+    # Reference path for CPU or capacity operator (Triton kernel is product-only for now)
+    if not TRITON_AVAILABLE or not x.is_cuda or operator == 'capacity':
         soft_pos = torch.tanh(pos_logits / ste_temperature)
         soft_neg = torch.tanh(neg_logits / ste_temperature)
         with torch.no_grad():
@@ -326,7 +329,9 @@ def fused_clause_outputs(
         mask_neg = hard_neg + (soft_neg - soft_neg.detach())
 
         mask_pos_pos = torch.clamp(mask_pos, min=0.0)
+        mask_pos_inv = torch.clamp(-mask_pos, min=0.0)
         mask_neg_pos = torch.clamp(mask_neg, min=0.0)
+        mask_neg_inv = torch.clamp(-mask_neg, min=0.0)
 
         W_eff_pos = mask_pos
         W_eff_neg = mask_neg
@@ -340,14 +345,24 @@ def fused_clause_outputs(
         mismatch_pos = bias_pos - proj_pos
         mismatch_neg = bias_neg - proj_neg
 
-        scaled_pos = torch.clamp(mismatch_pos * product_scale, min=0.0, max=10.0)
-        scaled_neg = torch.clamp(mismatch_neg * product_scale, min=0.0, max=10.0)
-
-        pos_strength = torch.exp(-scaled_pos)
-        neg_strength = torch.exp(-scaled_neg)
+        if operator == 'capacity':
+            # Capacity operator: relu(capacity - mismatch)
+            capacity_pos = (mask_pos_pos + mask_pos_inv).sum(dim=1).unsqueeze(0)
+            capacity_neg = (mask_neg_pos + mask_neg_inv).sum(dim=1).unsqueeze(0)
+            raw_pos = capacity_pos - mismatch_pos
+            raw_neg = capacity_neg - mismatch_neg
+            pos_strength = torch.relu(raw_pos)
+            neg_strength = torch.relu(raw_neg)
+        else:
+            # Product operator: exp(-clamp(mismatch * scale, 0, 10))
+            scaled_pos = torch.clamp(mismatch_pos * product_scale, min=0.0, max=10.0)
+            scaled_neg = torch.clamp(mismatch_neg * product_scale, min=0.0, max=10.0)
+            pos_strength = torch.exp(-scaled_pos)
+            neg_strength = torch.exp(-scaled_neg)
 
         return torch.cat([pos_strength, neg_strength], dim=1)
 
+    # Triton kernel path (product operator only, capacity uses reference above)
     B, F = x.shape
     half, Fp = pos_logits.shape
     assert F == Fp, "Feature mismatch between input and logits"

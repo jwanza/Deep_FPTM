@@ -98,7 +98,7 @@ class OptimizedSTCM(FuzzyPatternTM_STCM):
 
     def _clause_outputs(self, x: torch.Tensor, use_ste: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Check for Massive Speedup opportunity (Fused Triton Kernel)
-        # Criteria: Triton enabled, STE used, product operator, no complex constraints
+        # Criteria: Triton enabled, STE used, product/capacity operator, no complex constraints
         triton_status = get_triton_status()
         use_fused_kernel = (
             triton_status['triton_enabled'] and 
@@ -106,7 +106,7 @@ class OptimizedSTCM(FuzzyPatternTM_STCM):
             fused_clause_outputs is not None and
             use_ste and
             x.is_cuda and
-            self.operator == 'product' and
+            self.operator in ('product', 'capacity') and  # Extended to include capacity
             getattr(self, 'literal_dropout', 0.0) == 0.0 and
             getattr(self, 'max_literals', None) is None
         )
@@ -115,7 +115,8 @@ class OptimizedSTCM(FuzzyPatternTM_STCM):
             # Fused Path: Compute both clause banks in one launch
             clause_outputs = fused_clause_outputs(
                 x, self.pos_logits, self.neg_logits,
-                self.ternary_band, self.ste_temperature, self.product_scale
+                self.ternary_band, self.ste_temperature, self.product_scale,
+                operator=self.operator,  # Pass operator for capacity support
             )
             half = self.n_clauses // 2
             pos_strength = clause_outputs[:, :half]

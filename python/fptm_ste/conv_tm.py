@@ -269,7 +269,7 @@ class ConvTM2dOptimized(ConvTM2d):
     Significantly faster and more memory efficient for STE/STCM backends.
     """
 
-    def forward(self, x: torch.Tensor, use_ste: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_ste: bool = True, return_clauses: bool = False) -> torch.Tensor:
         # Fallback for deep backends or unsupported cores
         if self.core_backend not in {"tm", "stcm"} or not hasattr(self.core, "get_masks"):
             return super().forward(x, use_ste=use_ste)
@@ -350,6 +350,9 @@ class ConvTM2dOptimized(ConvTM2d):
         if self.training and self.core.clause_dropout > 0.0:
              clause_outputs = F.dropout(clause_outputs, p=self.core.clause_dropout, training=True)
              
+        if return_clauses:
+            return clause_outputs
+
         # Voting
         # self.core.voting is [n_clauses, n_classes]
         # We need [n_classes, n_clauses, 1, 1] for conv
