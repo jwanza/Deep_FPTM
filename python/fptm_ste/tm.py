@@ -650,7 +650,12 @@ def _resize_spatial(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
     return F.interpolate(x, size=(height, width), mode=mode, align_corners=False)
 
 
-def _ste_ternary(logits: torch.Tensor, band: float, temperature: float) -> torch.Tensor:
+def _ste_ternary(
+    logits: torch.Tensor,
+    band: float,
+    temperature: float,
+    gradient_mode: str = "tanh",
+) -> torch.Tensor:
     """
     Straight-through ternary quantizer mapping logits to {-1, 0, +1}.
 
@@ -658,10 +663,18 @@ def _ste_ternary(logits: torch.Tensor, band: float, temperature: float) -> torch
         logits: Arbitrary tensor of logits.
         band: Non-negative margin defining the neutral zone around zero.
         temperature: Positive temperature controlling the slope of the soft surrogate.
+        gradient_mode: Proxy gradient function ('tanh', 'linear', 'gated_linear').
     """
     if temperature <= 0:
         raise ValueError("temperature must be positive for STE ternary quantization.")
-    soft = torch.tanh(logits / temperature)
+    
+    if gradient_mode == "linear":
+        soft = logits / temperature
+    elif gradient_mode == "gated_linear":
+        soft = F.hardtanh(logits / temperature) + 0.1 * (logits / temperature)
+    else:  # tanh (default)
+        soft = torch.tanh(logits / temperature)
+
     if band < 0:
         raise ValueError("band must be non-negative.")
     with torch.no_grad():
@@ -1208,6 +1221,7 @@ class FuzzyPatternTM_STCM(nn.Module):
         ternary_voting: bool = False,
         ternary_band: float = 0.0,
         ste_temperature: float = 1.0,
+        ste_gradient_mode: str = "tanh",
         init_std: float = 0.01,
     ):
         super().__init__()
@@ -1247,6 +1261,7 @@ class FuzzyPatternTM_STCM(nn.Module):
         self.ternary_voting = ternary_voting
         self.ternary_band = ternary_band
         self.ste_temperature = ste_temperature
+        self.ste_gradient_mode = ste_gradient_mode
         self.product_scale = 4.0 / self.n_features
 
         if self.input_shape is not None:
@@ -1292,7 +1307,7 @@ class FuzzyPatternTM_STCM(nn.Module):
 
     def _mask_from_logits(self, logits: torch.Tensor, use_ste: bool) -> torch.Tensor:
         if use_ste:
-            return _ste_ternary(logits, self.ternary_band, self.ste_temperature)
+            return _ste_ternary(logits, self.ternary_band, self.ste_temperature, self.ste_gradient_mode)
         return torch.tanh(logits / self.ste_temperature)
 
     def _split_masks(self, mask: torch.Tensor, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1404,7 +1419,7 @@ class FuzzyPatternTM_STCM(nn.Module):
         temp = max(self.ste_temperature, 1e-6)
 
         if use_ste:
-            mask_all = _ste_ternary(all_logits, self.ternary_band, self.ste_temperature)
+            mask_all = _ste_ternary(all_logits, self.ternary_band, self.ste_temperature, self.ste_gradient_mode)
         else:
             mask_all = torch.tanh(all_logits / self.ste_temperature)
 
@@ -1551,14 +1566,14 @@ class FuzzyPatternTM_STCM(nn.Module):
     def _voting_matrix(self, use_ste: bool) -> torch.Tensor:
         if self.ternary_voting:
             assert self.vote_logits is not None
-            return _ste_ternary(self.vote_logits, self.ternary_band, self.ste_temperature)
+            return _ste_ternary(self.vote_logits, self.ternary_band, self.ste_temperature, self.ste_gradient_mode)
         assert self.voting is not None
         return self.voting
 
     def extra_repr(self) -> str:
         return (
             f"features={self.n_features}, clauses={self.n_clauses}, classes={self.n_classes}, "
-            f"operator='{self.operator}', ternary_voting={self.ternary_voting}"
+            f"operator='{self.operator}', ternary_voting={self.ternary_voting}, ste_mode='{self.ste_gradient_mode}'"
         )
 
     @torch.no_grad()

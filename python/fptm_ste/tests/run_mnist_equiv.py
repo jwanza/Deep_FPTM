@@ -1350,6 +1350,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Temperature for STCM STE ternary masks.",
     )
+    parser.add_argument(
+        "--stcm-ste-gradient-mode",
+        choices=["tanh", "linear", "gated_linear"],
+        default="tanh",
+        help="Gradient surrogate mode for STCM STE (tanh, linear, gated_linear).",
+    )
 
     # Deep TM options
     parser.add_argument(
@@ -3984,7 +3990,8 @@ def run_variant_deepctm(train_loader,
                         stcm_operator: str = "capacity",
                         stcm_ternary_voting: bool = False,
                         stcm_ternary_band: float = 0.05,
-                        stcm_ste_temperature: float = 1.0) -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
+                        stcm_ste_temperature: float = 1.0,
+                        stcm_ste_gradient_mode: str = "tanh") -> Tuple[str, Optional[float], float, float, List[int], Dict[str, Any], Dict[str, Any]]:
     model = DeepCTMNetwork(
         in_channels=in_channels,
         image_size=image_size,
@@ -4010,6 +4017,7 @@ def run_variant_deepctm(train_loader,
         stcm_ternary_voting=stcm_ternary_voting,
         stcm_ternary_band=stcm_ternary_band,
         stcm_ste_temperature=stcm_ste_temperature,
+        stcm_ste_gradient_mode=stcm_ste_gradient_mode,
     ).to(device)
     label = "Deep-CTM"
     if device.type == "cuda":
@@ -4082,6 +4090,7 @@ def run_variant_deepcstcm(train_loader,
                           stcm_ternary_voting: bool,
                           stcm_ternary_band: float,
                           stcm_ste_temperature: float,
+                          stcm_ste_gradient_mode: str,
                           base_lr: float,
                           min_lr: float,
                           warmup_epochs: int,
@@ -4124,6 +4133,7 @@ def run_variant_deepcstcm(train_loader,
         stcm_ternary_voting=stcm_ternary_voting,
         stcm_ternary_band=stcm_ternary_band,
         stcm_ste_temperature=stcm_ste_temperature,
+        stcm_ste_gradient_mode=stcm_ste_gradient_mode,
     ).to(device)
     label = "Deep-CSTCM"
     if device.type == "cuda":
@@ -6421,6 +6431,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     stcm_ternary_voting=args.stcm_ternary_voting,
                     stcm_ternary_band=args.stcm_ternary_band,
                     stcm_ste_temperature=args.stcm_ste_temperature,
+                    stcm_ste_gradient_mode=args.stcm_ste_gradient_mode,
                 )
                 variant_classes = args.num_classes
             elif model_key == "deep_cstcm" or (model_key == "deep_stcm" and args.deepctm_channels):
@@ -6478,6 +6489,7 @@ def run_experiment_with_args(args: argparse.Namespace) -> Dict[str, Dict[str, An
                     stcm_ternary_voting=args.stcm_ternary_voting,
                     stcm_ternary_band=args.stcm_ternary_band,
                     stcm_ste_temperature=args.stcm_ste_temperature,
+                    stcm_ste_gradient_mode=args.stcm_ste_gradient_mode,
                     aux_weight=args.deepctm_aux_weight,
                     use_stem=args.deepctm_stem,
                     stem_channels=args.deepctm_stem_channels,

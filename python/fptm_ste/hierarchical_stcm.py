@@ -364,3 +364,4 @@ class DeepHierarchicalSTCM(nn.Module):
         logits, info = self.head(x)
         return logits, info
 
+

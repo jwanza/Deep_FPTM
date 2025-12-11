@@ -60,6 +60,9 @@ from .trainers import (
 )
 from .resnet_tm import ResNetTM, resnet_tm18, resnet_tm34, resnet_tm50, resnet_tm101
 
+# Logic Layers
+from .logic_layers import ProbabilisticLogicLayer
+
 # New modules
 from .clause_attention import (
     HierarchicalClauseAttention,
@@ -139,3 +142,23 @@ from .continual import (
     ContinualLearningPipeline,
 )
 
+# Fused Triton Kernels
+from .config import TRITON_ENABLED, set_triton_enabled, get_triton_status, check_triton_hardware
+
+# Ensure hardware check runs
+check_triton_hardware()
+
+try:
+    from .kernels_fused import (
+        fused_ste_ternary,
+        fused_clause_sync,
+        fused_gumbel_softmax,
+        TRITON_AVAILABLE as _TRITON_HW_AVAILABLE,
+    )
+    FUSED_KERNELS_AVAILABLE = _TRITON_HW_AVAILABLE
+except ImportError:
+    FUSED_KERNELS_AVAILABLE = False
+    _TRITON_HW_AVAILABLE = False
+    fused_ste_ternary = None
+    fused_clause_sync = None
+    fused_gumbel_softmax = None

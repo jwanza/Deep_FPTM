@@ -141,6 +141,7 @@ class ConvTM2d(nn.Module):
         ternary_voting: Optional[bool] = None,
         ternary_band: float = 0.0,
         ste_temperature: float = 1.0,
+        ste_gradient_mode: str = "tanh",
         im2col_chunk: Optional[int] = None,
     ):
         super().__init__()
@@ -178,8 +179,12 @@ class ConvTM2d(nn.Module):
 
         # Build core
         layer_extra_kwargs = {}
-        if layer_cls is FuzzyPatternTM_STCM or layer_cls == FuzzyPatternTM_STCM:
-            layer_extra_kwargs.update({"ternary_band": float(ternary_band), "ste_temperature": float(ste_temperature)})
+        # Add STCM kwargs to extra list; they will be filtered by support later
+        layer_extra_kwargs.update({
+            "ternary_band": float(ternary_band), 
+            "ste_temperature": float(ste_temperature),
+            "ste_gradient_mode": ste_gradient_mode
+        })
 
         backend = self.core_backend
         if backend in {"tm", "stcm"}:
@@ -398,6 +403,7 @@ class ConvSTE2d(ConvTM2dOptimized):
             ternary_voting=None,
             ternary_band=0.0,
             ste_temperature=1.0,
+            ste_gradient_mode="tanh",
             im2col_chunk=im2col_chunk,
         )
 
@@ -423,6 +429,7 @@ class ConvSTCM2d(ConvTM2dOptimized):
         ternary_voting: bool = False,
         ternary_band: float = 0.05,
         ste_temperature: float = 1.0,
+        ste_gradient_mode: str = "tanh",
         im2col_chunk: Optional[int] = None,
     ):
         super().__init__(
@@ -444,5 +451,6 @@ class ConvSTCM2d(ConvTM2dOptimized):
             ternary_voting=ternary_voting,
             ternary_band=ternary_band,
             ste_temperature=ste_temperature,
+            ste_gradient_mode=ste_gradient_mode,
             im2col_chunk=im2col_chunk,
         )

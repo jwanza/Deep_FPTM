@@ -405,3 +405,4 @@ class DeepUltimateSTCM(nn.Module):
             layer.reset_exit_statistics()
         self.head.reset_exit_statistics()
 
+

@@ -77,6 +77,7 @@ class DeepCTMNetwork(nn.Module):
         stcm_ternary_voting: bool = False,
         stcm_ternary_band: float = 0.05,
         stcm_ste_temperature: float = 1.0,
+        stcm_ste_gradient_mode: str = "tanh",
         # Select STE vs STCM
         layer_cls: Type[nn.Module] = FuzzyPatternTM_STE,
     ):
@@ -172,6 +173,7 @@ class DeepCTMNetwork(nn.Module):
                     ternary_voting=stcm_ternary_voting,
                     ternary_band=stcm_ternary_band,
                     ste_temperature=stcm_ste_temperature,
+                    ste_gradient_mode=stcm_ste_gradient_mode,
                 )
             blocks.append(conv)
             norms.append(nn.BatchNorm2d(C_out))
@@ -236,6 +238,7 @@ class DeepCTMNetwork(nn.Module):
             stcm_ternary_voting=stcm_ternary_voting,
             stcm_ternary_band=stcm_ternary_band,
             stcm_ste_temperature=stcm_ste_temperature,
+            stcm_ste_gradient_mode=stcm_ste_gradient_mode,
         )
         self.head_mix_params = nn.ParameterDict()
         self._latest_head_mix: Dict[str, float] = {}
@@ -256,6 +259,8 @@ class DeepCTMNetwork(nn.Module):
     def _get_diag_head(self, idx: int) -> nn.Module:
         if self._diag_heads is None:
             self._diag_heads = nn.ModuleList([nn.Linear(c, self.num_classes) for c in self.channels])
+            device = next(self.parameters()).device
+            self._diag_heads.to(device)
         return self._diag_heads[idx]
 
     def forward(self, x: torch.Tensor, use_ste: bool = True, collect_diagnostics: bool = False):
@@ -337,6 +342,15 @@ class DeepCTMNetwork(nn.Module):
                 except Exception:
                     continue
 
+    def set_stcm_gradient_mode(self, mode: str) -> None:
+        mode = str(mode)
+        for module in self.modules():
+            if hasattr(module, "ste_gradient_mode"):
+                try:
+                    module.ste_gradient_mode = mode
+                except Exception:
+                    continue
+
     def _build_mixer_module(self, channels: int) -> nn.Module:
         if self.mix_type == "linear":
             return nn.Sequential(
@@ -371,6 +385,7 @@ class DeepCTMNetwork(nn.Module):
         stcm_ternary_voting: bool,
         stcm_ternary_band: float,
         stcm_ste_temperature: float,
+        stcm_ste_gradient_mode: str,
     ) -> Tuple[Optional[nn.Module], bool]:
         head_type = head_type.lower()
         if head_type == "none":
@@ -386,13 +401,14 @@ class DeepCTMNetwork(nn.Module):
                 literal_dropout=literal_dropout,
                 clause_bias_init=clause_bias_init,
             )
-            if classifier_cls is FuzzyPatternTM_STCM:
+            if _is_stcm_cls(classifier_cls):
                 head_kwargs.update(
                     dict(
                         operator=stcm_operator,
                         ternary_voting=stcm_ternary_voting,
                         ternary_band=stcm_ternary_band,
                         ste_temperature=stcm_ste_temperature,
+                        ste_gradient_mode=stcm_ste_gradient_mode,
                     )
                 )
             return classifier_cls(**head_kwargs), True
@@ -402,10 +418,14 @@ class DeepCTMNetwork(nn.Module):
             layer_extra_kwargs: Dict[str, float] = {}
             layer_operator = None
             layer_ternary_voting = None
-            if layer_cls is FuzzyPatternTM_STCM:
+            if _is_stcm_cls(layer_cls):
                 layer_operator = stcm_operator
                 layer_ternary_voting = stcm_ternary_voting
-                layer_extra_kwargs = dict(ternary_band=stcm_ternary_band, ste_temperature=stcm_ste_temperature)
+                layer_extra_kwargs = dict(
+                    ternary_band=stcm_ternary_band, 
+                    ste_temperature=stcm_ste_temperature,
+                    ste_gradient_mode=stcm_ste_gradient_mode
+                )
             head = DeepTMNetwork(
                 input_dim=self.final_channels,
                 hidden_dims=hidden_dims,

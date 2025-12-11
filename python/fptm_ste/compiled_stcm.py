@@ -214,3 +214,4 @@ class DeepCompiledSTCM(nn.Module):
         logits, clause_outputs = self.head(x)[:2]
         return logits, clause_outputs
 
+

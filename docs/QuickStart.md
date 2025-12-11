@@ -156,7 +156,8 @@ Helpful switches:
 
 - `--models stcm` / `--models deep_stcm` select the ternary variants.
 - `--stcm-operator {capacity,product}` toggles between the capacity–mismatch and product operators.
-- `--stcm-ternary-voting`, `--stcm-ternary-band`, and `--stcm-ste-temperature` control the ternary mask/ voting behaviour.
+- `--stcm-ternary-voting`, `--stcm-ternary-band`, `--stcm-ste-temperature` control the ternary mask/ voting behaviour.
+- `--stcm-ste-gradient-mode {tanh,linear,gated_linear}` controls the gradient surrogate. Use `gated_linear` for deeper networks (>3 layers) to prevent vanishing gradients.
 
 ---
 

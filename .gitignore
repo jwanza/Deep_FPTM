@@ -1,4 +1,5 @@
 results/
+python/data/
 
 # General artifacts
 __pycache__/

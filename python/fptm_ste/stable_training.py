@@ -834,3 +834,4 @@ class StableTrainer:
             if self.ema is not None and 'ema_state_dict' in best:
                 self.ema.load_state_dict(best['ema_state_dict'])
 
+
