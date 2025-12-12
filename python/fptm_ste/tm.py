@@ -786,8 +786,11 @@ class FuzzyPatternTM_STE(nn.Module):
         clause_bias_init: float = 0.0,
         use_bitpack: bool = True,
         bitpack_threshold: float = 0.5,
+        activation_ste: str = "leaky",  # Options: "leaky", "gelu", "adaptive"
     ):
         super().__init__()
+        self.activation_ste = activation_ste
+        self._training_progress = 0.0  # For adaptive mode
         self.n_features = n_features
         self.n_clauses = n_clauses
         self.n_classes = n_classes
@@ -1055,11 +1058,36 @@ class FuzzyPatternTMFPTM(nn.Module):
             included = torch.minimum(included, torch.as_tensor(float(self.lf), device=included.device))
         return included.unsqueeze(0)  # [1, half]
 
-    @staticmethod
-    def _straight_relu(x: torch.Tensor) -> torch.Tensor:
-        # Use Leaky ReLU with a very small negative slope to allow gradient flow for "dead" clauses
-        clamped = F.leaky_relu(x, negative_slope=0.01)
-        return x + (clamped - x).detach()
+    def _straight_relu(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Straight-through estimator for ReLU-like activation.
+        
+        Supports multiple modes:
+        - "leaky": Original LeakyReLU(0.01) - default
+        - "gelu": GELU activation for better gradient flow in deep networks
+        - "adaptive": Annealing slope from 0.3 to 0.01 based on training progress
+        """
+        mode = getattr(self, 'activation_ste', 'leaky')
+        
+        if mode == 'gelu':
+            # GELU-STE: better gradient flow for deep networks
+            soft = F.gelu(x)
+            hard = F.relu(x)
+            return hard + (soft - soft.detach())
+        elif mode == 'adaptive':
+            # Adaptive slope that anneals during training
+            progress = getattr(self, '_training_progress', 0.0)
+            slope = 0.3 * (1 - progress) + 0.01 * progress
+            soft = F.leaky_relu(x, negative_slope=slope)
+            hard = F.leaky_relu(x, negative_slope=0.01)
+            return hard + (soft - soft.detach())
+        else:  # 'leaky' or default
+            clamped = F.leaky_relu(x, negative_slope=0.01)
+            return x + (clamped - x).detach()
+    
+    def set_training_progress(self, progress: float):
+        """Set training progress for adaptive activation STE (0.0 to 1.0)."""
+        self._training_progress = max(0.0, min(1.0, progress))
 
     def _strength(self, x: torch.Tensor, mask_pos: torch.Tensor, mask_inv: torch.Tensor) -> torch.Tensor:
         capacity = self._clause_capacity(mask_pos, mask_inv)
@@ -1223,8 +1251,11 @@ class FuzzyPatternTM_STCM(nn.Module):
         ste_temperature: float = 1.0,
         ste_gradient_mode: str = "tanh",
         init_std: float = 0.01,
+        activation_ste: str = "leaky",  # Options: "leaky", "gelu", "adaptive"
     ):
         super().__init__()
+        self.activation_ste = activation_ste
+        self._training_progress = 0.0  # For adaptive mode
         if n_clauses <= 0 or n_features <= 0:
             raise ValueError("n_features and n_clauses must both be positive.")
         if n_clauses % 2 != 0:
@@ -1487,10 +1518,36 @@ class FuzzyPatternTM_STCM(nn.Module):
         included = self._apply_literal_constraints(included)
         return included.unsqueeze(0)
 
-    @staticmethod
-    def _straight_relu(x: torch.Tensor) -> torch.Tensor:
-        clamped = F.leaky_relu(x, negative_slope=0.01)
-        return x + (clamped - x).detach()
+    def _straight_relu(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Straight-through estimator for ReLU-like activation.
+        
+        Supports multiple modes:
+        - "leaky": Original LeakyReLU(0.01) - default
+        - "gelu": GELU activation for better gradient flow in deep networks
+        - "adaptive": Annealing slope from 0.3 to 0.01 based on training progress
+        """
+        mode = getattr(self, 'activation_ste', 'leaky')
+        
+        if mode == 'gelu':
+            # GELU-STE: better gradient flow for deep networks
+            soft = F.gelu(x)
+            hard = F.relu(x)
+            return hard + (soft - soft.detach())
+        elif mode == 'adaptive':
+            # Adaptive slope that anneals during training
+            progress = getattr(self, '_training_progress', 0.0)
+            slope = 0.3 * (1 - progress) + 0.01 * progress
+            soft = F.leaky_relu(x, negative_slope=slope)
+            hard = F.leaky_relu(x, negative_slope=0.01)
+            return hard + (soft - soft.detach())
+        else:  # 'leaky' or default
+            clamped = F.leaky_relu(x, negative_slope=0.01)
+            return x + (clamped - x).detach()
+    
+    def set_training_progress(self, progress: float):
+        """Set training progress for adaptive activation STE (0.0 to 1.0)."""
+        self._training_progress = max(0.0, min(1.0, progress))
 
     def _apply_literal_constraints(self, included: torch.Tensor) -> torch.Tensor:
         if self.literal_budget is not None:
