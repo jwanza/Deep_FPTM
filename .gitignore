@@ -1,5 +1,6 @@
 results/
 python/data/
+runs/
 
 # General artifacts
 __pycache__/
