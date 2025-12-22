@@ -14,6 +14,20 @@ from .tm import (
 )
 from .tm_feedback import EnhancedSTCM
 from .tm_optimized import OptimizedSTCM
+
+# P-Scan optimized STCM
+from .pscan_stcm import (
+    PScanOptimizedSTCM,
+    PScanOptimizedSTCM_Graph,
+)
+from .parallel_ops import (
+    associative_scan_linear,
+    sequential_scan_linear,
+    verify_pscan_correctness,
+    benchmark_pscan_vs_sequential,
+    parallel_cumsum_stable,
+    parallel_cumprod_log,
+)
 from .tm_integrated import IntegratedSTCM, build_stcm
 from .backbones import (
     UniversalBackboneFactory,
